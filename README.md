@@ -39,6 +39,25 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Deploy On Streamlit Community Cloud
+
+Deploy directly from the GitHub repository:
+
+- Repository: `RuddiRodriguez/investing`
+- Branch: `main`
+- Main file path: `app.py`
+
+If you enable the optional AI explanation, add this secret in the Streamlit app settings:
+
+```toml
+OPENAI_API_KEY="your_api_key_here"
+```
+
+The repository includes:
+
+- `/Users/ruddigarcia/Projects/invest/runtime.txt` to pin the Python version used by Streamlit Cloud
+- `/Users/ruddigarcia/Projects/invest/.streamlit/config.toml` for Streamlit runtime defaults
+
 ## Optional OpenAI Interpretation
 
 If you want the app to produce a narrative interpretation of the latest allocation, set:

@@ -1,6 +1,6 @@
 streamlit>=1.43,<2.0
 pandas>=2.2,<3.0
-numpy>=1.26,<3.0
+numpy>=1.26,<2.0
 yfinance>=0.2.54,<0.3.0
 plotly>=6.0,<7.0
 openai>=1.68,<2.0
