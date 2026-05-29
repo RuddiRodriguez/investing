@@ -144,6 +144,30 @@ def write_forecast_log_plot_artifacts(
     }
 
 
+def write_daily_trade_plot_artifacts(
+    report: dict[str, Any],
+    prices: pd.DataFrame,
+    output_dir: str | Path,
+    target_column: str = "close",
+) -> dict[str, str]:
+    """Write same-session daily-trade charts."""
+
+    output_path = Path(output_dir)
+    plot_path = output_path / "plots"
+    plot_path.mkdir(parents=True, exist_ok=True)
+    normalized_prices = normalize_price_frame(prices, target_column=target_column)
+    ticker = str(report.get("ticker", "ticker")).upper()
+
+    png_path = plot_path / f"daily_trade_{ticker}.png"
+    html_path = plot_path / f"daily_trade_{ticker}.html"
+    _plot_daily_trade(report, normalized_prices, png_path, target_column=target_column)
+    _plot_daily_trade_plotly(report, normalized_prices, html_path, target_column=target_column)
+    return {
+        "daily_trade_plot": str(png_path),
+        "daily_trade_plotly": str(html_path),
+    }
+
+
 def _plot_forecast(report: dict[str, Any], close: pd.Series, output_file: Path) -> None:
     history = close.tail(252)
     forecasts = sorted(report["forecasts"], key=lambda item: int(item["horizon_days"]))
@@ -175,6 +199,118 @@ def _plot_forecast(report: dict[str, Any], close: pd.Series, output_file: Path) 
     fig.tight_layout()
     fig.savefig(output_file, dpi=150)
     plt.close(fig)
+
+
+def _daily_trade_plot_frame(prices: pd.DataFrame, target_column: str) -> pd.DataFrame:
+    index = pd.DatetimeIndex(prices.index)
+    latest_date = index[-1].date()
+    session = prices[index.date == latest_date].copy()
+    if len(session) < 2:
+        session = prices.tail(120).copy()
+    close = session[target_column].astype(float)
+    high = session["high"].astype(float) if "high" in session.columns else close
+    low = session["low"].astype(float) if "low" in session.columns else close
+    volume = session["volume"].astype(float) if "volume" in session.columns else pd.Series(1.0, index=session.index)
+    typical_price = (high + low + close) / 3.0
+    session["plot_close"] = close
+    session["plot_vwap"] = (typical_price * volume).cumsum() / volume.where(volume != 0.0).cumsum()
+    return session
+
+
+def _plot_daily_trade(report: dict[str, Any], prices: pd.DataFrame, output_file: Path, target_column: str) -> None:
+    session = _daily_trade_plot_frame(prices, target_column)
+    opening_range = report.get("opening_range", {})
+    plan = report.get("trade_plan", {})
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(session.index, session["plot_close"], color="#111827", linewidth=1.8, label="Close")
+    ax.plot(session.index, session["plot_vwap"], color="#2563eb", linewidth=1.4, label="VWAP")
+    if opening_range.get("high") is not None:
+        ax.axhline(float(opening_range["high"]), color="#16a34a", linestyle="--", linewidth=1, label="Opening range high")
+    if opening_range.get("low") is not None:
+        ax.axhline(float(opening_range["low"]), color="#dc2626", linestyle="--", linewidth=1, label="Opening range low")
+    _add_trade_plan_levels(ax, plan)
+
+    title_action = plan.get("action", "no_trade")
+    ax.set_title(f"{report.get('ticker', '').upper()} Daily Trade Plan: {title_action}")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=150)
+    plt.close(fig)
+
+
+def _add_trade_plan_levels(ax: plt.Axes, plan: dict[str, Any]) -> None:
+    if plan.get("entry_reference") is not None:
+        ax.axhline(float(plan["entry_reference"]), color="#7c3aed", linewidth=1.2, label="Entry reference")
+    if plan.get("stop") is not None:
+        ax.axhline(float(plan["stop"]), color="#b91c1c", linestyle="-.", linewidth=1.2, label="Stop")
+    if plan.get("take_profit") is not None:
+        ax.axhline(float(plan["take_profit"]), color="#15803d", linestyle="-.", linewidth=1.2, label="Take profit")
+
+
+def _plot_daily_trade_plotly(report: dict[str, Any], prices: pd.DataFrame, output_file: Path, target_column: str) -> None:
+    session = _daily_trade_plot_frame(prices, target_column)
+    opening_range = report.get("opening_range", {})
+    plan = report.get("trade_plan", {})
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=session.index,
+            y=session["plot_close"],
+            mode="lines",
+            name="Close",
+            line={"color": "#111827", "width": 2},
+            hovertemplate="Time: %{x|%Y-%m-%d %H:%M}<br>Close: %{y:.2f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=session.index,
+            y=session["plot_vwap"],
+            mode="lines",
+            name="VWAP",
+            line={"color": "#2563eb", "width": 2},
+            hovertemplate="Time: %{x|%Y-%m-%d %H:%M}<br>VWAP: %{y:.2f}<extra></extra>",
+        )
+    )
+    _add_plotly_horizontal_line(fig, opening_range.get("high"), "Opening range high", "#16a34a", "dash")
+    _add_plotly_horizontal_line(fig, opening_range.get("low"), "Opening range low", "#dc2626", "dash")
+    _add_plotly_horizontal_line(fig, plan.get("entry_reference"), "Entry reference", "#7c3aed", "solid")
+    _add_plotly_horizontal_line(fig, plan.get("stop"), "Stop", "#b91c1c", "dashdot")
+    _add_plotly_horizontal_line(fig, plan.get("take_profit"), "Take profit", "#15803d", "dashdot")
+    fig.update_layout(
+        title=f"{report.get('ticker', '').upper()} Daily Trade Plan: {plan.get('action', 'no_trade')}",
+        xaxis_title="Time",
+        yaxis_title="Price",
+        template="plotly_white",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+    )
+    fig.write_html(output_file, include_plotlyjs=True, full_html=True)
+
+
+def _add_plotly_horizontal_line(fig: go.Figure, value: object, name: str, color: str, dash: str) -> None:
+    if value is None:
+        return
+    try:
+        y = float(value)
+    except (TypeError, ValueError):
+        return
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="lines",
+            name=name,
+            line={"color": color, "dash": dash, "width": 1.5},
+            hoverinfo="skip",
+        )
+    )
+    fig.add_hline(y=y, line_color=color, line_dash=dash, line_width=1.2)
 
 
 def _plot_forecast_log(frame: pd.DataFrame, output_file: Path, ticker: str) -> None:

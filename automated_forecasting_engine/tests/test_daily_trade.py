@@ -8,6 +8,7 @@ from market_forecasting_engine.daily_trade import (
     build_daily_trade_plan,
     infer_bar_interval_minutes,
 )
+from market_forecasting_engine.plots import write_daily_trade_plot_artifacts
 
 
 def _intraday_prices(rows: int = 78) -> pd.DataFrame:
@@ -53,3 +54,14 @@ def test_daily_trade_plan_warns_when_input_is_daily() -> None:
 
     assert report["has_intraday_data"] is False
     assert "daily/end-of-day" in report["data_warning"]
+
+
+def test_daily_trade_plot_artifacts_are_written(tmp_path) -> None:
+    prices = _intraday_prices()
+    report = build_daily_trade_plan(prices, DailyTradeConfig(ticker="TEST", minimum_score_to_trade=2.0))
+
+    artifacts = write_daily_trade_plot_artifacts(report, prices, output_dir=tmp_path)
+
+    assert (tmp_path / "plots" / "daily_trade_TEST.png").exists()
+    assert (tmp_path / "plots" / "daily_trade_TEST.html").exists()
+    assert artifacts["daily_trade_plot"].endswith("daily_trade_TEST.png")

@@ -68,7 +68,8 @@ Run from a local intraday CSV:
 PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecasting_engine.daily_trade_cli \
   --ticker AAPL \
   --csv path/to/aapl_5m.csv \
-  --interval 5m
+  --interval 5m \
+  --output-dir automated_forecasting_engine/runs/aapl_daily_trade
 ```
 
 The output is an auditable same-session plan with:
@@ -78,6 +79,14 @@ The output is an auditable same-session plan with:
 - VWAP and opening-range context
 - long/short/no-trade decision
 - entry reference, stop, take-profit, and max hold time when a setup qualifies
+
+The daily-trade run also writes:
+
+```text
+<output-dir>/daily_trade_report.json
+<output-dir>/plots/daily_trade_<TICKER>.png
+<output-dir>/plots/daily_trade_<TICKER>.html
+```
 
 By default, runs with `--output-dir` also create a local data cache inside the run folder:
 
