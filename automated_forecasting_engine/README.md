@@ -85,7 +85,11 @@ The daily-trade run also writes:
 
 ```text
 <output-dir>/daily_trade_report.json
+<output-dir>/forecast_report.json
 <output-dir>/daily_trade_forecasts.csv
+<output-dir>/governance/
+<output-dir>/plots/forecast_<TICKER>.png
+<output-dir>/plots/forecast_<TICKER>.html
 <output-dir>/plots/daily_trade_<TICKER>.png
 <output-dir>/plots/daily_trade_<TICKER>.html
 ```
@@ -95,6 +99,8 @@ Change the forecast horizons with:
 ```bash
 --forecast-hours 1,2,3,4
 ```
+
+The CLI refreshes Yahoo data on every run and uses recent intraday history for model training. If the requested `--start` has too few 5-minute bars for 1h-4h validation, it automatically expands the Yahoo training lookback while still forecasting from the newest available bar.
 
 By default, runs with `--output-dir` also create a local data cache inside the run folder:
 
