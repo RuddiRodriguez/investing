@@ -48,6 +48,37 @@ PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecast
   --output-dir automated_forecasting_engine/runs/aapl
 ```
 
+## Same-Session Daily Trading Variant
+
+Use the daily-trade variant when the goal is to make an entry/exit decision during the same trading session. This path requires intraday OHLCV data such as 1-minute, 5-minute, or 15-minute bars. Daily end-of-day candles can support swing or next-day forecasts, but they do not contain the intraday path needed for VWAP, opening range, stop placement, or same-day risk control.
+
+Fetch 5-minute Yahoo bars:
+
+```bash
+PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecasting_engine.daily_trade_cli \
+  --ticker AAPL \
+  --interval 5m \
+  --start 2026-05-20 \
+  --output automated_forecasting_engine/runs/aapl_daily_trade/report.json
+```
+
+Run from a local intraday CSV:
+
+```bash
+PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecasting_engine.daily_trade_cli \
+  --ticker AAPL \
+  --csv path/to/aapl_5m.csv \
+  --interval 5m
+```
+
+The output is an auditable same-session plan with:
+
+- whether the input actually looks intraday
+- inferred bar interval
+- VWAP and opening-range context
+- long/short/no-trade decision
+- entry reference, stop, take-profit, and max hold time when a setup qualifies
+
 By default, runs with `--output-dir` also create a local data cache inside the run folder:
 
 ```text
