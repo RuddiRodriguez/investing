@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import pandas as pd
 
@@ -10,6 +11,7 @@ from market_forecasting_engine.cli import (
     _interval_to_minutes,
     _refresh_cache_for_request,
 )
+from market_forecasting_engine.plots import write_forecast_log_plot_artifacts
 
 
 def test_interval_to_minutes_supports_hour_and_intraday_bars() -> None:
@@ -65,3 +67,52 @@ def test_append_forecast_log_deduplicates_same_as_of_and_horizon(tmp_path) -> No
     logged = pd.read_csv(path)
     assert len(logged) == 1
     assert logged.loc[0, "forecast_timestamp"] == "2026-05-29T16:00:00"
+
+
+def test_forecast_log_plot_artifacts_are_written(tmp_path) -> None:
+    path = tmp_path / "forecast_log.csv"
+    pd.DataFrame(
+        [
+            {
+                "generated_at_utc": "2026-05-29T12:00:00+00:00",
+                "ticker": "TSLA",
+                "as_of_timestamp": "2026-05-29T15:00:00",
+                "forecast_interval": "1h",
+                "horizon": 1,
+                "forecast_timestamp": "2026-05-29T16:00:00",
+                "current_price": 100.0,
+                "predicted_price": 101.0,
+                "lower_price": 99.0,
+                "upper_price": 103.0,
+                "expected_return": 0.01,
+                "expected_direction": "Up",
+                "directional_confidence": 0.60,
+                "selected_model": "test",
+                "suggested_action": "Hold",
+                "risk_level": "Medium",
+            },
+            {
+                "generated_at_utc": "2026-05-29T13:00:00+00:00",
+                "ticker": "TSLA",
+                "as_of_timestamp": "2026-05-29T16:00:00",
+                "forecast_interval": "1h",
+                "horizon": 1,
+                "forecast_timestamp": "2026-05-29T17:00:00",
+                "current_price": 101.0,
+                "predicted_price": 102.0,
+                "lower_price": 100.0,
+                "upper_price": 104.0,
+                "expected_return": 0.01,
+                "expected_direction": "Up",
+                "directional_confidence": 0.61,
+                "selected_model": "test",
+                "suggested_action": "Hold",
+                "risk_level": "Medium",
+            },
+        ]
+    ).to_csv(path, index=False)
+
+    artifacts = write_forecast_log_plot_artifacts(path, output_dir=tmp_path, ticker="TSLA")
+
+    assert Path(artifacts["forecast_log_plot"]).exists()
+    assert Path(artifacts["forecast_log_plotly"]).exists()

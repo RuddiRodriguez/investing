@@ -31,7 +31,7 @@ from market_forecasting_engine.panel import (
 )
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 from market_forecasting_engine.pipeline import ForecastingEngine
-from market_forecasting_engine.plots import write_plot_artifacts
+from market_forecasting_engine.plots import write_forecast_log_plot_artifacts, write_plot_artifacts
 from market_forecasting_engine.schema import ForecastConfig
 from market_forecasting_engine.security_master import load_security_master, resolve_security_metadata
 
@@ -386,6 +386,13 @@ def main() -> None:
     if forecast_log_path is not None:
         report.setdefault("artifacts", {})["forecast_log"] = str(forecast_log_path)
         _append_forecast_log(report, forecast_log_path)
+        report["artifacts"].update(
+            write_forecast_log_plot_artifacts(
+                forecast_log_path,
+                output_dir=output_dir or forecast_log_path.parent,
+                ticker=report.get("ticker"),
+            )
+        )
 
     print(_summary(report))
     print(

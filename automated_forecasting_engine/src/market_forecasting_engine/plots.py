@@ -96,6 +96,54 @@ def write_plot_artifacts(
     return artifacts
 
 
+def write_forecast_log_plot_artifacts(
+    forecast_log_path: str | Path,
+    output_dir: str | Path | None = None,
+    ticker: str | None = None,
+) -> dict[str, str]:
+    """Write plots from the compact append-only forecast log."""
+
+    log_path = Path(forecast_log_path)
+    if not log_path.exists():
+        return {}
+    frame = pd.read_csv(log_path)
+    if frame.empty:
+        return {}
+
+    required_columns = {"ticker", "forecast_timestamp", "predicted_price", "lower_price", "upper_price", "horizon"}
+    if not required_columns.issubset(frame.columns):
+        return {}
+
+    if ticker:
+        frame = frame[frame["ticker"].astype(str).str.upper() == ticker.upper()]
+    if frame.empty:
+        return {}
+
+    frame = frame.copy()
+    frame["forecast_timestamp"] = pd.to_datetime(frame["forecast_timestamp"], errors="coerce")
+    frame["as_of_timestamp"] = pd.to_datetime(frame.get("as_of_timestamp"), errors="coerce")
+    for column in ("predicted_price", "lower_price", "upper_price", "current_price", "horizon"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["forecast_timestamp", "predicted_price", "horizon"])
+    if frame.empty:
+        return {}
+
+    output_path = Path(output_dir) if output_dir is not None else log_path.parent
+    plot_path = output_path / "plots"
+    plot_path.mkdir(parents=True, exist_ok=True)
+    label = ticker.upper() if ticker else str(frame["ticker"].iloc[-1]).upper()
+
+    png_path = plot_path / f"forecast_log_{label}.png"
+    html_path = plot_path / f"forecast_log_{label}.html"
+    _plot_forecast_log(frame, png_path, label)
+    _plot_forecast_log_plotly(frame, html_path, label)
+    return {
+        "forecast_log_plot": str(png_path),
+        "forecast_log_plotly": str(html_path),
+    }
+
+
 def _plot_forecast(report: dict[str, Any], close: pd.Series, output_file: Path) -> None:
     history = close.tail(252)
     forecasts = sorted(report["forecasts"], key=lambda item: int(item["horizon_days"]))
@@ -127,6 +175,100 @@ def _plot_forecast(report: dict[str, Any], close: pd.Series, output_file: Path) 
     fig.tight_layout()
     fig.savefig(output_file, dpi=150)
     plt.close(fig)
+
+
+def _plot_forecast_log(frame: pd.DataFrame, output_file: Path, ticker: str) -> None:
+    ordered = frame.sort_values(["horizon", "forecast_timestamp", "as_of_timestamp"])
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for horizon, group in ordered.groupby("horizon"):
+        label = f"{int(horizon)} bar horizon"
+        group = group.sort_values("forecast_timestamp")
+        ax.plot(
+            group["forecast_timestamp"],
+            group["predicted_price"],
+            marker="o",
+            linewidth=1.8,
+            label=label,
+        )
+        if {"lower_price", "upper_price"}.issubset(group.columns):
+            ax.fill_between(
+                group["forecast_timestamp"],
+                group["lower_price"],
+                group["upper_price"],
+                alpha=0.12,
+            )
+
+    latest_current = ordered.dropna(subset=["as_of_timestamp", "current_price"])
+    if not latest_current.empty:
+        current = latest_current.sort_values("as_of_timestamp").drop_duplicates("as_of_timestamp", keep="last")
+        ax.scatter(
+            current["as_of_timestamp"],
+            current["current_price"],
+            color="#111827",
+            s=24,
+            label="Observed at forecast time",
+            zorder=4,
+        )
+
+    ax.set_title(f"{ticker} Forecast Log")
+    ax.set_xlabel("Forecast timestamp")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=150)
+    plt.close(fig)
+
+
+def _plot_forecast_log_plotly(frame: pd.DataFrame, output_file: Path, ticker: str) -> None:
+    ordered = frame.sort_values(["horizon", "forecast_timestamp", "as_of_timestamp"])
+    fig = go.Figure()
+    for horizon, group in ordered.groupby("horizon"):
+        group = group.sort_values("forecast_timestamp")
+        customdata = group[["as_of_timestamp", "lower_price", "upper_price", "expected_direction", "selected_model"]].to_numpy()
+        fig.add_trace(
+            go.Scatter(
+                x=group["forecast_timestamp"],
+                y=group["predicted_price"],
+                customdata=customdata,
+                mode="lines+markers",
+                name=f"{int(horizon)} bar horizon",
+                hovertemplate=(
+                    "Forecast timestamp: %{x|%Y-%m-%d %H:%M}"
+                    "<br>Predicted price: %{y:.2f}"
+                    "<br>As of: %{customdata[0]|%Y-%m-%d %H:%M}"
+                    "<br>Interval: %{customdata[1]:.2f} - %{customdata[2]:.2f}"
+                    "<br>Direction: %{customdata[3]}"
+                    "<br>Model: %{customdata[4]}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    latest_current = ordered.dropna(subset=["as_of_timestamp", "current_price"])
+    if not latest_current.empty:
+        current = latest_current.sort_values("as_of_timestamp").drop_duplicates("as_of_timestamp", keep="last")
+        fig.add_trace(
+            go.Scatter(
+                x=current["as_of_timestamp"],
+                y=current["current_price"],
+                mode="markers",
+                name="Observed at forecast time",
+                marker={"color": "#111827", "size": 7},
+                hovertemplate="As of: %{x|%Y-%m-%d %H:%M}<br>Current price: %{y:.2f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=f"{ticker} Forecast Log",
+        xaxis_title="Forecast timestamp",
+        yaxis_title="Price",
+        template="plotly_white",
+        hovermode="x unified",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "right", "x": 1},
+    )
+    fig.write_html(output_file, include_plotlyjs=True, full_html=True)
 
 
 def _plot_forecast_plotly(report: dict[str, Any], close: pd.Series, output_file: Path) -> None:

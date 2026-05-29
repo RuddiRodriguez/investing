@@ -187,6 +187,13 @@ For live Yahoo runs where `--end` is omitted, the engine now refreshes provider 
 <output-dir>/forecast_log.csv
 ```
 
+It also writes forecast-history plots from that log:
+
+```text
+<output-dir>/plots/forecast_log_<TICKER>.png
+<output-dir>/plots/forecast_log_<TICKER>.html
+```
+
 Use `--allow-live-cache` only when you explicitly want to reuse cached provider data.
 
 Optional CSV inputs can add macro, rates, and event data:
