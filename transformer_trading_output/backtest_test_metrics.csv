@@ -1,0 +1,2 @@
+label,n_signals,n_trades_nonzero,total_return_pct,annualized_sharpe,max_drawdown_pct,hit_rate_nonzero,avg_net_return_per_signal_pct,turnover_avg,transaction_cost_bps,bullish_threshold,bearish_threshold,allow_short
+test,19,17,10.767913471262581,0.2919902798208566,-16.796269760029002,0.47058823529411764,0.5396982932790229,0.21052631578947367,5.0,0.6,0.4,True

@@ -26,6 +26,35 @@ def _series_to_pct_map(series: pd.Series) -> dict[str, float]:
     return {str(k): round(float(v) * 100, 2) for k, v in series.items()}
 
 
+def _require_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Set OPENAI_API_KEY to enable AI interpretation.")
+    if OpenAI is None:
+        raise ValueError("The openai package is not installed. Run `pip install -r requirements.txt`.")
+    return OpenAI(api_key=api_key)
+
+
+def _append_web_sources(response: Any, output_text: str) -> str:
+    sources = []
+    for item in getattr(response, "output", []):
+        if getattr(item, "type", None) != "web_search_call":
+            continue
+        action = getattr(item, "action", None)
+        if not action:
+            continue
+        for source in getattr(action, "sources", []) or []:
+            title = getattr(source, "title", "Source")
+            url = getattr(source, "url", "")
+            if url:
+                sources.append(f"- [{title}]({url})")
+
+    if sources:
+        output_text = f"{output_text}\n\n**Sources**\n" + "\n".join(dict.fromkeys(sources))
+
+    return output_text
+
+
 def build_analysis_payload(results: dict[str, Any], user_note: str) -> dict[str, Any]:
     """Reduce the backtest output to a compact payload for the model."""
 
@@ -66,13 +95,7 @@ def interpret_results_with_openai(
 ) -> str:
     """Ask OpenAI for a structured interpretation of the latest portfolio state."""
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Set OPENAI_API_KEY to enable AI interpretation.")
-    if OpenAI is None:
-        raise ValueError("The openai package is not installed. Run `pip install -r requirements.txt`.")
-
-    client = OpenAI(api_key=api_key)
+    client = _require_openai_client()
     payload = build_analysis_payload(results, user_note)
 
     tools = [{"type": "web_search"}] if use_web_search else []
@@ -119,21 +142,40 @@ def interpret_results_with_openai(
     output_text = getattr(response, "output_text", "").strip()
     if not use_web_search:
         return output_text
+    return _append_web_sources(response, output_text)
 
-    sources = []
-    for item in getattr(response, "output", []):
-        if getattr(item, "type", None) != "web_search_call":
-            continue
-        action = getattr(item, "action", None)
-        if not action:
-            continue
-        for source in getattr(action, "sources", []) or []:
-            title = getattr(source, "title", "Source")
-            url = getattr(source, "url", "")
-            if url:
-                sources.append(f"- [{title}]({url})")
 
-    if sources:
-        output_text = f"{output_text}\n\n**Sources**\n" + "\n".join(dict.fromkeys(sources))
+def summarize_daily_finance_news_with_openai(
+    focus_note: str = "",
+    model: str = "gpt-4.1",
+) -> str:
+    """Summarize the most relevant current finance news for an investor."""
 
-    return output_text
+    client = _require_openai_client()
+    today = date.today().isoformat()
+    focus_text = focus_note.strip() or "No specific focus provided."
+    instructions = (
+        "You are a cautious finance news assistant for retail investors. "
+        f"Today is {today}. Use web search and summarize the most important finance and macro news relevant for investing today. "
+        "Prioritize events that could materially affect stocks, bonds, ETFs, inflation expectations, interest rates, currencies, "
+        "commodities, or broad market sentiment. "
+        "Use current sources and state dates clearly. Do not present old events as new. "
+        "Avoid hype and avoid stock-picking language unless the user explicitly asked for that. "
+        "Return concise markdown with these sections: "
+        "1) Top Market News Today "
+        "2) Why It Matters For Investors "
+        "3) What To Watch Next. "
+        "Keep the language simple and practical. Treat this as educational information, not financial advice."
+    )
+
+    response = client.responses.create(
+        model=model,
+        instructions=instructions,
+        input=f"User focus: {focus_text}",
+        tools=[{"type": "web_search"}],
+        tool_choice="required",
+        include=["web_search_call.action.sources"],
+    )
+
+    output_text = getattr(response, "output_text", "").strip()
+    return _append_web_sources(response, output_text)

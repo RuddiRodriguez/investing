@@ -1,0 +1,4 @@
+signal_date,next_date,regime,portfolio_value_start,portfolio_value_end,daily_pnl,daily_return,benchmark_value_start,benchmark_value_end,benchmark_return,cash,cash_weight,gross_exposure,buy_count,hold_count,sell_count,realized_pnl_cumulative
+2026-05-08,2026-05-11,risk_on_growth,10000.0,10000.0,0.0,0.0,10000.0,10022.775855954316,0.002277585595431564,10000.0,1.0,0.0,0,5,1,0.0
+2026-05-11,2026-05-12,risk_on_growth,10000.0,10000.0,0.0,0.0,10022.775855954316,10007.591951984772,-0.0015149399914519135,10000.0,1.0,0.0,0,6,0,0.0
+2026-05-12,2026-05-13,risk_on_growth,10000.0,10000.0,0.0,0.0,10007.591951984772,10063.582908170232,0.005594848036780231,10000.0,1.0,0.0,0,5,1,0.0

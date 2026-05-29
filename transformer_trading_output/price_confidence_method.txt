@@ -1,0 +1,51 @@
+Empirical price confidence method
+=================================
+
+What the model predicts
+-----------------------
+The Transformer predicts probability of outperformance, not an exact price.
+
+How the approximate price is created
+------------------------------------
+approx_future_close = close_t * exp(B_train + p * E_out_train + (1 - p) * E_under_train)
+
+where p is the model probability that NVDA outperforms SPY over the next 20 trading days.
+
+How the confidence bands are created
+------------------------------------
+The bands are empirical error bands calibrated on the validation set.
+
+For every validation prediction:
+
+    residual = actual_future_stock_log_return - approx_log_return
+
+Then the script takes residual quantiles:
+
+    68% band: residual q16 to q84
+    90% band: residual q05 to q95
+
+For a new signal:
+
+    lower_band = close_t * exp(approx_log_return + residual_low_quantile)
+    upper_band = close_t * exp(approx_log_return + residual_high_quantile)
+
+Interpretation
+--------------
+These are approximate empirical confidence intervals, not guaranteed statistical confidence intervals.
+They answer: historically, on the validation period, how far was the approximate price from the realized price?
+
+Calibration diagnostics from validation set
+-------------------------------------------
+median_absolute_price_error_pct: 8.6096%
+mae_log_return: 0.10656661
+rmse_log_return: 0.13468663
+coverage_68: 0.6755
+coverage_90: 0.8989
+
+Residual quantiles
+------------------
+q05: -0.17241893
+q16: -0.09305516
+q50: 0.01665861
+q84: 0.18466711
+q95: 0.25376384

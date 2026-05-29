@@ -1,0 +1,53 @@
+{
+  "cash": 100.99537501260376,
+  "realized_pnl": 11.28537501260376,
+  "benchmark_value": 101.56042878821691,
+  "units": {
+    "TSLA": 0.0,
+    "AMD": 0.0,
+    "GOOGL": 0.0,
+    "META": 0.0,
+    "NVDA": 0.0,
+    "ASML": 0.0,
+    "AAPL": 0.0,
+    "AVGO": 0.0,
+    "LLY": 0.0,
+    "XOM": 0.0,
+    "SHEL": 0.0,
+    "TSM": 0.0,
+    "ETH-USD": 0.0,
+    "SOL-USD": 0.0
+  },
+  "avg_cost": {
+    "TSLA": null,
+    "AMD": null,
+    "GOOGL": null,
+    "META": null,
+    "NVDA": null,
+    "ASML": null,
+    "AAPL": null,
+    "AVGO": null,
+    "LLY": null,
+    "XOM": null,
+    "SHEL": null,
+    "TSM": null,
+    "ETH-USD": null,
+    "SOL-USD": null
+  },
+  "entry_date": {
+    "TSLA": null,
+    "AMD": null,
+    "GOOGL": null,
+    "META": null,
+    "NVDA": null,
+    "ASML": null,
+    "AAPL": null,
+    "AVGO": null,
+    "LLY": null,
+    "XOM": null,
+    "SHEL": null,
+    "TSM": null,
+    "ETH-USD": null,
+    "SOL-USD": null
+  }
+}

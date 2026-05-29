@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketforecasting.watchagent.asml.medium</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/ruddigarcia/Projects/invest/automated_forecasting_engine/scripts/run_watch_agent_once.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ruddigarcia/Projects/invest</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PROJECT_DIR</key>
+    <string>/Users/ruddigarcia/Projects/invest</string>
+    <key>TICKER</key>
+    <string>ASML</string>
+    <key>PROFILE</key>
+    <string>medium</string>
+    <key>HOLDING_STATUS</key>
+    <string>not_owned</string>
+    <key>REFRESH_AFTER_HOURS</key>
+    <string>12</string>
+    <key>LLM_ENV_FILE</key>
+    <string>/Users/ruddigarcia/Projects/invest/.env</string>
+    <key>QUIET_UNCHANGED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ruddigarcia/Projects/invest/automated_forecasting_engine/runs/watch_agent_state/launchd_stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/ruddigarcia/Projects/invest/automated_forecasting_engine/runs/watch_agent_state/launchd_stderr.log</string>
+</dict>
+</plist>

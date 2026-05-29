@@ -1,0 +1,53 @@
+Price scenario calculation method
+=================================
+
+Model output
+------------
+The Transformer is a classifier. It predicts only this probability:
+
+    p = probability that NVDA outperforms SPY over the next 20 trading days
+
+It does not directly predict an exact future price.
+
+Approximate price formula
+-------------------------
+For each signal date t:
+
+    approx_future_close = close_t * exp(approx_log_return)
+
+where:
+
+    approx_log_return = B_train + p * E_out_train + (1 - p) * E_under_train
+
+Definitions
+-----------
+B_train:
+    Historical median future log return of SPY in the training set.
+
+E_out_train:
+    Historical median excess log return of NVDA versus SPY in the training set,
+    using only cases where NVDA actually outperformed SPY.
+
+E_under_train:
+    Historical median excess log return of NVDA versus SPY in the training set,
+    using only cases where NVDA did not outperform SPY.
+
+Scenario band
+-------------
+The low/high band uses the same formula but replaces median excess returns with
+20th and 80th percentile conditional excess returns from the training set.
+
+Important interpretation
+------------------------
+This price is an approximate scenario derived from historical behavior and model probability.
+It is not a direct price forecast and it does not use realized future returns.
+
+Parameters used
+---------------
+benchmark_base_log_return: 0.01684043
+median_excess_if_outperform: 0.07957152
+median_excess_if_underperform: -0.05947271
+q20_excess_if_outperform: 0.03104764
+q80_excess_if_outperform: 0.13653232
+q20_excess_if_underperform: -0.13835608
+q80_excess_if_underperform: -0.02196459

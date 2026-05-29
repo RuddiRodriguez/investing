@@ -7,7 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.ai_interpreter import interpret_results_with_openai
+from scripts.stochastic_pipeline import run_stochastic_analysis
+from src.ai_interpreter import interpret_results_with_openai, summarize_daily_finance_news_with_openai
 from src.data import download_prices, load_inflation_series, parse_uploaded_csv
 from src.strategy import StrategyConfig, backtest
 
@@ -25,6 +26,66 @@ INFLATION_OPTIONS = {
     "Netherlands": {"code": "NL", "index_label": "HICP", "source": "Eurostat"},
     "Spain": {"code": "ES", "index_label": "HICP", "source": "Eurostat"},
 }
+RESOURCE_CATEGORIES = {
+    "Market Data And News": [
+        {
+            "name": "Investing.com",
+            "url": "https://www.investing.com/",
+            "description": "Live markets, economic calendar, rates, commodities, and broad news coverage.",
+        },
+        {
+            "name": "Yahoo Finance",
+            "url": "https://finance.yahoo.com/",
+            "description": "Quotes, charts, ETF holdings snapshots, and headline market news.",
+        },
+        {
+            "name": "Trading Economics",
+            "url": "https://tradingeconomics.com/",
+            "description": "Macro indicators, country data, central bank updates, and economic calendars.",
+        },
+    ],
+    "ETF Research": [
+        {
+            "name": "Morningstar ETFs",
+            "url": "https://www.morningstar.com/topics/etfs",
+            "description": "ETF research, category analysis, ratings, and fund commentary.",
+        },
+        {
+            "name": "JustETF",
+            "url": "https://www.justetf.com/",
+            "description": "Strong ETF screener for European investors, including UCITS funds and comparisons.",
+        },
+        {
+            "name": "ETF.com",
+            "url": "https://www.etf.com/",
+            "description": "ETF education, industry news, fund data, and screening tools.",
+        },
+    ],
+    "Official Macro Data": [
+        {
+            "name": "FRED",
+            "url": "https://fred.stlouisfed.org/",
+            "description": "Official-style macro data portal for inflation, rates, employment, and growth series.",
+        },
+        {
+            "name": "Eurostat",
+            "url": "https://ec.europa.eu/eurostat",
+            "description": "European statistics on inflation, GDP, labor markets, and household data.",
+        },
+    ],
+    "Investor Protection And Checks": [
+        {
+            "name": "Investor.gov",
+            "url": "https://www.investor.gov/",
+            "description": "U.S. SEC investor education, fraud warnings, and basic investment explainers.",
+        },
+        {
+            "name": "FINRA BrokerCheck",
+            "url": "https://brokercheck.finra.org/",
+            "description": "Check whether a broker or adviser is registered and review disclosures.",
+        },
+    ],
+}
 
 
 def _format_pct(value: float) -> str:
@@ -39,9 +100,123 @@ def _load_prices(data_source: str, tickers: list[str], start_date: pd.Timestamp,
     return parse_uploaded_csv(uploaded_file.getvalue())
 
 
+def _load_single_price_series(
+    data_source: str,
+    ticker: str,
+    start_date: pd.Timestamp,
+    uploaded_file,
+    uploaded_column: str | None,
+) -> pd.DataFrame:
+    if data_source == "Yahoo Finance":
+        prices = download_prices([ticker.strip().upper()], start_date.strftime("%Y-%m-%d"))
+        column = prices.columns[0]
+        return prices[[column]].rename(columns={column: ticker.strip().upper()})
+
+    if uploaded_file is None:
+        raise ValueError("Upload a CSV file or switch to Yahoo Finance.")
+    prices = parse_uploaded_csv(uploaded_file.getvalue())
+    if prices.empty:
+        raise ValueError("Uploaded CSV returned no usable price data.")
+    column = uploaded_column or str(prices.columns[0])
+    if column not in prices.columns:
+        raise ValueError(f"Column {column} is not present in the uploaded CSV.")
+    return prices[[column]].rename(columns={column: str(column).upper()})
+
+
 @st.cache_data(show_spinner=False)
 def _load_cpi_data(region_code: str) -> pd.DataFrame:
     return load_inflation_series(region_code)
+
+
+def _build_stochastic_price_chart(result: dict) -> go.Figure:
+    history = result["history"].copy()
+    history["date"] = pd.to_datetime(history["date"], errors="coerce")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history["date"],
+            y=history["price"],
+            mode="lines",
+            name="History",
+            line=dict(color="#1f2937", width=2),
+        )
+    )
+
+    for label, color in (("gbm", "#2563eb"), ("garch", "#dc2626"), ("egarch", "#059669")):
+        model_result = result[label]
+        if label == "gbm":
+            cone = model_result["price_cone"].copy()
+        else:
+            cone = model_result.price_cone.copy()
+        cone = cone.reset_index().rename(columns={cone.index.name or "index": "date"})
+        if "index" in cone.columns and "date" not in cone.columns:
+            cone = cone.rename(columns={"index": "date"})
+        cone["date"] = pd.to_datetime(cone["date"], errors="coerce")
+        fig.add_trace(
+            go.Scatter(
+                x=cone["date"],
+                y=cone["p90"],
+                mode="lines",
+                line=dict(color=color, width=0),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=cone["date"],
+                y=cone["p10"],
+                mode="lines",
+                line=dict(color=color, width=0),
+                fill="tonexty",
+                fillcolor=f"rgba{(*tuple(int(color[i:i+2], 16) for i in (1, 3, 5)), 0.10)}",
+                hoverinfo="skip",
+                name=f"{model_result['model_name'] if label == 'gbm' else model_result.model_name} 10-90% band",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=cone["date"],
+                y=cone["p50"],
+                mode="lines",
+                name=f"{model_result['model_name'] if label == 'gbm' else model_result.model_name} median",
+                line=dict(color=color, width=2, dash="dash" if label == "gbm" else "solid"),
+            )
+        )
+
+    fig.update_layout(
+        title="Stochastic Price Cones",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        height=460,
+    )
+    return fig
+
+
+def _build_stochastic_volatility_chart(result: dict) -> go.Figure:
+    fig = go.Figure()
+    for model_result, color in ((result["garch"], "#dc2626"), (result["egarch"], "#059669")):
+        forecast = model_result.volatility_forecast.copy().reset_index().rename(columns={"index": "date"})
+        forecast["date"] = pd.to_datetime(forecast["date"], errors="coerce")
+        fig.add_trace(
+            go.Scatter(
+                x=forecast["date"],
+                y=forecast["annualized_volatility"],
+                mode="lines+markers",
+                name=model_result.model_name,
+                line=dict(color=color, width=2),
+            )
+        )
+
+    fig.update_layout(
+        title="Forward Volatility Forecast",
+        xaxis_title="Date",
+        yaxis_title="Annualized volatility",
+        yaxis_tickformat=".1%",
+        height=360,
+    )
+    return fig
 
 
 def main() -> None:
@@ -51,7 +226,7 @@ def main() -> None:
         "using price strength, long-term direction, and occasional portfolio updates."
     )
 
-    analysis_tab, inflation_tab = st.tabs(["ETF Analysis", "Inflation / CPI"])
+    analysis_tab, stochastic_tab, inflation_tab, resources_tab = st.tabs(["ETF Analysis", "Stochastic Models", "Inflation / CPI", "Resources"])
 
     with analysis_tab:
         with st.sidebar:
@@ -244,6 +419,148 @@ def main() -> None:
                     """
                 )
 
+    with stochastic_tab:
+        st.subheader("Stochastic Process Modeling")
+        st.caption(
+            "Run a probabilistic market-dynamics view using GBM for price paths and GARCH / EGARCH for volatility clustering and persistence."
+        )
+
+        control_col1, control_col2, control_col3, control_col4 = st.columns([1.1, 1.4, 1.0, 1.0])
+        with control_col1:
+            stochastic_data_source = st.radio(
+                "Price source",
+                ["Yahoo Finance", "Upload CSV"],
+                index=0,
+                key="stochastic_data_source",
+            )
+        with control_col2:
+            stochastic_ticker = st.text_input("Ticker", value="SPY", key="stochastic_ticker")
+        with control_col3:
+            stochastic_start_date = st.date_input(
+                "History start",
+                value=pd.Timestamp("2018-01-01"),
+                key="stochastic_start_date",
+            )
+        with control_col4:
+            horizon_days = st.slider("Forecast days", 5, 90, 30, key="stochastic_horizon_days")
+
+        control_col5, control_col6, control_col7 = st.columns([1.2, 1.0, 1.0])
+        with control_col5:
+            uploaded_file = st.file_uploader("Upload price CSV", type=["csv"], key="stochastic_uploaded_file")
+        uploaded_column = None
+        if uploaded_file is not None and stochastic_data_source == "Upload CSV":
+            uploaded_prices = parse_uploaded_csv(uploaded_file.getvalue())
+            uploaded_column = st.selectbox(
+                "Price column",
+                options=[str(column) for column in uploaded_prices.columns],
+                index=0,
+                key="stochastic_uploaded_column",
+            )
+        with control_col6:
+            simulation_paths = st.slider("GBM paths", 200, 5000, 1500, step=100, key="stochastic_paths")
+        with control_col7:
+            random_seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1, key="stochastic_seed")
+
+        run_stochastic_button = st.button("Run stochastic models", type="primary", key="run_stochastic_button")
+
+        st.markdown(
+            """
+            **What this tab does**
+
+            1. Fits a geometric Brownian motion view of future price paths.
+            2. Fits GARCH(1,1) and EGARCH(1,1) style volatility processes.
+            3. Shows forward price cones and volatility forecasts instead of a single point estimate.
+            """
+        )
+
+        if not run_stochastic_button:
+            st.info("Choose a series and click Run stochastic models.")
+        else:
+            progress_bar = st.progress(0.0)
+            progress_status = st.empty()
+
+            def stochastic_progress(step: int, total: int, message: str) -> None:
+                progress_bar.progress(step / max(total, 1))
+                progress_status.write(message)
+
+            try:
+                price_frame = _load_single_price_series(
+                    data_source=stochastic_data_source,
+                    ticker=stochastic_ticker,
+                    start_date=pd.Timestamp(stochastic_start_date),
+                    uploaded_file=uploaded_file,
+                    uploaded_column=uploaded_column,
+                )
+                result = run_stochastic_analysis(
+                    price_frame,
+                    horizon_days=horizon_days,
+                    num_paths=simulation_paths,
+                    seed=int(random_seed),
+                    progress_callback=stochastic_progress,
+                )
+                progress_bar.progress(1.0)
+                progress_status.success("Stochastic model run complete.")
+            except Exception as exc:
+                progress_status.error(str(exc))
+                st.error(str(exc))
+                result = None
+
+            if result is not None:
+                comparison = result["comparison"].copy()
+                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                metric_col1.metric("Last price", f"{result['last_price']:.2f}")
+                metric_col2.metric("GBM median terminal price", f"{comparison.loc[comparison['model'] == 'GBM', 'terminal_median_price'].iloc[0]:.2f}")
+                metric_col3.metric("GARCH terminal vol", f"{result['garch'].volatility_forecast.iloc[-1]['annualized_volatility']:.2%}")
+                metric_col4.metric("EGARCH terminal vol", f"{result['egarch'].volatility_forecast.iloc[-1]['annualized_volatility']:.2%}")
+
+                left, right = st.columns([2.2, 1.2])
+                left.plotly_chart(_build_stochastic_price_chart(result), use_container_width=True)
+                right.plotly_chart(_build_stochastic_volatility_chart(result), use_container_width=True)
+
+                st.subheader("Model Comparison")
+                st.dataframe(
+                    comparison.style.format(
+                        {
+                            "annualized_volatility": "{:.2%}",
+                            "terminal_median_price": "{:.2f}",
+                            "terminal_p10_price": "{:.2f}",
+                            "terminal_p90_price": "{:.2f}",
+                            "log_likelihood": "{:.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+
+                parameter_rows = [
+                    {"model": "GBM", **result["gbm"]["parameters"]},
+                    {"model": result["garch"].model_name, **result["garch"].parameters},
+                    {"model": result["egarch"].model_name, **result["egarch"].parameters},
+                ]
+                st.subheader("Estimated Parameters")
+                st.dataframe(pd.DataFrame(parameter_rows), use_container_width=True)
+
+                realized_vol = result["log_returns"].rolling(20).std() * (252 ** 0.5)
+                realized_vol = realized_vol.dropna().rename("realized_20d_vol")
+                if not realized_vol.empty:
+                    realized_chart = go.Figure()
+                    realized_chart.add_trace(
+                        go.Scatter(
+                            x=realized_vol.index,
+                            y=realized_vol.values,
+                            mode="lines",
+                            name="Realized 20d volatility",
+                            line=dict(color="#1f2937", width=2),
+                        )
+                    )
+                    st.subheader("Recent Realized Volatility")
+                    realized_chart.update_layout(
+                        xaxis_title="Date",
+                        yaxis_title="Annualized volatility",
+                        yaxis_tickformat=".1%",
+                        height=320,
+                    )
+                    st.plotly_chart(realized_chart, use_container_width=True)
+
     with inflation_tab:
         st.subheader("Inflation")
         selected_region = st.selectbox("Country", list(INFLATION_OPTIONS.keys()), index=0)
@@ -315,6 +632,53 @@ def main() -> None:
             )
         except Exception as exc:
             st.error(f"Unable to load inflation data right now: {exc}")
+
+    with resources_tab:
+        st.subheader("Useful Investing Resources")
+        st.caption(
+            "A short list of widely used websites for market data, ETF research, macro data, and investor safety checks."
+        )
+
+        st.markdown("### AI Finance News")
+        st.caption(
+            "Generate a fresh AI summary of the most important finance news for investors. This runs only when you click the button."
+        )
+        news_focus = st.text_input(
+            "Optional focus",
+            value="ETFs, inflation, interest rates, and global markets",
+            key="resources_ai_focus",
+            help="Example: European ETFs, technology stocks, bonds, or central banks.",
+        )
+        summarize_news = st.button("Summarize Today's Finance News", key="resources_ai_news_button")
+
+        if summarize_news:
+            try:
+                with st.spinner("Summarizing current finance news..."):
+                    news_summary = summarize_daily_finance_news_with_openai(
+                        focus_note=news_focus,
+                    )
+                st.markdown(news_summary)
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown(
+            """
+            Use these sites to cross-check ideas before investing:
+
+            - compare the same ETF across more than one source
+            - verify macro claims with official data when possible
+            - check fees, holdings, and region/currency details before buying
+            - verify brokers and avoid acting on unverified social media tips
+            """
+        )
+
+        for category, resources in RESOURCE_CATEGORIES.items():
+            st.markdown(f"### {category}")
+            for resource in resources:
+                st.markdown(
+                    f"- [{resource['name']}]({resource['url']})  \n"
+                    f"  {resource['description']}"
+                )
 
 
 if __name__ == "__main__":

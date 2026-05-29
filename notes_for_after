@@ -1,0 +1,21 @@
+Chapter 20 LLM integration note
+
+The Chapter 20 ticker suitability layer is intentionally rule-based first. It scores whether a completed ticker report is suitable for short-term trading, intermediate trading, long-term investing, speculative satellite monitoring, or index/diversifier use.
+
+Later this layer should be combined with an LLM reviewer/agent. The LLM should consume the completed Chapter 18 tactical packet, Chapter 19 validation, and Chapter 20 suitability packet to explain and rank tickers across a universe. It must not override Chapter 18 tactical gates or Chapter 19 operational validation; it can only review, explain, compare, and downgrade.
+
+Chapter 21 LLM integration note
+
+The Chapter 21 chart-selection layer should also remain rule-based first. A later LLM reviewer can compare the generated chart_book_row objects across many tickers, explain why each ticker is active review, watchlist, monitor-only, or excluded, and produce a human-readable chart-book summary. The LLM must not promote a ticker that Chapter 19 marks non-auditable or Chapter 20 marks avoid-for-now.
+
+Chapters 23-30 LLM integration note
+
+The Chapters 23-30 trade/risk plan is also rule-based first. In a second version, an LLM trade/risk reviewer should consume Chapter 18 tactical plan, Chapter 19 validation, Chapter 20 suitability, Chapter 21 chart selection, and the Chapters 23-30 trade/risk packet together. The LLM can explain whether the plan is coherent, compare trade/risk plans across tickers, and downgrade or request manual review. It must not override protective stops, position-size limits, margin/short restrictions, or Chapter 19 operational blockers.
+
+Chapters 31/38/40-42 LLM integration note
+
+The portfolio capital/risk layer should remain rule-based first. A later LLM portfolio reviewer can explain allocation tradeoffs across tickers and portfolio profiles, but it must not bypass diversification checks, account-equity risk budgets, cash constraints, drawdown limits, or blocked capital gates.
+
+Chapters 39/43 LLM integration note
+
+The discipline/governance layer should remain the final process audit. A later LLM discipline reviewer can explain rule deviations, compare the current run with prior runs, and suggest what evidence to collect next, but it cannot justify breaking stops, validation gates, sizing limits, portfolio capital gates, or method-card/version discipline.

@@ -1,0 +1,29 @@
+[project]
+name = "market-forecasting-engine"
+version = "0.1.0"
+description = "Governable automated stock price forecasting engine prototype."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "matplotlib>=3.8",
+  "plotly>=6.0",
+  "pyarrow>=16.0",
+  "pdfplumber>=0.11",
+  "statsmodels>=0.14,<1.0",
+  "arch>=7.0,<9.0",
+  "PyWavelets>=1.8,<2.0",
+  "yfinance>=0.2",
+]
+
+[project.optional-dependencies]
+lightgbm = ["lightgbm>=4.5"]
+optimization = ["optuna>=3.6,<5.0"]
+deep-learning = ["torch>=2.2,<3.0"]
+llm = ["openai>=1.0,<2.0"]
+bayesian = ["pymc>=5,<6"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

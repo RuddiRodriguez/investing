@@ -1,0 +1,4 @@
+asset_scope,tracked_by_simulation,simulation_ticker,source_symbol,name,shares,avg_cost,entry_date,cash_effect,portfolio_as_of_date
+cash,True,CASH,EUR,Cash,0.0,1.0,,0.0,2026-05-05
+tracked,True,ETH-USD,ETH,Ethereum,0.004877,2255.4849292597905,2026-05-05,-11.0,2026-05-05
+tracked,True,ASML,NL0010273215,ASML,0.006636,1356.23869801085,2026-05-05,-9.0,2026-05-05

@@ -1,0 +1,10 @@
+{
+  "class_weight": "balanced",
+  "colsample_bytree": 0.9811629825630416,
+  "learning_rate": 0.10350246398492775,
+  "max_depth": 5,
+  "min_child_samples": 22,
+  "n_estimators": 100,
+  "num_leaves": 43,
+  "subsample": 0.7493106976689219
+}

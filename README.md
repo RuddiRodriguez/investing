@@ -39,6 +39,126 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Download Yahoo Finance Prices
+
+Use the simple script to download historical prices for any Yahoo Finance ticker symbol:
+
+```bash
+python scripts/download_yahoo_prices.py
+```
+
+Edit these values at the top of `scripts/download_yahoo_prices.py`:
+
+```python
+TICKER = "AAPL"
+START_DATE = "2020-01-01"
+END_DATE = None
+OUTPUT_FILE = "stock_prices.csv"
+```
+
+Then plot the downloaded close price:
+
+```bash
+python scripts/plot_stock_prices.py
+```
+
+Test the simplest direction prediction method in a graph:
+
+```bash
+python scripts/direction/method_1_graph_test.py
+```
+
+Test the momentum direction method in a graph:
+
+```bash
+python scripts/direction/method_2_graph_test.py
+```
+
+Test the moving average crossover method in a graph:
+
+```bash
+python scripts/direction/method_3_graph_test.py
+```
+
+Test the indicator voting method in a graph:
+
+```bash
+python scripts/direction/method_4_graph_test.py
+```
+
+Run the improved logistic regression direction method:
+
+```bash
+python scripts/direction/method_5_logistic_regression.py
+```
+
+Test the improved logistic regression method in a graph:
+
+```bash
+python scripts/direction/method_5_logistic_regression_graph_test.py
+```
+
+Try method 5 with LightGBM:
+
+```bash
+python scripts/direction/method_5_lgbm.py
+```
+
+Test the LightGBM method in a graph:
+
+```bash
+python scripts/direction/method_5_lgbm_graph_test.py
+```
+
+## Assess Risk
+
+Run the basic risk methods:
+
+```bash
+python scripts/risk/method_1_volatility.py
+python scripts/risk/method_2_drawdown.py
+python scripts/risk/method_3_var.py
+python scripts/risk/method_4_expected_shortfall.py
+python scripts/risk/method_5_signal_risk.py
+```
+
+Validate whether the risk assessment is doing a decent job:
+
+```bash
+python scripts/risk/validate_risk_assessment.py
+```
+
+The validation checks whether higher estimated risk buckets lead to worse future volatility/losses, and whether 95% VaR is breached near 5% of the time.
+
+## Predict Outperformance
+
+Run the advanced LightGBM outperformance model:
+
+```bash
+python scripts/outperformance/method_1_lgbm_outperformance.py
+```
+
+It uses `stock_prices.csv` as the stock and downloads `SPY` as the benchmark into `benchmark_prices.csv`.
+
+## Advanced Live Stock Pipeline
+
+The advanced implementation is standalone in `/Users/ruddigarcia/Projects/invest/scripts/advanced_pipeline`.
+It does not import the Streamlit app or the beginner strategy modules.
+
+Run it with live Yahoo Finance data:
+
+```bash
+python -m scripts.advanced_pipeline.cli --tickers AAPL,MSFT,NVDA,AMZN --benchmark SPY
+```
+
+The pipeline downloads live adjusted prices, fundamentals, and recent headline data, then caches identical requests under:
+
+```text
+/Users/ruddigarcia/Projects/invest/scripts/advanced_pipeline/.cache
+```
+
+Use `--force-refresh` to bypass the cache. The output includes each ticker's decision, confidence, expected excess return, expected volatility, risk score, position size, main drivers, and main risks.
+
 ## Deploy On Streamlit Community Cloud
 
 Deploy directly from the GitHub repository:

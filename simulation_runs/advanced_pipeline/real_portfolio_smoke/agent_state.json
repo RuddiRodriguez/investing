@@ -1,0 +1,29 @@
+{
+  "cash": 23.294718258178712,
+  "realized_pnl": 2.5847182581787096,
+  "benchmark_value": 23.555537014505575,
+  "units": {
+    "TSLA": 0.0,
+    "AMD": 0.0,
+    "GOOGL": 0.0,
+    "META": 0.0,
+    "NVDA": 0.0,
+    "ASML": 0.0
+  },
+  "avg_cost": {
+    "TSLA": null,
+    "AMD": null,
+    "GOOGL": null,
+    "META": null,
+    "NVDA": null,
+    "ASML": null
+  },
+  "entry_date": {
+    "TSLA": null,
+    "AMD": null,
+    "GOOGL": null,
+    "META": null,
+    "NVDA": null,
+    "ASML": null
+  }
+}
