@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def main() -> None:
     parser.add_argument("--stop-atr-multiple", type=float, default=1.2, help="ATR multiple used for stop distance.")
     parser.add_argument("--max-hold-bars", type=int, default=24, help="Maximum same-session hold length in bars.")
     parser.add_argument("--forecast-hours", default="1,2,4", help="Comma-separated hourly forecast horizons.")
-    parser.add_argument("--training-lookback-days", type=int, default=30, help="Minimum Yahoo intraday lookback used when the requested start has too few rows for modelling.")
+    parser.add_argument("--training-lookback-days", type=int, default=45, help="Minimum Yahoo intraday lookback used when the requested start has too few rows for modelling.")
     parser.add_argument("--selection-metric", default="mae", help="Model selection metric for the advanced hourly forecasting engine.")
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")
     parser.add_argument("--no-statistical-models", action="store_true", help="Disable optional ARIMA/SARIMA/GARCH/VAR candidates.")
@@ -87,6 +88,7 @@ def main() -> None:
     report = _run_advanced_hourly_forecast(prices, trade_report, args, result.metadata, forecast_hours)
     if output_dir is not None and not args.no_plot:
         report.setdefault("artifacts", {}).update(write_plot_artifacts(report, prices, output_dir, target_column=args.target_column))
+        report["artifacts"].update(_write_hour_named_validation_aliases(report, output_dir))
         report["artifacts"].update(
             write_daily_trade_plot_artifacts(
                 trade_report,
@@ -116,29 +118,45 @@ def _ensure_training_history(result, args: argparse.Namespace, provider_name: st
     prices = normalize_price_frame(result.frame, target_column=args.target_column)
     interval_minutes = infer_bar_interval_minutes(prices.index) or _interval_to_minutes(args.interval) or 5.0
     max_horizon_bars = max(1, max(int(round(hours * 60.0 / interval_minutes)) for hours in forecast_hours))
-    required_rows = max_horizon_bars + 60
-    if len(prices) >= required_rows:
+    required_rows = max(600, max_horizon_bars * 12)
+    fallback_start = (pd.Timestamp.now(tz=UTC).tz_convert(None) - pd.Timedelta(days=_safe_yahoo_intraday_lookback_days(args))).date().isoformat()
+    if len(prices) >= required_rows and (args.start is None or pd.Timestamp(args.start) <= pd.Timestamp(fallback_start)):
         return result
 
-    fallback_start = (pd.Timestamp.now(tz=UTC).tz_convert(None) - pd.Timedelta(days=args.training_lookback_days)).date().isoformat()
-    expanded = load_prices_with_provider(
-        provider_name,
-        DataRequest(
-            ticker=args.ticker,
-            start=fallback_start,
-            end=args.end,
-            interval=args.interval,
-            target_column=args.target_column,
-        ),
-        store=None,
-        use_cache=False,
-        refresh_cache=True,
-    )
+    try:
+        expanded = load_prices_with_provider(
+            provider_name,
+            DataRequest(
+                ticker=args.ticker,
+                start=fallback_start,
+                end=args.end,
+                interval=args.interval,
+                target_column=args.target_column,
+            ),
+            store=None,
+            use_cache=False,
+            refresh_cache=True,
+        )
+    except Exception as exc:
+        result.metadata["training_history_expanded"] = False
+        result.metadata["training_history_expand_error"] = str(exc)
+        result.metadata["training_history_required_rows"] = int(required_rows)
+        return result
     expanded.metadata["initial_request_rows"] = int(len(prices))
     expanded.metadata["training_history_expanded"] = True
     expanded.metadata["training_history_start"] = fallback_start
     expanded.metadata["training_history_required_rows"] = int(required_rows)
     return expanded
+
+
+def _safe_yahoo_intraday_lookback_days(args: argparse.Namespace) -> int:
+    interval_minutes = _interval_to_minutes(args.interval) or 1440.0
+    requested = max(1, int(args.training_lookback_days))
+    if interval_minutes < 60:
+        return min(requested, 45)
+    if interval_minutes < 1440:
+        return min(requested, 700)
+    return requested
 
 
 def _run_advanced_hourly_forecast(
@@ -153,9 +171,10 @@ def _run_advanced_hourly_forecast(
         interval_minutes = 5.0
     horizons = tuple(max(1, int(round(hours * 60.0 / float(interval_minutes)))) for hours in forecast_hours)
     n_rows = len(prices)
+    max_horizon = max(horizons)
     min_training_rows = max(30, min(180, max(20, n_rows // 2)))
-    validation_window = max(10, min(45, max(10, n_rows // 5)))
-    step_size = max(5, validation_window // 2)
+    validation_window = max(max_horizon, min(max_horizon * 3, max(10, n_rows // 5)))
+    step_size = max_horizon
     security_metadata = resolve_security_metadata(ticker=args.ticker, prices=prices, provider_metadata=provider_metadata)
     data_quality_report = build_data_quality_report(prices, target_column=args.target_column)
     calendar_summary = summarize_calendar_alignment(prices)
@@ -210,6 +229,7 @@ def _run_advanced_hourly_forecast(
     report["daily_trade_view"] = trade_report
     report["data_provider"] = provider_metadata
     report["forecast_hours"] = list(forecast_hours)
+    _annotate_validation_gates(report, forecast_hours=forecast_hours)
     report["generated_at_utc"] = datetime.now(UTC).isoformat()
     return report
 
@@ -259,16 +279,18 @@ def _run_compact_intraday_model_report(
                 search_level=args.search_level,
             )
             candidate_pool.extend([HistoricalMeanReturn(), RecentMeanReturn(window=12, name="recent_mean_return_12_bars")])
+            validation_window = max(horizon, min(horizon * 3, max(12, len(training_frame) // 5)))
+            step_size = max(horizon, 1)
             validation_results = validate_candidates(
                 candidates=candidate_pool,
                 features=training_frame[feature_columns],
                 target=training_frame["target"],
                 horizon_days=horizon,
-                min_training_rows=max(20, min(60, len(training_frame) // 2)),
-                validation_window=max(8, min(24, len(training_frame) // 4)),
-                step_size=max(4, min(12, len(training_frame) // 8)),
+                min_training_rows=max(40, min(240, len(training_frame) // 2)),
+                validation_window=validation_window,
+                step_size=step_size,
                 max_splits=5,
-                purge_window=min(horizon, 12),
+                purge_window=horizon,
                 embargo_window=0,
                 final_holdout_fraction=0.10,
             )
@@ -278,9 +300,9 @@ def _run_compact_intraday_model_report(
                     features=training_frame[feature_columns],
                     target=training_frame["target"],
                     horizon_days=horizon,
-                    min_training_rows=20,
-                    validation_window=max(8, min(16, len(training_frame) // 4)),
-                    step_size=4,
+                    min_training_rows=max(20, min(120, len(training_frame) // 2)),
+                    validation_window=max(horizon, min(horizon * 2, len(training_frame) // 4)),
+                    step_size=max(horizon, 1),
                     max_splits=3,
                     final_holdout_fraction=0.0,
                 )
@@ -304,6 +326,7 @@ def _run_compact_intraday_model_report(
         predicted_price = float(close.iloc[-1] * np.exp(prediction))
         lower_price = float(close.iloc[-1] * np.exp(prediction - interval_width))
         upper_price = float(close.iloc[-1] * np.exp(prediction + interval_width))
+        validation_gate = _validation_gate(validation_metrics)
         forecasts.append(
             {
                 "horizon_days": int(horizon),
@@ -322,6 +345,8 @@ def _run_compact_intraday_model_report(
                 "confidence_interval_method": "compact_intraday_residual_std",
                 "calibration_sample_size": int(len(training_frame)),
                 "trade_quality": {},
+                "validation_gate": validation_gate,
+                "trade_allowed": bool(validation_gate["trade_allowed"]),
                 "validation_metrics": validation_metrics,
             }
         )
@@ -360,6 +385,7 @@ def _run_compact_intraday_model_report(
             "fallback_reason": fallback_reason,
             "candidate_results": candidate_results,
             "selected_validation_predictions": selected_validation_predictions,
+            "validation_gates": {str(item["horizon_days"]): item["validation_gate"] for item in forecasts},
         },
         "governance": {"model_cards": model_cards},
         "technical_view": {},
@@ -391,9 +417,79 @@ def _intraday_model_features(prices: pd.DataFrame, target_column: str) -> pd.Dat
     features["close_to_vwap"] = close / vwap - 1
     features["ema_9_to_21"] = close.ewm(span=9, adjust=False).mean() / close.ewm(span=21, adjust=False).mean() - 1
     features["range_pct"] = (high - low) / close
+    session_key = pd.DatetimeIndex(prices.index).date
+    session_open = close.groupby(session_key).transform("first")
+    opening_high = high.groupby(session_key).transform(lambda values: values.head(6).max())
+    opening_low = low.groupby(session_key).transform(lambda values: values.head(6).min())
+    volume_sma = volume.rolling(24).mean()
+    features["close_to_session_open"] = close / session_open - 1
+    features["close_to_opening_high"] = close / opening_high - 1
+    features["close_to_opening_low"] = close / opening_low - 1
+    features["relative_volume_24_bars"] = volume / volume_sma - 1
     features["minute_of_day"] = pd.DatetimeIndex(prices.index).hour * 60 + pd.DatetimeIndex(prices.index).minute
     features["day_of_week"] = pd.DatetimeIndex(prices.index).dayofweek
     return features.replace([np.inf, -np.inf], np.nan).ffill()
+
+
+def _validation_gate(metrics: dict[str, object]) -> dict[str, object]:
+    directional_accuracy = float(metrics.get("directional_accuracy", 0.0) or 0.0)
+    mae = float(metrics.get("mae", 999.0) or 999.0)
+    holdout_directional_accuracy = float(metrics.get("holdout_directional_accuracy", directional_accuracy) or 0.0)
+    holdout_mae = float(metrics.get("holdout_mae", mae) or mae)
+    reasons = []
+    if directional_accuracy < 0.45:
+        reasons.append("low_walk_forward_directional_accuracy")
+    if holdout_directional_accuracy < 0.45:
+        reasons.append("low_holdout_directional_accuracy")
+    if mae > 0.012:
+        reasons.append("high_walk_forward_mae")
+    if holdout_mae > 0.012:
+        reasons.append("high_holdout_mae")
+    return {
+        "trade_allowed": not reasons,
+        "status": "pass" if not reasons else "weak_validation",
+        "reasons": reasons,
+        "directional_accuracy": directional_accuracy,
+        "holdout_directional_accuracy": holdout_directional_accuracy,
+        "mae": mae,
+        "holdout_mae": holdout_mae,
+    }
+
+
+def _annotate_validation_gates(report: dict, forecast_hours: tuple[float, ...]) -> None:
+    gates = {}
+    for forecast, hours in zip(report.get("forecasts", []), forecast_hours):
+        forecast["horizon_hours"] = float(hours)
+        gate = _validation_gate(forecast.get("validation_metrics", {}))
+        forecast["validation_gate"] = gate
+        forecast["trade_allowed"] = bool(gate["trade_allowed"])
+        gates[str(forecast.get("horizon_days"))] = gate
+    report.setdefault("diagnostics", {})["validation_gates"] = gates
+
+
+def _write_hour_named_validation_aliases(report: dict, output_dir: Path) -> dict[str, str]:
+    artifacts: dict[str, str] = {}
+    plot_dir = output_dir / "plots"
+    for forecast in report.get("forecasts", []):
+        horizon = int(forecast.get("horizon_days", 0))
+        hours = forecast.get("horizon_hours")
+        if not horizon or hours is None:
+            continue
+        hour_label = _hour_label(float(hours))
+        for suffix in ("png", "html"):
+            source = plot_dir / f"validation_{report['ticker']}_{horizon}d.{suffix}"
+            if not source.exists():
+                continue
+            target = plot_dir / f"validation_{report['ticker']}_{hour_label}.{suffix}"
+            shutil.copyfile(source, target)
+            artifacts[f"validation_{hour_label}_{suffix}"] = str(target)
+    return artifacts
+
+
+def _hour_label(hours: float) -> str:
+    if float(hours).is_integer():
+        return f"{int(hours)}h"
+    return f"{str(hours).replace('.', '_')}h"
 
 
 def _compact_validation_records(

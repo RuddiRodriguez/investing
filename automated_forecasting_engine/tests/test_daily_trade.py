@@ -8,6 +8,7 @@ from market_forecasting_engine.daily_trade import (
     build_daily_trade_plan,
     infer_bar_interval_minutes,
 )
+from market_forecasting_engine.daily_trade_cli import _hour_label, _validation_gate
 from market_forecasting_engine.plots import write_daily_trade_plot_artifacts
 
 
@@ -67,3 +68,19 @@ def test_daily_trade_plot_artifacts_are_written(tmp_path) -> None:
     assert (tmp_path / "plots" / "daily_trade_TEST.png").exists()
     assert (tmp_path / "plots" / "daily_trade_TEST.html").exists()
     assert artifacts["daily_trade_plot"].endswith("daily_trade_TEST.png")
+
+
+def test_validation_gate_blocks_weak_hourly_models() -> None:
+    gate = _validation_gate(
+        {
+            "directional_accuracy": 0.25,
+            "holdout_directional_accuracy": 0.40,
+            "mae": 0.02,
+            "holdout_mae": 0.01,
+        }
+    )
+
+    assert gate["status"] == "weak_validation"
+    assert gate["trade_allowed"] is False
+    assert "low_walk_forward_directional_accuracy" in gate["reasons"]
+    assert _hour_label(2.0) == "2h"

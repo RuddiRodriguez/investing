@@ -102,6 +102,19 @@ Change the forecast horizons with:
 
 The CLI refreshes Yahoo data on every run and uses recent intraday history for model training. If the requested `--start` has too few 5-minute bars for 1h-4h validation, it automatically expands the Yahoo training lookback while still forecasting from the newest available bar.
 
+Hourly validation uses non-overlapping walk-forward windows by default, so a 4h validation advances by 4h instead of checking a new overlapping 4h target every 5 minutes. Validation plots are written with both internal bar-count names and readable hour aliases, for example:
+
+```text
+<output-dir>/plots/validation_TSLA_24d.png
+<output-dir>/plots/validation_TSLA_2h.png
+```
+
+Each forecast includes a `validation_gate`. Weak horizons are marked with:
+
+```json
+{"status": "weak_validation", "trade_allowed": false}
+```
+
 By default, runs with `--output-dir` also create a local data cache inside the run folder:
 
 ```text
