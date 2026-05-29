@@ -25,6 +25,7 @@ class DailyTradeConfig:
     risk_reward: float = 1.8
     stop_atr_multiple: float = 1.2
     max_hold_bars: int = 24
+    forecast_hours: tuple[float, ...] = (1.0, 2.0, 4.0)
     transaction_cost_bps: float = 2.0
     model_version: str = "0.1.0-intraday"
 
@@ -94,6 +95,15 @@ def build_daily_trade_plan(prices: pd.DataFrame, config: DailyTradeConfig) -> di
         config=config,
         interval_minutes=interval_minutes,
     )
+    forecasts = _hourly_forecasts(
+        close=close,
+        latest_price=latest_price,
+        latest_atr=latest_atr,
+        latest_timestamp=pd.Timestamp(latest_session.index[-1]),
+        interval_minutes=interval_minutes,
+        signal_score=float(signals["score"]),
+        forecast_hours=config.forecast_hours,
+    )
 
     return {
         "ticker": config.ticker.upper(),
@@ -112,12 +122,58 @@ def build_daily_trade_plan(prices: pd.DataFrame, config: DailyTradeConfig) -> di
             "low": opening_low,
         },
         "signals": signals,
+        "forecasts": forecasts,
         "trade_plan": trade_plan,
         "data_warning": None
         if has_intraday_data
         else "Input looks like daily/end-of-day data. Use 1m, 5m, or 15m bars for same-session trading.",
         "config": config.to_dict(),
     }
+
+
+def _hourly_forecasts(
+    *,
+    close: pd.Series,
+    latest_price: float,
+    latest_atr: float,
+    latest_timestamp: pd.Timestamp,
+    interval_minutes: float | None,
+    signal_score: float,
+    forecast_hours: tuple[float, ...],
+) -> list[dict[str, Any]]:
+    if interval_minutes is None or interval_minutes <= 0:
+        interval_minutes = 5.0
+    returns = np.log(close.replace(0, np.nan)).diff().dropna()
+    recent_drift_per_bar = float(returns.tail(12).mean()) if not returns.empty else 0.0
+    score_tilt_per_bar = np.clip(signal_score, -4.0, 4.0) * 0.00015
+    expected_return_per_bar = recent_drift_per_bar + float(score_tilt_per_bar)
+    volatility_per_bar = float(returns.tail(24).std()) if len(returns) >= 2 else 0.0
+    atr_return = latest_atr / latest_price if latest_price else 0.0
+    volatility_per_bar = max(volatility_per_bar, atr_return * 0.35, 0.0005)
+
+    forecasts: list[dict[str, Any]] = []
+    for hours in forecast_hours:
+        horizon_bars = max(1, int(round((float(hours) * 60.0) / interval_minutes)))
+        expected_log_return = expected_return_per_bar * horizon_bars
+        interval_width = 1.28 * volatility_per_bar * np.sqrt(horizon_bars)
+        predicted_price = latest_price * float(np.exp(expected_log_return))
+        lower_price = latest_price * float(np.exp(expected_log_return - interval_width))
+        upper_price = latest_price * float(np.exp(expected_log_return + interval_width))
+        forecast_timestamp = latest_timestamp + pd.Timedelta(minutes=interval_minutes * horizon_bars)
+        forecasts.append(
+            {
+                "horizon_hours": float(hours),
+                "horizon_bars": int(horizon_bars),
+                "forecast_timestamp": forecast_timestamp.isoformat(),
+                "expected_log_return": float(expected_log_return),
+                "expected_return": float(np.expm1(expected_log_return)),
+                "predicted_price": float(predicted_price),
+                "lower_price": float(lower_price),
+                "upper_price": float(upper_price),
+                "method": "recent_intraday_drift_plus_signal_tilt",
+            }
+        )
+    return forecasts
 
 
 def infer_bar_interval_minutes(index: pd.DatetimeIndex) -> float | None:

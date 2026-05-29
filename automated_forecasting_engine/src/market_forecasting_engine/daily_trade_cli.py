@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
 from market_forecasting_engine.plots import write_daily_trade_plot_artifacts
@@ -23,6 +25,7 @@ def main() -> None:
     parser.add_argument("--risk-reward", type=float, default=1.8, help="Take-profit distance divided by stop distance.")
     parser.add_argument("--stop-atr-multiple", type=float, default=1.2, help="ATR multiple used for stop distance.")
     parser.add_argument("--max-hold-bars", type=int, default=24, help="Maximum same-session hold length in bars.")
+    parser.add_argument("--forecast-hours", default="1,2,4", help="Comma-separated hourly forecast horizons.")
     parser.add_argument("--transaction-cost-bps", type=float, default=2.0, help="Estimated transaction cost in bps.")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument("--output-dir", default=None, help="Optional directory for JSON and daily-trade plot artifacts.")
@@ -55,6 +58,7 @@ def main() -> None:
         risk_reward=args.risk_reward,
         stop_atr_multiple=args.stop_atr_multiple,
         max_hold_bars=args.max_hold_bars,
+        forecast_hours=tuple(float(value.strip()) for value in args.forecast_hours.split(",") if value.strip()),
         transaction_cost_bps=args.transaction_cost_bps,
     )
     report = build_daily_trade_plan(result.frame, config)
@@ -75,6 +79,7 @@ def main() -> None:
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text + "\n", encoding="utf-8")
+        _write_forecast_csv(report, output_path.parent / "daily_trade_forecasts.csv")
     print(text)
 
 
@@ -84,6 +89,23 @@ def _resolve_output_dir(output_dir: str | None, output: str | None) -> Path | No
     if output:
         return Path(output).parent
     return None
+
+
+def _write_forecast_csv(report: dict, path: Path) -> None:
+    forecasts = report.get("forecasts", [])
+    if not forecasts:
+        return
+    rows = []
+    for forecast in forecasts:
+        rows.append(
+            {
+                "ticker": report.get("ticker"),
+                "as_of": report.get("as_of"),
+                **forecast,
+                "trade_action": report.get("trade_plan", {}).get("action"),
+            }
+        )
+    pd.DataFrame(rows).to_csv(path, index=False)
 
 
 if __name__ == "__main__":

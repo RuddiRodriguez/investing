@@ -221,6 +221,7 @@ def _plot_daily_trade(report: dict[str, Any], prices: pd.DataFrame, output_file:
     session = _daily_trade_plot_frame(prices, target_column)
     opening_range = report.get("opening_range", {})
     plan = report.get("trade_plan", {})
+    forecasts = _daily_trade_forecast_frame(report)
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(session.index, session["plot_close"], color="#111827", linewidth=1.8, label="Close")
@@ -230,6 +231,23 @@ def _plot_daily_trade(report: dict[str, Any], prices: pd.DataFrame, output_file:
     if opening_range.get("low") is not None:
         ax.axhline(float(opening_range["low"]), color="#dc2626", linestyle="--", linewidth=1, label="Opening range low")
     _add_trade_plan_levels(ax, plan)
+    if not forecasts.empty:
+        ax.plot(
+            [session.index[-1], *forecasts["forecast_timestamp"]],
+            [float(session["plot_close"].iloc[-1]), *forecasts["predicted_price"]],
+            color="#f59e0b",
+            marker="o",
+            linewidth=1.8,
+            label="Hourly forecast",
+        )
+        ax.fill_between(
+            forecasts["forecast_timestamp"],
+            forecasts["lower_price"],
+            forecasts["upper_price"],
+            color="#f59e0b",
+            alpha=0.16,
+            label="Forecast interval",
+        )
 
     title_action = plan.get("action", "no_trade")
     ax.set_title(f"{report.get('ticker', '').upper()} Daily Trade Plan: {title_action}")
@@ -256,6 +274,7 @@ def _plot_daily_trade_plotly(report: dict[str, Any], prices: pd.DataFrame, outpu
     session = _daily_trade_plot_frame(prices, target_column)
     opening_range = report.get("opening_range", {})
     plan = report.get("trade_plan", {})
+    forecasts = _daily_trade_forecast_frame(report)
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -282,6 +301,39 @@ def _plot_daily_trade_plotly(report: dict[str, Any], prices: pd.DataFrame, outpu
     _add_plotly_horizontal_line(fig, plan.get("entry_reference"), "Entry reference", "#7c3aed", "solid")
     _add_plotly_horizontal_line(fig, plan.get("stop"), "Stop", "#b91c1c", "dashdot")
     _add_plotly_horizontal_line(fig, plan.get("take_profit"), "Take profit", "#15803d", "dashdot")
+    if not forecasts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=forecasts["forecast_timestamp"],
+                y=forecasts["upper_price"],
+                mode="lines",
+                line={"width": 0},
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=forecasts["forecast_timestamp"],
+                y=forecasts["lower_price"],
+                mode="lines",
+                fill="tonexty",
+                fillcolor="rgba(245, 158, 11, 0.16)",
+                line={"width": 0},
+                name="Forecast interval",
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[session.index[-1], *forecasts["forecast_timestamp"]],
+                y=[float(session["plot_close"].iloc[-1]), *forecasts["predicted_price"]],
+                mode="lines+markers",
+                name="Hourly forecast",
+                line={"color": "#f59e0b", "width": 2},
+                hovertemplate="Time: %{x|%Y-%m-%d %H:%M}<br>Forecast: %{y:.2f}<extra></extra>",
+            )
+        )
     fig.update_layout(
         title=f"{report.get('ticker', '').upper()} Daily Trade Plan: {plan.get('action', 'no_trade')}",
         xaxis_title="Time",
@@ -311,6 +363,17 @@ def _add_plotly_horizontal_line(fig: go.Figure, value: object, name: str, color:
         )
     )
     fig.add_hline(y=y, line_color=color, line_dash=dash, line_width=1.2)
+
+
+def _daily_trade_forecast_frame(report: dict[str, Any]) -> pd.DataFrame:
+    forecasts = report.get("forecasts", [])
+    if not forecasts:
+        return pd.DataFrame()
+    frame = pd.DataFrame(forecasts)
+    frame["forecast_timestamp"] = pd.to_datetime(frame["forecast_timestamp"], errors="coerce")
+    for column in ("predicted_price", "lower_price", "upper_price"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.dropna(subset=["forecast_timestamp", "predicted_price", "lower_price", "upper_price"])
 
 
 def _plot_forecast_log(frame: pd.DataFrame, output_file: Path, ticker: str) -> None:

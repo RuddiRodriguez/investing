@@ -43,6 +43,8 @@ def test_daily_trade_plan_builds_long_setup_from_intraday_data() -> None:
     assert report["trade_plan"]["action"] == "long"
     assert report["trade_plan"]["stop"] < report["latest_price"]
     assert report["trade_plan"]["take_profit"] > report["latest_price"]
+    assert [item["horizon_hours"] for item in report["forecasts"]] == [1.0, 2.0, 4.0]
+    assert report["forecasts"][0]["forecast_timestamp"] > report["as_of"]
 
 
 def test_daily_trade_plan_warns_when_input_is_daily() -> None:

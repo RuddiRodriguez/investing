@@ -76,6 +76,7 @@ The output is an auditable same-session plan with:
 
 - whether the input actually looks intraday
 - inferred bar interval
+- 1h, 2h, and 4h price forecasts by default
 - VWAP and opening-range context
 - long/short/no-trade decision
 - entry reference, stop, take-profit, and max hold time when a setup qualifies
@@ -84,8 +85,15 @@ The daily-trade run also writes:
 
 ```text
 <output-dir>/daily_trade_report.json
+<output-dir>/daily_trade_forecasts.csv
 <output-dir>/plots/daily_trade_<TICKER>.png
 <output-dir>/plots/daily_trade_<TICKER>.html
+```
+
+Change the forecast horizons with:
+
+```bash
+--forecast-hours 1,2,3,4
 ```
 
 By default, runs with `--output-dir` also create a local data cache inside the run folder:
