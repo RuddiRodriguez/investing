@@ -43,7 +43,12 @@ def main() -> None:
     parser.add_argument("--provider", default=None, help="Data provider: yahoo, csv, polygon, alpha-vantage, or nasdaq-data-link.")
     parser.add_argument("--start", default="2020-01-01", help="Yahoo Finance start date when --csv is not provided.")
     parser.add_argument("--end", default=None, help="Yahoo Finance end date when --csv is not provided.")
-    parser.add_argument("--interval", default="1d", help="Provider bar interval. Yahoo supports 1d for this engine.")
+    parser.add_argument("--interval", default="1d", help="Provider bar interval, for example 1d, 1h, 15m, or 5m.")
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        help="Optional forecast cutoff timestamp, for example 2026-05-29 or 2026-05-29T15:00:00.",
+    )
     parser.add_argument("--adjustment-policy", default="auto_adjust", help="Price adjustment policy recorded in governance metadata.")
     parser.add_argument("--target-column", default="close", help="Price column to forecast.")
     parser.add_argument("--horizons", default="1,5,30", help="Comma-separated forecast horizons in trading days.")
@@ -58,6 +63,17 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None, help="Optional local data lake root for raw, normalized, panel, and metadata files.")
     parser.add_argument("--no-data-cache", action="store_true", help="Disable reading cached normalized provider data.")
     parser.add_argument("--refresh-data-cache", action="store_true", help="Fetch provider data even when a normalized cache file exists.")
+    parser.add_argument(
+        "--allow-live-cache",
+        action="store_true",
+        help="Allow cached provider data when --end is omitted. By default live Yahoo runs refresh on every execution.",
+    )
+    parser.add_argument(
+        "--forecast-log",
+        default=None,
+        help="Optional CSV path where one compact forecast row per horizon is appended after each run.",
+    )
+    parser.add_argument("--no-forecast-log", action="store_true", help="Disable the default output-dir forecast log.")
     parser.add_argument("--calendar", default="XNYS", help="Exchange calendar used for data-quality session checks.")
     parser.add_argument("--security-master-csv", default=None, help="Optional security master CSV with ticker metadata.")
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")
@@ -124,6 +140,7 @@ def main() -> None:
     args = parser.parse_args()
 
     horizons = tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip())
+    forecast_interval_minutes = _interval_to_minutes(args.interval)
     config = ForecastConfig(
         ticker=args.ticker,
         horizons=horizons,
@@ -154,6 +171,8 @@ def main() -> None:
         enable_bayesian_heavy=args.enable_bayesian_heavy,
         bayesian_mcmc_draws=args.bayesian_mcmc_draws,
         bayesian_mcmc_tune=args.bayesian_mcmc_tune,
+        forecast_interval=args.interval,
+        forecast_interval_minutes=forecast_interval_minutes,
     )
 
     output_dir = Path(args.output_dir) if args.output_dir else None
@@ -175,9 +194,10 @@ def main() -> None:
         request,
         store=data_store,
         use_cache=not args.no_data_cache,
-        refresh_cache=args.refresh_data_cache,
+        refresh_cache=_refresh_cache_for_request(args, provider_name),
     )
     prices = primary_result.frame
+    prices = _filter_prices_as_of(prices, args.as_of, target_column=config.target_column)
     data_artifacts: dict[str, object] = {"primary": primary_result.metadata.get("artifacts", {})}
     context_sources: list[dict[str, object]] = []
     indicator_sources: list[dict[str, object]] = []
@@ -205,9 +225,10 @@ def main() -> None:
             ),
             store=data_store,
             use_cache=not args.no_data_cache,
-            refresh_cache=args.refresh_data_cache,
+            refresh_cache=_refresh_cache_for_request(args, "yahoo"),
         )
-        column = context_result.frame["close"].rename(f"{_safe_label(label)}_{_safe_label(ticker)}")
+        context_frame = _filter_prices_as_of(context_result.frame, args.as_of, target_column="close")
+        column = context_frame["close"].rename(f"{_safe_label(label)}_{_safe_label(ticker)}")
         prices = prices.join(column, how="left")
         context_sources.append(
             {
@@ -285,7 +306,7 @@ def main() -> None:
         target_column=config.target_column,
         provider=provider_name,
         source=args.csv,
-        request=request.to_dict(),
+        request={**request.to_dict(), "as_of": args.as_of, "live_cache_refresh": _refresh_cache_for_request(args, provider_name)},
         artifacts=data_artifacts,
         context_sources=context_sources,
         indicator_sources=indicator_sources,
@@ -361,6 +382,10 @@ def main() -> None:
         )
         apply_chapter_39_43_discipline_governance(report)
         report["artifacts"].update(write_audit_bundle(report, output_dir))
+    forecast_log_path = _forecast_log_path(args, output_dir)
+    if forecast_log_path is not None:
+        report.setdefault("artifacts", {})["forecast_log"] = str(forecast_log_path)
+        _append_forecast_log(report, forecast_log_path)
 
     print(_summary(report))
     print(
@@ -564,6 +589,97 @@ def _summary(report: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def _filter_prices_as_of(prices: pd.DataFrame, as_of: str | None, target_column: str) -> pd.DataFrame:
+    frame = normalize_price_frame(prices, target_column=target_column)
+    if not as_of:
+        return frame
+    cutoff = pd.Timestamp(as_of)
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.tz_convert(None)
+    filtered = frame.loc[frame.index <= cutoff]
+    if filtered.empty:
+        raise ValueError(f"No price rows are available at or before --as-of {as_of}.")
+    return filtered
+
+
+def _interval_to_minutes(interval: str) -> float | None:
+    value = interval.strip().lower()
+    if not value:
+        return None
+    units = {
+        "m": 1.0,
+        "min": 1.0,
+        "h": 60.0,
+        "hr": 60.0,
+        "d": 24.0 * 60.0,
+        "wk": 7.0 * 24.0 * 60.0,
+        "mo": 30.0 * 24.0 * 60.0,
+    }
+    for suffix, multiplier in sorted(units.items(), key=lambda item: len(item[0]), reverse=True):
+        if value.endswith(suffix):
+            number = value[: -len(suffix)]
+            try:
+                return float(number) * multiplier
+            except ValueError:
+                return None
+    return None
+
+
+def _refresh_cache_for_request(args: argparse.Namespace, provider_name: str) -> bool:
+    if args.refresh_data_cache:
+        return True
+    if args.allow_live_cache:
+        return False
+    return provider_name.lower() == "yahoo" and args.end is None and not args.csv
+
+
+def _forecast_log_path(args: argparse.Namespace, output_dir: Path | None) -> Path | None:
+    if args.no_forecast_log:
+        return None
+    if args.forecast_log:
+        return Path(args.forecast_log)
+    if output_dir is not None:
+        return output_dir / "forecast_log.csv"
+    return None
+
+
+def _append_forecast_log(report: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for forecast in report.get("forecasts", []):
+        rows.append(
+            {
+                "generated_at_utc": report.get("generated_at_utc"),
+                "ticker": report.get("ticker"),
+                "as_of_timestamp": report.get("as_of_timestamp", report.get("as_of_date")),
+                "forecast_interval": report.get("forecast_interval"),
+                "horizon": forecast.get("horizon_days"),
+                "forecast_timestamp": forecast.get("forecast_date"),
+                "current_price": report.get("current_price"),
+                "predicted_price": forecast.get("predicted_price"),
+                "lower_price": forecast.get("lower_price"),
+                "upper_price": forecast.get("upper_price"),
+                "expected_return": forecast.get("expected_return"),
+                "expected_direction": forecast.get("expected_direction"),
+                "directional_confidence": forecast.get("directional_confidence"),
+                "selected_model": forecast.get("selected_model"),
+                "suggested_action": report.get("suggested_action"),
+                "risk_level": report.get("risk_level"),
+            }
+        )
+    if not rows:
+        return
+    frame = pd.DataFrame(rows)
+    if path.exists():
+        existing = pd.read_csv(path)
+        frame = pd.concat([existing, frame], ignore_index=True)
+        frame = frame.drop_duplicates(
+            subset=["ticker", "as_of_timestamp", "forecast_interval", "horizon"],
+            keep="last",
+        )
+    frame.to_csv(path, index=False)
+
+
 def _format_pct(value: object) -> str:
     try:
         return f"{float(value):.1%}"
@@ -647,9 +763,9 @@ def _build_panel_if_requested(
             ),
             store=data_store,
             use_cache=not args.no_data_cache,
-            refresh_cache=args.refresh_data_cache,
+            refresh_cache=_refresh_cache_for_request(args, panel_provider),
         )
-        frames[ticker] = result.frame.copy()
+        frames[ticker] = _filter_prices_as_of(result.frame, args.as_of, target_column=args.target_column.lower()).copy()
         sources.append(
             {
                 "label": "universe_panel",

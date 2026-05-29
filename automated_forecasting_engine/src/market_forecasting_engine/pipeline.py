@@ -179,7 +179,8 @@ class ForecastingEngine:
         )
         latest_features = features.iloc[[-1]]
         latest_price = float(normalized_prices[self.config.target_column].iloc[-1])
-        as_of_date = str(normalized_prices.index[-1].date())
+        as_of_timestamp = pd.Timestamp(normalized_prices.index[-1])
+        as_of_date = str(as_of_timestamp.date())
 
         forecasts: list[dict[str, Any]] = []
         all_candidate_results: dict[str, list[dict[str, object]]] = {}
@@ -450,6 +451,9 @@ class ForecastingEngine:
         report = {
             "ticker": self.config.ticker.upper(),
             "as_of_date": as_of_date,
+            "as_of_timestamp": as_of_timestamp.isoformat(),
+            "forecast_interval": self.config.forecast_interval,
+            "forecast_interval_minutes": self.config.forecast_interval_minutes,
             "generated_at_utc": datetime.now(UTC).isoformat(),
             "current_price": latest_price,
             "horizons": list(self.config.horizons),
@@ -792,12 +796,16 @@ class ForecastingEngine:
         confidence *= float(selected_summary.metrics.get("chapter_10_confidence_multiplier", 1.0))
         confidence = float(min(0.99, max(0.50, confidence)))
         direction = _direction_label(expected_return, selected_summary.metrics.get("mae", 0.0))
-        forecast_date = _forecast_date(pd.Timestamp(latest_features.index[-1]), horizon)
+        forecast_date = _forecast_timestamp(
+            pd.Timestamp(latest_features.index[-1]),
+            horizon,
+            interval_minutes=self.config.forecast_interval_minutes,
+        )
         model_diagnostics = fitted_model.model_diagnostics()
 
         forecast = HorizonForecast(
             horizon_days=horizon,
-            forecast_date=str(forecast_date.date()),
+            forecast_date=_format_forecast_timestamp(forecast_date, self.config.forecast_interval_minutes),
             selected_model=selected_summary.model_name,
             selected_model_family=selected_summary.model_family,
             selection_metric=self.config.selection_metric,
@@ -1035,8 +1043,16 @@ def run_forecast(
     )
 
 
-def _forecast_date(as_of_date: pd.Timestamp, horizon: int) -> pd.Timestamp:
-    return pd.bdate_range(as_of_date, periods=horizon + 1)[-1]
+def _forecast_timestamp(as_of_date: pd.Timestamp, horizon: int, interval_minutes: float | None = None) -> pd.Timestamp:
+    if interval_minutes is not None and interval_minutes < 18 * 60:
+        return as_of_date + pd.Timedelta(minutes=float(interval_minutes) * horizon)
+    return pd.bdate_range(as_of_date.normalize(), periods=horizon + 1)[-1]
+
+
+def _format_forecast_timestamp(forecast_timestamp: pd.Timestamp, interval_minutes: float | None = None) -> str:
+    if interval_minutes is not None and interval_minutes < 18 * 60:
+        return forecast_timestamp.isoformat()
+    return str(forecast_timestamp.date())
 
 
 def _predict_trade_quality(

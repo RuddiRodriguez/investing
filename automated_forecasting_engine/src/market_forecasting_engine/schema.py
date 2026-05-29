@@ -43,6 +43,8 @@ class ForecastConfig:
     enable_bayesian_heavy: bool = False
     bayesian_mcmc_draws: int = 300
     bayesian_mcmc_tune: int = 300
+    forecast_interval: str = "1d"
+    forecast_interval_minutes: float | None = None
     model_version: str = "0.1.0"
 
     def to_dict(self) -> dict[str, Any]:

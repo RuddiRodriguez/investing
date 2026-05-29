@@ -155,6 +155,40 @@ Validation controls:
 
 By default, the purge window equals the forecast horizon. The final holdout period is not used to select the winning model; it is reported as post-selection diagnostics. With `--tune optuna`, tuning is nested inside each candidate fit slice, so Optuna only sees the training portion available to that fold.
 
+## Date-Time Based Forecast Runs
+
+The main engine can run from a specific day and hour with `--as-of`. The model only sees bars at or before that timestamp, so this is the option to use when you want to reproduce a decision as of a known point in time.
+
+Daily bars:
+
+```bash
+PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecasting_engine.cli \
+  --ticker TSLA \
+  --start 2020-01-01 \
+  --as-of 2026-05-29 \
+  --output-dir automated_forecasting_engine/runs/TSLA_daily_asof
+```
+
+Hourly bars:
+
+```bash
+PYTHONPATH=automated_forecasting_engine/src ./venv/bin/python -m market_forecasting_engine.cli \
+  --ticker TSLA \
+  --start 2026-04-01 \
+  --interval 1h \
+  --horizons 1,2,4,8 \
+  --as-of 2026-05-29T15:00:00 \
+  --output-dir automated_forecasting_engine/runs/TSLA_hourly_asof
+```
+
+For live Yahoo runs where `--end` is omitted, the engine now refreshes provider data on each execution by default, so a scheduled daily/hourly run will scrape the newest available bars and append compact forecast rows to:
+
+```text
+<output-dir>/forecast_log.csv
+```
+
+Use `--allow-live-cache` only when you explicitly want to reuse cached provider data.
+
 Optional CSV inputs can add macro, rates, and event data:
 
 ```bash
