@@ -1,5 +1,6 @@
 import json
 
+from market_forecasting_engine.llm_usage import log_openai_usage, monotonic_ms, new_llm_call_id
 from market_forecasting_engine.openai_models import DEFAULT_REASONING_EFFORT, is_reasoning_model
 
 
@@ -69,7 +70,10 @@ def call_response(
     use_web_search,
     search_context_size,
     reasoning_effort=DEFAULT_REASONING_EFFORT,
+    usage_context=None,
 ):
+    call_id = new_llm_call_id()
+    started_ms = monotonic_ms()
     payload = response_payload(
         model=model,
         system_message=system_message,
@@ -80,7 +84,30 @@ def call_response(
         use_web_search=use_web_search,
         search_context_size=search_context_size,
     )
-    response = client.responses.create(**payload)
-    data = response_json(response)
-    parsed = json.loads(response.output_text)
-    return payload, data, parsed
+    try:
+        response = client.responses.create(**payload)
+        data = response_json(response)
+        log_openai_usage(
+            call_id=call_id,
+            model=model,
+            payload=payload,
+            response_data=data,
+            started_ms=started_ms,
+            status="ok",
+            context=usage_context,
+            api_key=getattr(client, "api_key", None),
+        )
+        parsed = json.loads(response.output_text)
+        return payload, data, parsed
+    except Exception as exc:
+        log_openai_usage(
+            call_id=call_id,
+            model=model,
+            payload=payload,
+            started_ms=started_ms,
+            status="error",
+            error=str(exc),
+            context=usage_context,
+            api_key=getattr(client, "api_key", None),
+        )
+        raise

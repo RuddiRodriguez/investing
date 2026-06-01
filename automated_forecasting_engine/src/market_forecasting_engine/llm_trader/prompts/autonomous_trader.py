@@ -37,6 +37,7 @@ Separate hard facts from sentiment. Treat forums as weak context, not evidence b
 Return exactly one JSON object matching the schema.
 Use numeric price levels when the technical report gives enough support, resistance, stop, target, or forecast levels.
 If a price is not justified, use null and explain what to wait for.
+If `decision_governance.mean_reversion_dip_buy.best_setup` is present, treat it as a separate conditional buy-lower path, not a momentum Buy. You may return Hold with `entry_style: wait_for_pullback` and `buy_near` at the dip-buy entry when the setup is attractive but current price has not reached it.
 Never recommend Buy/Sell if the report says new capital is blocked. In that case use Hold and explain the block.
 """.strip()
 

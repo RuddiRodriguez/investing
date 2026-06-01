@@ -128,12 +128,18 @@ def test_build_technical_packet_extracts_decision_and_risk_controls() -> None:
             },
         },
         "decision_view": {
+            "production_gate": {"allowed_forecast_count": 0},
+            "mean_reversion_dip_buy": {"best_setup": {"entry_price": 95.0}},
             "chapter_18_tactical_problem": {
                 "final_action": "Hold",
                 "rule_based_action": "Hold",
                 "rule_gate": {"status": "Pass"},
                 "trade_plan": {"entry_policy": "No new commitment."},
             }
+        },
+        "options_decision": {
+            "mode": "synthetic_chain_for_research",
+            "best_trade": {"action": "buy_call"},
         },
         "operations_view": {
             "chapter_19_validation": {
@@ -173,6 +179,9 @@ def test_build_technical_packet_extracts_decision_and_risk_controls() -> None:
 
     assert packet["ticker"] == "AAPL"
     assert packet["decision_governance"]["chapter_19_status"] == "pass"
+    assert packet["decision_governance"]["production_gate"]["allowed_forecast_count"] == 0
+    assert packet["decision_governance"]["mean_reversion_dip_buy"]["best_setup"]["entry_price"] == 95.0
     assert packet["decision_governance"]["trade_risk_commitment"]["commitment_type"] == "active_review_no_new_commitment"
     assert packet["decision_governance"]["portfolio_capital_gate"]["allocation_status"] == "not_applicable"
+    assert packet["options_decision"]["best_trade"]["action"] == "buy_call"
     assert packet["trend"]["chapter_13_support"]["center"] == 95.0

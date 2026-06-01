@@ -38,6 +38,8 @@ from market_forecasting_engine.calendar import summarize_calendar_alignment
 from market_forecasting_engine.data import data_version_hash, normalize_price_frame
 from market_forecasting_engine.data_manifest import build_data_manifest
 from market_forecasting_engine.data_quality import build_data_quality_report
+from market_forecasting_engine.daily_trade import add_trading_bars, add_trading_minutes, build_intraday_feature_frame
+from market_forecasting_engine.dip_buy import annotate_mean_reversion_dip_buy
 from market_forecasting_engine.dow_theory import analyze_dow_theory
 from market_forecasting_engine.factor_evaluation import evaluate_factors
 from market_forecasting_engine.feature_registry import build_feature_registry
@@ -102,6 +104,11 @@ class ForecastingEngine:
             )
 
         features = build_feature_frame(normalized_prices, target_column=self.config.target_column)
+        if self.config.forecast_interval_minutes is not None and self.config.forecast_interval_minutes < 18 * 60:
+            intraday_features = build_intraday_feature_frame(normalized_prices, target_column=self.config.target_column)
+            new_columns = [column for column in intraday_features.columns if column not in features.columns]
+            if new_columns:
+                features = pd.concat([features, intraday_features[new_columns]], axis=1)
         supervised = add_forward_return_targets(
             features=features,
             prices=normalized_prices,
@@ -688,6 +695,11 @@ class ForecastingEngine:
             target_column=self.config.target_column,
         )
         apply_chapter_21_chart_selection(report)
+        annotate_mean_reversion_dip_buy(
+            report,
+            prices=normalized_prices,
+            target_column=self.config.target_column,
+        )
         apply_chapter_23_30_trade_risk_plan(
             report,
             prices=normalized_prices,
@@ -765,7 +777,16 @@ class ForecastingEngine:
         )
 
         fitted_model = selected_candidate.clone().fit(features, target)
-        expected_log_return = float(fitted_model.predict(latest_features[feature_columns])[0])
+        selected_log_return = float(fitted_model.predict(latest_features[feature_columns])[0])
+        ensemble = _ensemble_forecast(
+            validation_results=validation_results,
+            features=features,
+            target=target,
+            latest_features=latest_features[feature_columns],
+            feature_columns=feature_columns,
+            selection_metric=self.config.selection_metric,
+        )
+        expected_log_return = float(ensemble.get("expected_log_return", selected_log_return))
         expected_return = float(np.expm1(expected_log_return))
         trade_quality = _predict_trade_quality(
             selected_candidate=selected_candidate,
@@ -776,10 +797,10 @@ class ForecastingEngine:
             horizon=horizon,
         )
 
-        residual_std = float(selected_summary.metrics.get("residual_std", 0.0))
+        residual_std = float(ensemble.get("residual_std", selected_summary.metrics.get("residual_std", 0.0)))
         interval = _empirical_forecast_interval(
             expected_log_return=expected_log_return,
-            validation_predictions=selected_predictions,
+            validation_predictions=ensemble.get("validation_predictions", selected_predictions),
             confidence_level=self.config.confidence_level,
             residual_std=residual_std,
         )
@@ -790,7 +811,7 @@ class ForecastingEngine:
         upper_price = float(latest_price * np.exp(upper_log_return))
         confidence = _empirical_directional_confidence(
             expected_log_return=expected_log_return,
-            validation_predictions=selected_predictions,
+            validation_predictions=ensemble.get("validation_predictions", selected_predictions),
             validation_metrics=selected_summary.metrics,
         )
         confidence *= float(selected_summary.metrics.get("chapter_10_confidence_multiplier", 1.0))
@@ -800,6 +821,7 @@ class ForecastingEngine:
             pd.Timestamp(latest_features.index[-1]),
             horizon,
             interval_minutes=self.config.forecast_interval_minutes,
+            index=price_series.index,
         )
         model_diagnostics = fitted_model.model_diagnostics()
 
@@ -851,6 +873,8 @@ class ForecastingEngine:
         )
         if model_diagnostics:
             model_card["model_diagnostics"] = model_diagnostics
+        if ensemble:
+            model_card["ensemble"] = {key: value for key, value in ensemble.items() if key != "validation_predictions"}
         model_card["ml4t_feature_selection_policy"] = feature_selection_policy
         model_card["ml4t_selection_adjustment"] = ml4t_selection_adjustment
         model_card["chapter_9_time_series_selection_adjustment"] = ml4t_selection_adjustment
@@ -1043,9 +1067,16 @@ def run_forecast(
     )
 
 
-def _forecast_timestamp(as_of_date: pd.Timestamp, horizon: int, interval_minutes: float | None = None) -> pd.Timestamp:
+def _forecast_timestamp(
+    as_of_date: pd.Timestamp,
+    horizon: int,
+    interval_minutes: float | None = None,
+    index: pd.DatetimeIndex | None = None,
+) -> pd.Timestamp:
     if interval_minutes is not None and interval_minutes < 18 * 60:
-        return as_of_date + pd.Timedelta(minutes=float(interval_minutes) * horizon)
+        if index is not None:
+            return add_trading_bars(pd.DatetimeIndex(index), as_of_date, horizon, interval_minutes)
+        return add_trading_minutes(as_of_date, float(interval_minutes) * horizon)
     return pd.bdate_range(as_of_date.normalize(), periods=horizon + 1)[-1]
 
 
@@ -1089,6 +1120,99 @@ def _predict_trade_quality(
             prediction = min(1.0, max(0.0, prediction))
         output[output_name] = float(prediction)
     return output
+
+
+def _ensemble_forecast(
+    *,
+    validation_results: list[tuple[Any, Any, pd.DataFrame]],
+    features: pd.DataFrame,
+    target: pd.Series,
+    latest_features: pd.DataFrame,
+    feature_columns: list[str],
+    selection_metric: str,
+) -> dict[str, Any]:
+    if not validation_results:
+        return {}
+    rows = []
+    for candidate, summary, predictions in validation_results:
+        metrics = summary.metrics
+        mae_value = float(metrics.get("mae", np.inf))
+        holdout_mae = float(metrics.get("holdout_mae", mae_value))
+        directional_accuracy = float(metrics.get("directional_accuracy", 0.0))
+        holdout_directional_accuracy = float(metrics.get("holdout_directional_accuracy", directional_accuracy))
+        if not np.isfinite(mae_value) or mae_value <= 0:
+            continue
+        if holdout_directional_accuracy < 0.42 or directional_accuracy < 0.42:
+            continue
+        if holdout_mae > max(0.018, mae_value * 2.5):
+            continue
+        try:
+            fitted = candidate.clone().fit(features, target)
+            prediction = float(fitted.predict(latest_features)[0])
+        except Exception:
+            continue
+        if not np.isfinite(prediction):
+            continue
+        score = 1.0 / max(mae_value, holdout_mae, 1e-6)
+        if selection_metric in HIGHER_IS_BETTER_METRICS:
+            score *= max(0.05, float(metrics.get(selection_metric, directional_accuracy)))
+        rows.append(
+            {
+                "candidate": candidate,
+                "summary": summary,
+                "predictions": predictions,
+                "prediction": prediction,
+                "weight_score": float(score),
+            }
+        )
+
+    if len(rows) < 2:
+        return {}
+    total = sum(row["weight_score"] for row in rows)
+    if total <= 0:
+        return {}
+    weights = [row["weight_score"] / total for row in rows]
+    expected_log_return = float(sum(weight * row["prediction"] for weight, row in zip(weights, rows)))
+    validation_predictions = _weighted_validation_predictions(rows, weights)
+    residuals = validation_predictions["actual"] - validation_predictions["predicted"]
+    residual_std = float(residuals.std()) if len(residuals.dropna()) > 1 else 0.0
+    members = [
+        {
+            "model": row["summary"].model_name,
+            "family": row["summary"].model_family,
+            "weight": float(weight),
+            "mae": float(row["summary"].metrics.get("mae", np.nan)),
+            "holdout_mae": float(row["summary"].metrics.get("holdout_mae", np.nan)),
+            "directional_accuracy": float(row["summary"].metrics.get("directional_accuracy", np.nan)),
+        }
+        for weight, row in zip(weights, rows)
+    ]
+    return {
+        "method": "validation_weighted_ensemble",
+        "expected_log_return": expected_log_return,
+        "member_count": int(len(members)),
+        "members": members,
+        "residual_std": residual_std,
+        "validation_predictions": validation_predictions,
+    }
+
+
+def _weighted_validation_predictions(rows: list[dict[str, Any]], weights: list[float]) -> pd.DataFrame:
+    prediction_frames = []
+    for row, weight in zip(rows, weights):
+        predictions = row["predictions"][["actual", "predicted", "split_train_end"]].copy()
+        predictions["weighted_predicted"] = predictions["predicted"] * weight
+        prediction_frames.append(predictions)
+    stacked = pd.concat(prediction_frames, keys=range(len(prediction_frames)), names=["member", "timestamp"])
+    grouped = stacked.groupby(level="timestamp")
+    output = pd.DataFrame(
+        {
+            "actual": grouped["actual"].mean(),
+            "predicted": grouped["weighted_predicted"].sum(),
+            "split_train_end": grouped["split_train_end"].last(),
+        }
+    )
+    return output.sort_index()
 
 
 def _empirical_forecast_interval(

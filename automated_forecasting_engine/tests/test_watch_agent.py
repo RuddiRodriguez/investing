@@ -4,11 +4,14 @@ from pathlib import Path
 
 from market_forecasting_engine.watch_agent.cli import (
     append_decision_log,
+    asset_class_for_ticker,
     decide_action,
     find_decision_file,
+    latest_alpaca_price_snapshot,
     load_decision,
     memory_file,
     memory_needs_refresh,
+    resolve_live_price_provider,
     resolve_decision_file,
     should_print_action,
     startup_output_dir,
@@ -16,11 +19,12 @@ from market_forecasting_engine.watch_agent.cli import (
     write_memory,
 )
 from market_forecasting_engine.watch_agent.dashboard import read_watch_logs
+from market_forecasting_engine import data_providers
 
 
 def _decision():
     return {
-        "decision": "Hold",
+        "decision": "Buy",
         "confidence": 0.86,
         "entry_plan": {
             "entry_style": "do_not_enter",
@@ -33,11 +37,102 @@ def _decision():
     }
 
 
+def _hold_decision():
+    decision = _decision()
+    decision["decision"] = "Hold"
+    return decision
+
+
 def test_watch_agent_alerts_buy_when_not_owned_and_buy_near_reached() -> None:
     action, reason = decide_action(_decision(), price=1500.0, holding_status="not_owned")
 
     assert action == "BUY"
     assert reason == "BUY_NEAR_REACHED"
+
+
+def test_watch_agent_does_not_buy_when_llm_holds_even_if_buy_near_reached() -> None:
+    action, reason = decide_action(_hold_decision(), price=1500.0, holding_status="not_owned")
+
+    assert action == "HOLD"
+    assert reason == "BUY_NEAR_REACHED_BUT_LLM_NOT_BUY"
+
+
+def test_watch_agent_does_not_buy_when_llm_holds_even_if_breakout_reached() -> None:
+    action, reason = decide_action(_hold_decision(), price=1660.0, holding_status="not_owned")
+
+    assert action == "HOLD"
+    assert reason == "BUY_ABOVE_REACHED_BUT_LLM_NOT_BUY"
+
+
+def test_watch_agent_holds_stock_alerts_when_market_is_closed() -> None:
+    action, reason = decide_action(
+        _decision(),
+        price=1500.0,
+        holding_status="not_owned",
+        market_status={"asset_class": "stock", "market_status": "market_closed", "is_tradable": False},
+    )
+
+    assert action == "HOLD"
+    assert reason == "MARKET_CLOSED"
+
+
+def test_watch_agent_allows_crypto_alerts_when_market_is_24_7() -> None:
+    action, reason = decide_action(
+        _decision(),
+        price=1500.0,
+        holding_status="not_owned",
+        market_status={"asset_class": "crypto", "market_status": "crypto_24_7", "is_tradable": True},
+    )
+
+    assert action == "BUY"
+    assert reason == "BUY_NEAR_REACHED"
+
+
+def test_watch_agent_classifies_crypto_tickers() -> None:
+    assert asset_class_for_ticker("ETH-USD") == "crypto"
+    assert asset_class_for_ticker("BTC-USD") == "crypto"
+    assert asset_class_for_ticker("ASML") == "stock"
+
+
+def test_watch_agent_auto_live_provider_prefers_alpaca_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "key-id")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+
+    assert resolve_live_price_provider("auto") == "alpaca"
+
+
+def test_watch_agent_auto_live_provider_falls_back_to_yahoo_without_alpaca(monkeypatch) -> None:
+    monkeypatch.delenv("ALPACA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("ALPACA_API_SECRET_KEY", raising=False)
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+
+    assert resolve_live_price_provider("auto") == "yahoo"
+
+
+def test_watch_agent_alpaca_live_snapshot_uses_provider_layer(monkeypatch) -> None:
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "key-id")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+    monkeypatch.setattr("market_forecasting_engine.watch_agent.cli._stock_market_is_open", lambda calendar="XNYS": (True, "open"))
+
+    def fake_get_json(url: str, headers=None):
+        assert "/v2/stocks/ASML/bars?" in url
+        assert "timeframe=1Min" in url
+        return {
+            "bars": [
+                {"t": "2026-05-29T13:30:00Z", "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "v": 12345},
+                {"t": "2026-05-29T13:31:00Z", "o": 100.5, "h": 102.0, "l": 100.0, "c": 101.5, "v": 23456},
+            ]
+        }
+
+    monkeypatch.setattr(data_providers, "_get_json", fake_get_json)
+
+    snapshot = latest_alpaca_price_snapshot("ASML", interval="1m")
+
+    assert snapshot["price"] == 101.5
+    assert snapshot["price_provider"] == "alpaca"
+    assert snapshot["asset_class"] == "stock"
+    assert snapshot["market_status"] == "market_open"
 
 
 def test_watch_dashboard_reads_latest_record_per_ticker_profile(tmp_path) -> None:

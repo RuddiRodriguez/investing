@@ -314,6 +314,9 @@ def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
     assert report["ticker"] == "TEST"
     assert report["suggested_action"] in {"Buy", "Hold", "Sell"}
     assert report["risk_level"] in {"Low", "Medium", "High"}
+    dip_buy = report["decision_view"]["mean_reversion_dip_buy"]
+    assert "best_setup" in dip_buy
+    assert "lower conditional buy" in dip_buy["policy"]
     assert report["technical_view"]["trend_state"]["state"] in {"Bullish", "Neutral", "Bearish"}
     assert report["technical_view"]["dow_theory"]["primary_trend"]["state"] in {"Bullish", "Neutral", "Bearish"}
     assert report["technical_view"]["magee_basing_points"]["preferred"]["trend_state"] in {"Long", "Short", "Neutral"}

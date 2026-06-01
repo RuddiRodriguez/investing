@@ -294,6 +294,7 @@ def fetch_openai_web_news_and_social(request: AlternativeNewsRequest) -> tuple[l
                 )
             },
             tools=[{"type": "web_search", "search_context_size": "medium"}],
+            usage_context={"purpose": "alternative_news_openai_web", "ticker": request.ticker.upper(), "provider": request.provider},
         )
         rows = parsed.get("articles", [])
         articles = []
@@ -528,6 +529,7 @@ def _score_articles_with_openai(
                     sort_keys=True,
                 )
             },
+            usage_context={"purpose": "alternative_news_sentiment_scoring", "ticker": request.ticker.upper(), "provider": request.provider},
         )
         scored_by_id = {int(item["id"]): item for item in parsed.get("articles", []) if "id" in item}
         output = []

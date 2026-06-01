@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from market_forecasting_engine.llm_usage import log_openai_usage, monotonic_ms, new_llm_call_id
 from market_forecasting_engine.openai_models import DEFAULT_REASONING_EFFORT, is_reasoning_model
 
 
@@ -70,7 +71,10 @@ def call_response(
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     item: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    usage_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    call_id = new_llm_call_id()
+    started_ms = monotonic_ms()
     payload = response_payload(
         model=model,
         system_message=system_message,
@@ -80,5 +84,29 @@ def call_response(
         item=item,
         tools=tools,
     )
-    response = client.responses.create(**payload)
-    return payload, response_json(response), parse_response_output_text(response)
+    try:
+        response = client.responses.create(**payload)
+        data = response_json(response)
+        log_openai_usage(
+            call_id=call_id,
+            model=model,
+            payload=payload,
+            response_data=data,
+            started_ms=started_ms,
+            status="ok",
+            context=usage_context,
+            api_key=getattr(client, "api_key", None),
+        )
+        return payload, data, parse_response_output_text(response)
+    except Exception as exc:
+        log_openai_usage(
+            call_id=call_id,
+            model=model,
+            payload=payload,
+            started_ms=started_ms,
+            status="error",
+            error=str(exc),
+            context=usage_context,
+            api_key=getattr(client, "api_key", None),
+        )
+        raise

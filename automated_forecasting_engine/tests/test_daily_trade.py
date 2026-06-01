@@ -5,10 +5,19 @@ import pandas as pd
 
 from market_forecasting_engine.daily_trade import (
     DailyTradeConfig,
+    add_trading_bars,
+    add_trading_minutes,
+    build_intraday_feature_frame,
     build_daily_trade_plan,
     infer_bar_interval_minutes,
 )
-from market_forecasting_engine.daily_trade_cli import _hour_label, _validation_gate
+from market_forecasting_engine.daily_trade_cli import (
+    _annotate_mean_reversion_dip_buy,
+    _hour_label,
+    _limit_training_rows,
+    _run_daily_llm_decision,
+    _validation_gate,
+)
 from market_forecasting_engine.plots import write_daily_trade_plot_artifacts
 
 
@@ -48,6 +57,38 @@ def test_daily_trade_plan_builds_long_setup_from_intraday_data() -> None:
     assert report["forecasts"][0]["forecast_timestamp"] > report["as_of"]
 
 
+def test_forecast_timestamp_skips_closed_market_hours() -> None:
+    forecast_time = add_trading_minutes(pd.Timestamp("2026-05-29 15:55"), 60)
+
+    assert forecast_time == pd.Timestamp("2026-06-01 10:25")
+
+
+def test_forecast_timestamp_uses_observed_provider_session() -> None:
+    index = pd.date_range("2026-05-29 13:30", periods=78, freq="5min")
+
+    forecast_time = add_trading_bars(index, pd.Timestamp("2026-05-29 19:55"), 6, 5.0)
+
+    assert forecast_time == pd.Timestamp("2026-06-01 13:55")
+
+
+def test_forecast_timestamp_keeps_weekends_for_247_markets() -> None:
+    index = pd.date_range("2026-05-29 00:00", periods=3 * 288, freq="5min")
+
+    forecast_time = add_trading_bars(index, pd.Timestamp("2026-05-29 23:55"), 2, 5.0)
+
+    assert forecast_time == pd.Timestamp("2026-05-30 00:05")
+
+
+def test_intraday_feature_frame_adds_session_features() -> None:
+    prices = _intraday_prices()
+
+    features = build_intraday_feature_frame(prices)
+
+    assert "intraday_close_to_vwap" in features.columns
+    assert "intraday_session_progress" in features.columns
+    assert features["intraday_session_progress"].iloc[-1] > features["intraday_session_progress"].iloc[0]
+
+
 def test_daily_trade_plan_warns_when_input_is_daily() -> None:
     index = pd.bdate_range("2026-01-02", periods=30)
     close = 100 + np.arange(30)
@@ -84,3 +125,85 @@ def test_validation_gate_blocks_weak_hourly_models() -> None:
     assert gate["trade_allowed"] is False
     assert "low_walk_forward_directional_accuracy" in gate["reasons"]
     assert _hour_label(2.0) == "2h"
+
+
+def test_limit_training_rows_uses_most_recent_rows() -> None:
+    prices = _intraday_prices(rows=100)
+
+    limited = _limit_training_rows(prices, 30)
+
+    assert len(limited) == 30
+    assert limited.index[0] == prices.index[-30]
+
+
+def test_mean_reversion_dip_buy_view_adds_conditional_lower_buy_setup() -> None:
+    prices = _intraday_prices(rows=240)
+    current = float(prices["close"].iloc[-1])
+    report = {
+        "ticker": "ETH-USD",
+        "current_price": current,
+        "forecasts": [
+            {
+                "horizon_days": 24,
+                "horizon_hours": 2.0,
+                "predicted_price": current * 0.98,
+                "lower_price": current * 0.97,
+                "upper_price": current * 1.01,
+                "expected_direction": "Down",
+                "trade_allowed": False,
+                "selected_model": "test_model",
+            }
+        ],
+        "decision_view": {
+            "production_gate": {
+                "chart_confirmation": {
+                    "support_level": current * 0.975,
+                    "resistance_level": current * 1.01,
+                }
+            }
+        },
+    }
+
+    _annotate_mean_reversion_dip_buy(report, prices, "close", risk_profile_name="aggressive")
+
+    view = report["decision_view"]["mean_reversion_dip_buy"]
+    assert view["best_setup"]["setup"] == "conditional_dip_buy"
+    assert view["best_setup"]["entry_price"] < current
+    assert view["best_setup"]["target_price"] > view["best_setup"]["entry_price"]
+    assert view["best_setup"]["order_template"]["type"] == "limit"
+
+
+def test_daily_llm_decision_dry_run_builds_prompt_packet() -> None:
+    class Args:
+        ticker = "ETH-USD"
+        risk_profile = "aggressive"
+        trader_name = "test_daily_trader"
+        holding_status = "not_owned"
+        entry_price = None
+        quantity = None
+        position_value = None
+        account_equity = None
+        portfolio_notes = ""
+        llm_model = "gpt-5.4-mini-2026-03-17"
+        llm_reasoning_effort = "none"
+        llm_no_web_search = True
+        llm_search_context_size = "low"
+
+    report = {
+        "ticker": "ETH-USD",
+        "as_of_date": "2026-05-31",
+        "current_price": 100.0,
+        "suggested_action": "Hold",
+        "forecasts": [],
+        "decision_view": {
+            "production_gate": {"allowed_forecast_count": 0},
+            "mean_reversion_dip_buy": {"best_setup": {"entry_price": 95.0}},
+        },
+    }
+
+    result = _run_daily_llm_decision(report, Args(), dry_run=True)
+
+    assert result["status"] == "dry_run"
+    assert result["trader_profile"]["name"] == "aggressive"
+    assert result["technical_packet"]["decision_governance"]["mean_reversion_dip_buy"]["best_setup"]["entry_price"] == 95.0
+    assert result["llm_prompt_payload"]["tools"] == []

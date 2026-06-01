@@ -11,6 +11,7 @@ from pandas.errors import PerformanceWarning
 from market_forecasting_engine.data import data_version_hash, enrich_price_frame, load_indicator_csv, normalize_price_frame
 from market_forecasting_engine.data_manifest import build_data_manifest
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine import data_providers
 from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.data_store import MarketDataStore
 from market_forecasting_engine.alternative_data import (
@@ -85,6 +86,99 @@ def test_normalize_price_frame_handles_yahoo_single_ticker_multiindex() -> None:
 
     assert list(normalized.columns) == ["open", "high", "low", "close", "volume"]
     assert normalized.loc[dates[-1], "close"] == 102.5
+
+
+def test_polygon_provider_normalizes_aggregate_bars(monkeypatch) -> None:
+    monkeypatch.setenv("POLYGON_API_KEY", "test-key")
+
+    def fake_get_json(url: str, headers=None):
+        assert "/v2/aggs/ticker/TEST/range/5/minute/" in url
+        return {
+            "results": [
+                {"t": 1_779_800_400_000, "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "v": 12345},
+                {"t": 1_779_800_700_000, "o": 100.5, "h": 102.0, "l": 100.0, "c": 101.5, "v": 23456},
+            ]
+        }
+
+    monkeypatch.setattr(data_providers, "_get_json", fake_get_json)
+
+    result = load_prices_with_provider(
+        "polygon",
+        DataRequest(ticker="TEST", start="2026-05-01", end="2026-05-02", interval="5m"),
+        store=None,
+        use_cache=False,
+        refresh_cache=True,
+    )
+
+    assert list(result.frame.columns) == ["open", "high", "low", "close", "volume"]
+    assert result.frame["close"].iloc[-1] == 101.5
+    assert result.metadata["provider"] == "polygon"
+    assert result.metadata["capabilities"]["extended_intraday_history"] is True
+
+
+def test_alpaca_provider_normalizes_historical_bars(monkeypatch) -> None:
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "key-id")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+
+    def fake_get_json(url: str, headers=None):
+        assert "timeframe=5Min" in url
+        assert headers["APCA-API-KEY-ID"] == "key-id"
+        return {
+            "bars": [
+                {"t": "2026-05-29T13:30:00Z", "o": 100.0, "h": 101.0, "l": 99.5, "c": 100.5, "v": 12345},
+                {"t": "2026-05-29T13:35:00Z", "o": 100.5, "h": 102.0, "l": 100.0, "c": 101.5, "v": 23456},
+            ]
+        }
+
+    monkeypatch.setattr(data_providers, "_get_json", fake_get_json)
+
+    result = load_prices_with_provider(
+        "alpaca",
+        DataRequest(ticker="TEST", start="2026-05-01", end="2026-05-02", interval="5m"),
+        store=None,
+        use_cache=False,
+        refresh_cache=True,
+    )
+
+    assert result.frame.index[0] == pd.Timestamp("2026-05-29 13:30:00")
+    assert result.frame["volume"].iloc[-1] == 23456
+    assert result.metadata["provider"] == "alpaca"
+    assert result.metadata["capabilities"]["explicit_regular_session_flags"] is True
+
+
+def test_alpaca_provider_routes_crypto_symbols_to_crypto_bars(monkeypatch) -> None:
+    monkeypatch.setenv("ALPACA_API_KEY_ID", "key-id")
+    monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+
+    def fake_get_json(url: str, headers=None):
+        assert "/v1beta3/crypto/us/bars?" in url
+        assert "symbols=ETH%2FUSD" in url
+        assert "timeframe=5Min" in url
+        assert headers["APCA-API-KEY-ID"] == "key-id"
+        return {
+            "bars": {
+                "ETH/USD": [
+                    {"t": "2026-05-30T13:30:00Z", "o": 2000.0, "h": 2010.0, "l": 1995.0, "c": 2005.0, "v": 12.3},
+                    {"t": "2026-05-30T13:35:00Z", "o": 2005.0, "h": 2020.0, "l": 2000.0, "c": 2015.0, "v": 15.6},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(data_providers, "_get_json", fake_get_json)
+
+    result = load_prices_with_provider(
+        "alpaca",
+        DataRequest(ticker="ETH-USD", start="2026-05-01", end="2026-05-02", interval="5m"),
+        store=None,
+        use_cache=False,
+        refresh_cache=True,
+    )
+
+    assert result.frame.index[0] == pd.Timestamp("2026-05-30 13:30:00")
+    assert result.frame["close"].iloc[-1] == 2015.0
+    assert result.metadata["ticker"] == "ETH/USD"
+    assert result.metadata["asset_class"] == "crypto"
+    assert result.metadata["capabilities"]["continuous_24_7_market"] is True
 
 
 def test_data_version_hash_is_stable_for_same_data() -> None:

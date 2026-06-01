@@ -1,10 +1,12 @@
 import argparse
 import json
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
-from market_forecasting_engine.llm_trader.run import run_autonomous_trader
+from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine.llm_trader.run import load_env, run_autonomous_trader
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 
 
@@ -25,6 +27,13 @@ def build_parser():
     parser.add_argument("--price", type=float, default=None, help="Manual price for testing or offline checks.")
     parser.add_argument("--csv")
     parser.add_argument("--provider", default=None)
+    parser.add_argument(
+        "--live-price-provider",
+        choices=("auto", "alpaca", "yahoo"),
+        default="auto",
+        help="Provider for watch-agent live prices. Auto prefers Alpaca when credentials are configured, then falls back to Yahoo.",
+    )
+    parser.add_argument("--live-price-interval", default="1m", help="Live watch price interval for Alpaca.")
     parser.add_argument("--start", default="2020-01-01")
     parser.add_argument("--end", default=None)
     parser.add_argument("--interval", default="1d")
@@ -69,6 +78,7 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    load_env(args.llm_env_file)
     progress(
         args,
         "START",
@@ -82,17 +92,34 @@ def main():
     progress(args, "DECISION", "loading remembered trader decision", decision_file=decision_path)
     decision = load_decision(decision_path)
     while True:
-        progress(args, "PRICE", "checking current price", mode="manual" if args.price is not None else "live_yahoo")
-        price = args.price if args.price is not None else latest_price(args.ticker)
-        progress(args, "PRICE", "price resolved", price=f"{price:.2f}")
+        progress(args, "PRICE", "checking current price", mode="manual" if args.price is not None else args.live_price_provider)
+        price_snapshot = (
+            manual_price_snapshot(args.price)
+            if args.price is not None
+            else latest_price_snapshot(
+                args.ticker,
+                calendar=args.calendar,
+                provider=args.live_price_provider,
+                interval=args.live_price_interval,
+            )
+        )
+        price = price_snapshot["price"]
+        progress(
+            args,
+            "PRICE",
+            "price resolved",
+            price=f"{price:.2f}",
+            market_status=price_snapshot.get("market_status"),
+            price_provider=price_snapshot.get("price_provider"),
+        )
         progress(args, "ACTION", "evaluating watch levels")
-        action, reason = decide_action(decision, price, args.holding_status)
+        action, reason = decide_action(decision, price, args.holding_status, market_status=price_snapshot)
         should_print = should_print_action(args, memory, action, reason)
         if should_print:
             print_loaded_advice(args, memory, decision_path, decision)
             print_alert(args.ticker, args.profile, price, action, reason, decision, args.holding_status)
-        log_path = append_decision_log(args, memory, decision, price, action, reason, should_print)
-        update_last_check_memory(args, memory, price, action, reason, should_print, log_path)
+        log_path = append_decision_log(args, memory, decision, price, action, reason, should_print, price_snapshot)
+        update_last_check_memory(args, memory, price, action, reason, should_print, log_path, price_snapshot)
         progress(args, "LOG", "decision appended", log_file=log_path)
         if args.once:
             progress(args, "DONE", "one-shot wake-up complete")
@@ -232,7 +259,7 @@ def memory_needs_refresh(memory, refresh_after_hours):
     return age.total_seconds() >= float(refresh_after_hours) * 3600
 
 
-def append_decision_log(args, memory, decision, price, action, reason, printed=None):
+def append_decision_log(args, memory, decision, price, action, reason, printed=None, market_status=None):
     log_dir = Path(args.log_dir) if args.log_dir else Path(args.state_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
@@ -258,6 +285,13 @@ def append_decision_log(args, memory, decision, price, action, reason, printed=N
         "stop_loss": entry.get("stop_loss"),
         "take_profit": entry.get("take_profit"),
     }
+    if market_status:
+        record["asset_class"] = market_status.get("asset_class")
+        record["market_status"] = market_status.get("market_status")
+        record["market_is_tradable"] = market_status.get("is_tradable")
+        record["market_reason"] = market_status.get("market_reason")
+        record["latest_price_time"] = market_status.get("latest_price_time")
+        record["price_provider"] = market_status.get("price_provider")
     if printed is not None:
         record["printed"] = bool(printed)
     with log_path.open("a", encoding="utf-8") as handle:
@@ -266,6 +300,42 @@ def append_decision_log(args, memory, decision, price, action, reason, printed=N
 
 
 def latest_price(ticker):
+    return latest_price_snapshot(ticker)["price"]
+
+
+def latest_price_snapshot(ticker, calendar="XNYS", provider="auto", interval="1m"):
+    provider_choice = resolve_live_price_provider(provider)
+    if provider_choice == "alpaca":
+        try:
+            return latest_alpaca_price_snapshot(ticker, calendar=calendar, interval=interval)
+        except Exception:
+            if str(provider or "auto").lower() != "auto":
+                raise
+    return latest_yahoo_price_snapshot(ticker, calendar=calendar)
+
+
+def latest_alpaca_price_snapshot(ticker, calendar="XNYS", interval="1m"):
+    start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    result = load_prices_with_provider(
+        "alpaca",
+        DataRequest(ticker=ticker, start=start, interval=interval, target_column="close"),
+        store=None,
+        use_cache=False,
+        refresh_cache=True,
+    )
+    close = result.frame["close"].dropna()
+    if close.empty:
+        raise RuntimeError(f"No valid Alpaca close price returned for {ticker}.")
+    latest_timestamp = close.index[-1]
+    return {
+        "price": float(close.iloc[-1]),
+        "price_provider": "alpaca",
+        "provider_metadata": _compact_provider_metadata(result.metadata),
+        **market_status_for_ticker(ticker, latest_timestamp=latest_timestamp, calendar=calendar),
+    }
+
+
+def latest_yahoo_price_snapshot(ticker, calendar="XNYS"):
     import yfinance as yf
 
     frame = yf.download(ticker, period="5d", interval="1h", auto_adjust=True, progress=False)
@@ -277,10 +347,29 @@ def latest_price(ticker):
     close = close.dropna()
     if close.empty:
         raise RuntimeError(f"No valid close price returned for {ticker}.")
-    return float(close.iloc[-1])
+    latest_timestamp = close.index[-1]
+    return {
+        "price": float(close.iloc[-1]),
+        "price_provider": "yahoo",
+        **market_status_for_ticker(ticker, latest_timestamp=latest_timestamp, calendar=calendar),
+    }
 
 
-def decide_action(decision, price, holding_status):
+def manual_price_snapshot(price):
+    return {
+        "price": float(price),
+        "asset_class": "manual",
+        "market_status": "manual_price",
+        "market_reason": "Manual price supplied; market-hours gate not applied.",
+        "is_tradable": True,
+        "latest_price_time": None,
+        "price_provider": "manual",
+    }
+
+
+def decide_action(decision, price, holding_status, market_status=None):
+    if market_status and not market_status.get("is_tradable", True):
+        return "HOLD", str(market_status.get("market_status") or "MARKET_NOT_TRADABLE").upper()
     entry = decision.get("entry_plan", {}) or {}
     decision_action = str(decision.get("decision") or "Hold")
     entry_style = str(entry.get("entry_style") or "")
@@ -301,6 +390,12 @@ def decide_action(decision, price, holding_status):
         return "HOLD", "OWNED_NO_SELL_TRIGGER"
     if stop_loss is not None and price <= stop_loss:
         return "HOLD", "DO_NOT_ENTER_STOP_OR_INVALIDATION_BROKEN"
+    if decision_action != "Buy":
+        if buy_above is not None and price >= buy_above:
+            return "HOLD", "BUY_ABOVE_REACHED_BUT_LLM_NOT_BUY"
+        if buy_near is not None and price <= buy_near:
+            return "HOLD", "BUY_NEAR_REACHED_BUT_LLM_NOT_BUY"
+        return "HOLD", "WAITING_FOR_ADVICE_LEVEL"
     if entry_style == "buy_now":
         return "BUY", "LLM_ENTRY_STYLE_BUY_NOW"
     if buy_above is not None and price >= buy_above:
@@ -347,7 +442,7 @@ def should_print_action(args, memory, action, reason):
     return last.get("action") != action or last.get("reason") != reason
 
 
-def update_last_check_memory(args, memory, price, action, reason, printed, log_path):
+def update_last_check_memory(args, memory, price, action, reason, printed, log_path, market_status=None):
     state_path = memory_file(args.state_dir, args.ticker, args.profile)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     updated = {key: value for key, value in memory.items() if not key.startswith("_")}
@@ -360,6 +455,13 @@ def update_last_check_memory(args, memory, price, action, reason, printed, log_p
         "printed": bool(printed),
         "log_file": str(log_path),
     }
+    if market_status:
+        updated["last_check"]["asset_class"] = market_status.get("asset_class")
+        updated["last_check"]["market_status"] = market_status.get("market_status")
+        updated["last_check"]["market_is_tradable"] = market_status.get("is_tradable")
+        updated["last_check"]["market_reason"] = market_status.get("market_reason")
+        updated["last_check"]["latest_price_time"] = market_status.get("latest_price_time")
+        updated["last_check"]["price_provider"] = market_status.get("price_provider")
     state_path.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     memory.clear()
     memory.update(updated)
@@ -375,6 +477,99 @@ def format_levels(decision):
         f"stop_loss={entry.get('stop_loss')} "
         f"take_profit={entry.get('take_profit')}"
     )
+
+
+def market_status_for_ticker(ticker, latest_timestamp=None, calendar="XNYS"):
+    asset_class = asset_class_for_ticker(ticker)
+    latest_time = _timestamp_iso(latest_timestamp)
+    if asset_class == "crypto":
+        return {
+            "asset_class": asset_class,
+            "market_status": "crypto_24_7",
+            "market_reason": "Crypto market treated as continuously tradable.",
+            "is_tradable": True,
+            "latest_price_time": latest_time,
+        }
+    is_open, reason = _stock_market_is_open(calendar)
+    return {
+        "asset_class": asset_class,
+        "market_status": "market_open" if is_open else "market_closed",
+        "market_reason": reason,
+        "is_tradable": bool(is_open),
+        "latest_price_time": latest_time,
+    }
+
+
+def asset_class_for_ticker(ticker):
+    symbol = str(ticker or "").upper()
+    if symbol.endswith("-USD") or symbol.endswith("-USDT") or symbol in {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA"}:
+        return "crypto"
+    return "stock"
+
+
+def resolve_live_price_provider(provider="auto"):
+    choice = str(provider or "auto").lower()
+    if choice in {"alpaca", "yahoo"}:
+        return choice
+    if _alpaca_credentials_available():
+        return "alpaca"
+    return "yahoo"
+
+
+def _alpaca_credentials_available():
+    return bool(
+        (os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID"))
+        and (os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY"))
+    )
+
+
+def _compact_provider_metadata(metadata):
+    return {
+        "provider": metadata.get("provider"),
+        "ticker": metadata.get("ticker"),
+        "feed": metadata.get("feed"),
+        "asset_class": metadata.get("asset_class"),
+        "normalized_data_hash": metadata.get("normalized_data_hash"),
+        "capabilities": metadata.get("capabilities", {}),
+    }
+
+
+def _stock_market_is_open(calendar="XNYS"):
+    now_utc = datetime.now(timezone.utc)
+    try:
+        import exchange_calendars as xcals  # type: ignore
+
+        exchange = xcals.get_calendar(calendar)
+        timestamp = pd_timestamp_utc(now_utc)
+        if bool(exchange.is_open_on_minute(timestamp)):
+            return True, f"{calendar} is open."
+        return False, f"{calendar} is closed."
+    except Exception:
+        weekday = now_utc.weekday()
+        open_time = dt_time(14, 30)
+        close_time = dt_time(21, 0)
+        current = now_utc.time()
+        is_open = weekday < 5 and open_time <= current <= close_time
+        reason = "fallback weekday UTC session is open." if is_open else "fallback weekday UTC session is closed."
+        return is_open, reason
+
+
+def pd_timestamp_utc(value):
+    import pandas as pd
+
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def _timestamp_iso(value):
+    if value is None:
+        return None
+    try:
+        return pd_timestamp_utc(value).isoformat()
+    except Exception:
+        return str(value)
 
 
 def progress(args, stage, message, **fields):

@@ -155,6 +155,16 @@ def dashboard_html(refresh_seconds: int) -> str:
     .PARSE_ERROR {{ background: var(--sell); }}
     .price {{ font-size: 34px; font-weight: 760; margin: 8px 0 2px; }}
     .reason {{ color: var(--muted); font-size: 14px; min-height: 20px; }}
+    .badge-label {{ color: var(--muted); font-size: 11px; text-align: center; margin-bottom: 4px; }}
+    .conflict {{
+      margin-top: 10px;
+      border: 1px solid #f2c94c;
+      background: #fff8db;
+      color: #5f4700;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }}
     .fields {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -234,6 +244,11 @@ def dashboard_html(refresh_seconds: int) -> str:
     function cls(action) {{
       return ["BUY", "SELL", "HOLD", "PARSE_ERROR"].includes(action) ? action : "HOLD";
     }}
+    function hasDecisionConflict(row) {{
+      const llm = String(row.llm_decision || "").toUpperCase();
+      const action = String(row.action || "").toUpperCase();
+      return (action === "BUY" && llm && llm !== "BUY") || (action === "SELL" && llm && llm !== "SELL");
+    }}
     function card(row) {{
       return `<article class="card">
         <div class="card-head">
@@ -241,13 +256,21 @@ def dashboard_html(refresh_seconds: int) -> str:
             <div class="ticker">${{row.ticker || "UNKNOWN"}}</div>
             <div class="profile">${{row.profile || "default"}} · ${{time(row.checked_at)}}</div>
           </div>
-          <div class="badge ${{cls(row.action)}}">${{row.action || "-"}}</div>
+          <div>
+            <div class="badge-label">Watch alert</div>
+            <div class="badge ${{cls(row.action)}}">${{row.action || "-"}}</div>
+          </div>
         </div>
         <div class="price">${{money(row.price)}}</div>
         <div class="reason">${{row.reason || ""}}</div>
+        ${{hasDecisionConflict(row) ? `<div class="conflict">Watch alert conflicts with LLM decision (${{row.llm_decision}}). Treat this as a stale/level-trigger warning until the agent writes a fresh check.</div>` : ""}}
         <div class="fields">
           <div class="field"><span>LLM Decision</span><strong>${{row.llm_decision || "-"}}</strong></div>
           <div class="field"><span>Confidence</span><strong>${{row.llm_confidence ?? "-"}}</strong></div>
+          <div class="field"><span>Market</span><strong>${{row.market_status || "-"}}</strong></div>
+          <div class="field"><span>Asset Class</span><strong>${{row.asset_class || "-"}}</strong></div>
+          <div class="field"><span>Price Provider</span><strong>${{row.price_provider || "-"}}</strong></div>
+          <div class="field"><span>Latest Bar</span><strong>${{time(row.latest_price_time)}}</strong></div>
           <div class="field"><span>Buy Near</span><strong>${{money(row.buy_near)}}</strong></div>
           <div class="field"><span>Buy Above</span><strong>${{money(row.buy_above)}}</strong></div>
           <div class="field"><span>Sell Near</span><strong>${{money(row.sell_near)}}</strong></div>
@@ -260,11 +283,12 @@ def dashboard_html(refresh_seconds: int) -> str:
     function historyTable(rows) {{
       const all = Object.values(rows.histories || {{}}).flat().sort((a, b) => String(b.checked_at || "").localeCompare(String(a.checked_at || ""))).slice(0, 30);
       if (!all.length) return '<div class="empty">No watch-agent records found.</div>';
-      return `<table><thead><tr><th>Time</th><th>Ticker</th><th>Action</th><th>Price</th><th>Reason</th><th>Printed</th></tr></thead><tbody>${{all.map(row => `
+      return `<table><thead><tr><th>Time</th><th>Ticker</th><th>Action</th><th>Market</th><th>Price</th><th>Reason</th><th>Printed</th></tr></thead><tbody>${{all.map(row => `
         <tr>
           <td>${{time(row.checked_at)}}</td>
           <td>${{row.ticker || "-"}}</td>
           <td>${{row.action || "-"}}</td>
+          <td>${{row.market_status || "-"}}</td>
           <td>${{money(row.price)}}</td>
           <td>${{row.reason || "-"}}</td>
           <td>${{row.printed ? "yes" : "no"}}</td>

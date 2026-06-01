@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,15 +11,35 @@ import numpy as np
 import pandas as pd
 
 from market_forecasting_engine.calendar import summarize_calendar_alignment
-from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan, infer_bar_interval_minutes
+from market_forecasting_engine.daily_trade import (
+    DailyTradeConfig,
+    add_trading_bars,
+    build_daily_trade_plan,
+    build_intraday_chart_confirmation,
+    build_intraday_feature_frame,
+    build_intraday_risk_context,
+    infer_bar_interval_minutes,
+)
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_manifest import build_data_manifest
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
 from market_forecasting_engine.data_quality import build_data_quality_report
+from market_forecasting_engine.dip_buy import annotate_mean_reversion_dip_buy, historical_reversal_stats
 from market_forecasting_engine.governance import write_audit_bundle
+from market_forecasting_engine.llm_trader.prompts import autonomous_trader
+from market_forecasting_engine.llm_trader.profiles import trader_profiles
+from market_forecasting_engine.llm_trader.responses_api import call_response, response_payload
+from market_forecasting_engine.llm_trader.run import build_technical_packet, load_env, resolve_llm_model
+from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 from market_forecasting_engine.models import HistoricalMeanReturn, RecentMeanReturn, default_candidates
+from market_forecasting_engine.options_decision import (
+    OptionsDecisionConfig,
+    build_options_decision,
+    write_options_artifacts,
+)
 from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.plots import write_daily_trade_plot_artifacts, write_plot_artifacts
+from market_forecasting_engine.risk_profiles import risk_profile_for_name
 from market_forecasting_engine.schema import ForecastConfig
 from market_forecasting_engine.security_master import resolve_security_metadata
 from market_forecasting_engine.validation import select_candidate, validate_candidates, validation_summaries_as_dict
@@ -40,11 +61,35 @@ def main() -> None:
     parser.add_argument("--max-hold-bars", type=int, default=24, help="Maximum same-session hold length in bars.")
     parser.add_argument("--forecast-hours", default="1,2,4", help="Comma-separated hourly forecast horizons.")
     parser.add_argument("--training-lookback-days", type=int, default=45, help="Minimum Yahoo intraday lookback used when the requested start has too few rows for modelling.")
+    parser.add_argument("--max-training-rows", type=int, default=3500, help="Maximum most-recent intraday rows used for modelling; set 0 to disable.")
     parser.add_argument("--selection-metric", default="mae", help="Model selection metric for the advanced hourly forecasting engine.")
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")
     parser.add_argument("--no-statistical-models", action="store_true", help="Disable optional ARIMA/SARIMA/GARCH/VAR candidates.")
     parser.add_argument("--search-level", choices=("fast", "expanded"), default="fast", help="Candidate tuning breadth.")
+    parser.add_argument("--risk-profile", choices=("conservative", "medium", "aggressive"), default="medium", help="Risk profile used by production and options gates.")
     parser.add_argument("--transaction-cost-bps", type=float, default=2.0, help="Estimated transaction cost in bps.")
+    parser.add_argument("--enable-options-decision", action="store_true", help="Score options candidates against the forecast distribution.")
+    parser.add_argument("--options-chain-csv", default=None, help="Optional options chain CSV with strike, option_type, expiry, bid/ask or mid.")
+    parser.add_argument("--options-strike-pct-range", type=float, default=0.04, help="Synthetic options chain strike range around spot.")
+    parser.add_argument("--options-strike-count", type=int, default=17, help="Synthetic options chain strike count.")
+    parser.add_argument("--options-min-edge-pct", type=float, default=None, help="Minimum expected value over ask for options candidates; defaults from risk profile.")
+    parser.add_argument("--options-max-spread-pct", type=float, default=None, help="Maximum bid/ask spread over mid for options candidates; defaults from risk profile.")
+    parser.add_argument("--options-min-probability-breakeven", type=float, default=None, help="Minimum probability of finishing beyond option breakeven; defaults from risk profile.")
+    parser.add_argument("--enable-llm-decision", action="store_true", help="Run the autonomous LLM trader as a final governed decision layer.")
+    parser.add_argument("--llm-dry-run", action="store_true", help="Build the LLM decision packet without calling the LLM.")
+    parser.add_argument("--llm-model", default=None, help=f"Defaults to OPENAI_MODEL or {DEFAULT_OPENAI_MODEL}.")
+    parser.add_argument("--llm-reasoning-effort", default=DEFAULT_REASONING_EFFORT)
+    parser.add_argument("--llm-timeout", type=int, default=120)
+    parser.add_argument("--llm-env-file", default=None)
+    parser.add_argument("--llm-no-web-search", action="store_true")
+    parser.add_argument("--llm-search-context-size", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument("--trader-name", default="daily_intraday_trader")
+    parser.add_argument("--holding-status", choices=("not_owned", "owned"), default="not_owned")
+    parser.add_argument("--entry-price", type=float, default=None)
+    parser.add_argument("--quantity", type=float, default=None)
+    parser.add_argument("--position-value", type=float, default=None)
+    parser.add_argument("--account-equity", type=float, default=None)
+    parser.add_argument("--portfolio-notes", default="")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument("--output-dir", default=None, help="Optional directory for JSON and daily-trade plot artifacts.")
     parser.add_argument("--no-plot", action="store_true", help="Disable daily-trade chart artifact generation.")
@@ -70,6 +115,7 @@ def main() -> None:
     )
     result = _ensure_training_history(result, args, provider_name, forecast_hours)
     prices = normalize_price_frame(result.frame, target_column=args.target_column)
+    prices = _limit_training_rows(prices, args.max_training_rows)
     config = DailyTradeConfig(
         ticker=args.ticker,
         interval=args.interval,
@@ -86,6 +132,32 @@ def main() -> None:
     trade_report["data_provider"] = result.metadata
     output_dir = _resolve_output_dir(args.output_dir, args.output)
     report = _run_advanced_hourly_forecast(prices, trade_report, args, result.metadata, forecast_hours)
+    risk_profile = risk_profile_for_name(args.risk_profile)
+    report["risk_profile"] = risk_profile.to_dict()
+    _annotate_production_decision(report, prices, args.target_column, risk_profile_name=args.risk_profile)
+    _annotate_mean_reversion_dip_buy(report, prices, args.target_column, risk_profile_name=args.risk_profile)
+    if args.enable_options_decision or args.options_chain_csv:
+        report["options_decision"] = build_options_decision(
+            report,
+            prices,
+            target_column=args.target_column,
+            config=OptionsDecisionConfig(
+                ticker=args.ticker,
+                risk_profile=args.risk_profile,
+                chain_csv=args.options_chain_csv,
+                strike_pct_range=args.options_strike_pct_range,
+                strike_count=args.options_strike_count,
+                min_edge_pct=args.options_min_edge_pct if args.options_min_edge_pct is not None else risk_profile.options_min_edge_pct,
+                max_spread_pct=args.options_max_spread_pct if args.options_max_spread_pct is not None else risk_profile.options_max_spread_pct,
+                min_probability_above_breakeven=(
+                    args.options_min_probability_breakeven
+                    if args.options_min_probability_breakeven is not None
+                    else risk_profile.options_min_probability_breakeven
+                ),
+            ),
+        )
+    if args.enable_llm_decision:
+        report["llm_trader"] = _run_daily_llm_decision(report, args, dry_run=bool(args.llm_dry_run))
     if output_dir is not None and not args.no_plot:
         report.setdefault("artifacts", {}).update(write_plot_artifacts(report, prices, output_dir, target_column=args.target_column))
         report["artifacts"].update(_write_hour_named_validation_aliases(report, output_dir))
@@ -101,6 +173,9 @@ def main() -> None:
             key: value for key, value in report["artifacts"].items() if key.startswith("daily_trade")
         }
     if output_dir is not None:
+        if "options_decision" in report:
+            report.setdefault("artifacts", {}).update(write_options_artifacts(report["options_decision"], output_dir))
+        report.setdefault("artifacts", {}).update(_update_forecast_ledger(report, prices, output_dir, args.target_column))
         report.setdefault("artifacts", {}).update(write_audit_bundle(report, output_dir))
 
     text = json.dumps(report, indent=2, default=str)
@@ -147,6 +222,12 @@ def _ensure_training_history(result, args: argparse.Namespace, provider_name: st
     expanded.metadata["training_history_start"] = fallback_start
     expanded.metadata["training_history_required_rows"] = int(required_rows)
     return expanded
+
+
+def _limit_training_rows(prices: pd.DataFrame, max_training_rows: int) -> pd.DataFrame:
+    if max_training_rows <= 0 or len(prices) <= max_training_rows:
+        return prices
+    return prices.tail(max_training_rows).copy()
 
 
 def _safe_yahoo_intraday_lookback_days(args: argparse.Namespace) -> int:
@@ -321,7 +402,7 @@ def _run_compact_intraday_model_report(
                 horizon=horizon,
             )
 
-        forecast_timestamp = pd.Timestamp(prices.index[-1]) + pd.Timedelta(minutes=interval_minutes * horizon)
+        forecast_timestamp = add_trading_bars(pd.DatetimeIndex(prices.index), pd.Timestamp(prices.index[-1]), horizon, interval_minutes)
         interval_width = max(1.28 * residual_std, 0.001)
         predicted_price = float(close.iloc[-1] * np.exp(prediction))
         lower_price = float(close.iloc[-1] * np.exp(prediction - interval_width))
@@ -399,36 +480,7 @@ def _run_compact_intraday_model_report(
 
 
 def _intraday_model_features(prices: pd.DataFrame, target_column: str) -> pd.DataFrame:
-    close = prices[target_column].astype(float)
-    high = prices["high"].astype(float) if "high" in prices.columns else close
-    low = prices["low"].astype(float) if "low" in prices.columns else close
-    volume = prices["volume"].astype(float) if "volume" in prices.columns else pd.Series(1.0, index=prices.index)
-    log_close = np.log(close.replace(0, np.nan))
-    returns = log_close.diff()
-    typical_price = (high + low + close) / 3.0
-    vwap = (typical_price * volume).groupby(pd.DatetimeIndex(prices.index).date).cumsum() / volume.where(volume != 0).groupby(pd.DatetimeIndex(prices.index).date).cumsum()
-    features = pd.DataFrame(index=prices.index)
-    for window in (1, 3, 6, 12, 24, 48):
-        features[f"log_return_{window}_bars"] = log_close.diff(window)
-        features[f"momentum_{window}_bars"] = close.pct_change(window)
-    for window in (6, 12, 24):
-        features[f"realized_vol_{window}_bars"] = returns.rolling(window).std()
-        features[f"volume_z_{window}_bars"] = (volume - volume.rolling(window).mean()) / volume.rolling(window).std()
-    features["close_to_vwap"] = close / vwap - 1
-    features["ema_9_to_21"] = close.ewm(span=9, adjust=False).mean() / close.ewm(span=21, adjust=False).mean() - 1
-    features["range_pct"] = (high - low) / close
-    session_key = pd.DatetimeIndex(prices.index).date
-    session_open = close.groupby(session_key).transform("first")
-    opening_high = high.groupby(session_key).transform(lambda values: values.head(6).max())
-    opening_low = low.groupby(session_key).transform(lambda values: values.head(6).min())
-    volume_sma = volume.rolling(24).mean()
-    features["close_to_session_open"] = close / session_open - 1
-    features["close_to_opening_high"] = close / opening_high - 1
-    features["close_to_opening_low"] = close / opening_low - 1
-    features["relative_volume_24_bars"] = volume / volume_sma - 1
-    features["minute_of_day"] = pd.DatetimeIndex(prices.index).hour * 60 + pd.DatetimeIndex(prices.index).minute
-    features["day_of_week"] = pd.DatetimeIndex(prices.index).dayofweek
-    return features.replace([np.inf, -np.inf], np.nan).ffill()
+    return build_intraday_feature_frame(prices, target_column=target_column)
 
 
 def _validation_gate(metrics: dict[str, object]) -> dict[str, object]:
@@ -465,6 +517,284 @@ def _annotate_validation_gates(report: dict, forecast_hours: tuple[float, ...]) 
         forecast["trade_allowed"] = bool(gate["trade_allowed"])
         gates[str(forecast.get("horizon_days"))] = gate
     report.setdefault("diagnostics", {})["validation_gates"] = gates
+
+
+def _annotate_production_decision(report: dict, prices: pd.DataFrame, target_column: str, risk_profile_name: str = "medium") -> None:
+    risk_profile = risk_profile_for_name(risk_profile_name)
+    risk_context = build_intraday_risk_context(prices, target_column=target_column)
+    chart_confirmation = build_intraday_chart_confirmation(prices, target_column=target_column)
+    provider = str(report.get("data_provider", {}).get("provider", "")).lower()
+    provider_warning = _provider_quality_warning(provider, str(report.get("forecast_interval", "")))
+    allowed_count = 0
+    for forecast in report.get("forecasts", []):
+        gate = forecast.get("validation_gate", {})
+        reasons = list(gate.get("reasons", []))
+        if risk_context["risk_score"] > risk_profile.maximum_risk_score:
+            reasons.append("intraday_risk_score_too_high")
+        if forecast.get("directional_confidence", 0.0) < risk_profile.minimum_directional_confidence:
+            reasons.append("low_directional_confidence")
+        expected_return = abs(float(forecast.get("expected_return", 0.0) or 0.0))
+        if expected_return < max(
+            risk_profile.minimum_edge_fraction,
+            float(forecast.get("validation_metrics", {}).get("mae", 0.0)) * risk_profile.validation_mae_edge_multiplier,
+        ):
+            reasons.append("forecast_edge_too_small")
+        if provider_warning:
+            reasons.append("provider_not_production_intraday_grade")
+        production_gate = {
+            "trade_allowed": not reasons,
+            "status": "pass" if not reasons else "blocked",
+            "reasons": sorted(set(reasons)),
+            "risk_score": risk_context["risk_score"],
+            "uncertainty": risk_context["uncertainty"],
+        }
+        forecast["production_gate"] = production_gate
+        forecast["trade_allowed"] = bool(production_gate["trade_allowed"])
+        forecast["risk_adjusted_expected_return"] = float(forecast.get("expected_return", 0.0) or 0.0) - risk_context["risk_penalty"]
+        if forecast["trade_allowed"]:
+            allowed_count += 1
+
+    report.setdefault("decision_view", {})["production_gate"] = {
+        "allowed_forecast_count": allowed_count,
+        "risk_context": risk_context,
+        "chart_confirmation": chart_confirmation,
+        "provider_quality_warning": provider_warning,
+        "risk_profile": risk_profile.to_dict(),
+        "policy": "A forecast must pass walk-forward validation, confidence, edge, intraday risk, and provider-quality checks before it can be used for trading.",
+    }
+    report.setdefault("diagnostics", {})["intraday_risk_context"] = risk_context
+    report.setdefault("technical_view", {})["intraday_chart_confirmation"] = chart_confirmation
+    if allowed_count == 0:
+        report["suggested_action"] = "Hold"
+
+
+def _annotate_mean_reversion_dip_buy(report: dict, prices: pd.DataFrame, target_column: str, risk_profile_name: str = "medium") -> None:
+    """Add conditional dip-buy setups that are separate from momentum forecast gates."""
+
+    annotate_mean_reversion_dip_buy(report, prices, target_column, risk_profile_name)
+
+
+def _run_daily_llm_decision(report: dict, args: argparse.Namespace, *, dry_run: bool) -> dict[str, Any]:
+    profile = trader_profiles[args.risk_profile]
+    technical_packet = build_technical_packet(report)
+    portfolio_context = {
+        "holding_status": args.holding_status,
+        "entry_price": args.entry_price,
+        "quantity": args.quantity,
+        "position_value": args.position_value,
+        "account_equity": args.account_equity,
+        "notes": args.portfolio_notes,
+    }
+    item = {
+        "today": datetime.now(UTC).date().isoformat(),
+        "ticker": args.ticker.upper(),
+        "trader_name": args.trader_name,
+        "trader_profile_json": json.dumps(profile, indent=2, sort_keys=True),
+        "portfolio_context_json": json.dumps(portfolio_context, indent=2, sort_keys=True),
+        "technical_packet_json": json.dumps(technical_packet, indent=2, sort_keys=True, default=str),
+    }
+    model = resolve_llm_model(args.llm_model)
+    if dry_run:
+        payload = response_payload(
+            model=model,
+            system_message=autonomous_trader.system_message,
+            user_message=autonomous_trader.user_message,
+            json_schema=autonomous_trader.json_schema,
+            reasoning_effort=args.llm_reasoning_effort,
+            item=item,
+            use_web_search=not args.llm_no_web_search,
+            search_context_size=args.llm_search_context_size,
+        )
+        return {
+            "status": "dry_run",
+            "decision": None,
+            "reason": "LLM decision packet was built but no LLM call was made.",
+            "model": model,
+            "trader_profile": profile,
+            "portfolio_context": portfolio_context,
+            "technical_packet": technical_packet,
+            "llm_prompt_payload": payload,
+        }
+
+    load_env(args.llm_env_file)
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(timeout=float(args.llm_timeout))
+        payload, raw_response, decision = call_response(
+            client=client,
+            model=model,
+            system_message=autonomous_trader.system_message,
+            user_message=autonomous_trader.user_message,
+            json_schema=autonomous_trader.json_schema,
+            reasoning_effort=args.llm_reasoning_effort,
+            item=item,
+            use_web_search=not args.llm_no_web_search,
+            search_context_size=args.llm_search_context_size,
+            usage_context={"purpose": "daily_trade_llm_decision", "ticker": args.ticker.upper(), "risk_profile": args.risk_profile},
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "decision": None,
+            "reason": str(exc),
+            "model": model,
+            "trader_profile": profile,
+            "portfolio_context": portfolio_context,
+            "technical_packet": technical_packet,
+        }
+    return {
+        "status": "executed",
+        "model": model,
+        "trader_profile": profile,
+        "portfolio_context": portfolio_context,
+        "technical_packet": technical_packet,
+        "decision": decision,
+        "llm_prompt_payload": payload,
+        "llm_raw_response": raw_response,
+        "policy": "LLM decision is advisory/governed context. Deterministic risk and broker gates still control execution.",
+    }
+
+
+def _historical_reversal_stats(
+    *,
+    prices: pd.DataFrame,
+    target_column: str,
+    current_price: float,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    horizon_bars: int,
+) -> dict[str, Any]:
+    return historical_reversal_stats(
+        prices=prices,
+        target_column=target_column,
+        current_price=current_price,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        horizon_bars=horizon_bars,
+    )
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(value) / math.sqrt(2.0)))
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _provider_quality_warning(provider: str, interval: str) -> str | None:
+    interval_minutes = _interval_to_minutes(interval) or 1440.0
+    if provider == "yahoo" and interval_minutes < 1440:
+        return (
+            "Yahoo intraday data is useful for validation runs but has limited history and no explicit production SLA. "
+            "Use Polygon, Alpaca, IEX, or another configured low-latency provider for live trading."
+        )
+    return None
+
+
+def _update_forecast_ledger(report: dict, prices: pd.DataFrame, output_dir: Path, target_column: str) -> dict[str, str]:
+    ledger_path = output_dir / "forecast_ledger.csv"
+    existing = pd.read_csv(ledger_path) if ledger_path.exists() else pd.DataFrame()
+    now = datetime.now(UTC).isoformat()
+    run_id = f"{report.get('ticker', 'TICKER')}_{report.get('as_of_timestamp', now)}"
+    rows = []
+    for forecast in report.get("forecasts", []):
+        rows.append(
+            {
+                "run_id": run_id,
+                "ticker": report.get("ticker"),
+                "as_of_timestamp": report.get("as_of_timestamp"),
+                "created_at_utc": now,
+                "forecast_timestamp": forecast.get("forecast_date"),
+                "horizon_bars": forecast.get("horizon_days"),
+                "horizon_hours": forecast.get("horizon_hours"),
+                "current_price": report.get("current_price"),
+                "predicted_price": forecast.get("predicted_price"),
+                "lower_price": forecast.get("lower_price"),
+                "upper_price": forecast.get("upper_price"),
+                "expected_direction": forecast.get("expected_direction"),
+                "selected_model": forecast.get("selected_model"),
+                "trade_allowed": forecast.get("trade_allowed"),
+                "gate_status": forecast.get("production_gate", forecast.get("validation_gate", {})).get("status"),
+                "actual_price": np.nan,
+                "actual_timestamp": "",
+                "absolute_error": np.nan,
+                "absolute_pct_error": np.nan,
+                "direction_correct": np.nan,
+                "status": "pending",
+            }
+        )
+    combined = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True) if not existing.empty else pd.DataFrame(rows)
+    combined = _score_matured_ledger_rows(combined, prices, target_column)
+    combined = combined.drop_duplicates(subset=["run_id", "horizon_bars"], keep="last")
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(ledger_path, index=False)
+    summary_path = output_dir / "forecast_ledger_summary.json"
+    summary_path.write_text(json.dumps(_ledger_summary(combined), indent=2, default=str) + "\n", encoding="utf-8")
+    return {"forecast_ledger": str(ledger_path), "forecast_ledger_summary": str(summary_path)}
+
+
+def _score_matured_ledger_rows(ledger: pd.DataFrame, prices: pd.DataFrame, target_column: str) -> pd.DataFrame:
+    if ledger.empty:
+        return ledger
+    output = ledger.copy()
+    price_series = prices[target_column].astype(float).sort_index()
+    price_index = pd.DatetimeIndex(price_series.index)
+    output["forecast_timestamp"] = pd.to_datetime(output["forecast_timestamp"], errors="coerce")
+    for index, row in output.iterrows():
+        if str(row.get("status", "")) == "matured" and pd.notna(row.get("actual_price")):
+            continue
+        forecast_timestamp = row.get("forecast_timestamp")
+        if pd.isna(forecast_timestamp):
+            output.at[index, "status"] = "invalid_timestamp"
+            continue
+        future_positions = np.where(price_index >= pd.Timestamp(forecast_timestamp))[0]
+        if len(future_positions) == 0:
+            output.at[index, "status"] = "pending"
+            continue
+        actual_idx = future_positions[0]
+        actual_timestamp = price_index[actual_idx]
+        actual_price = float(price_series.iloc[actual_idx])
+        predicted_price = float(row.get("predicted_price", np.nan))
+        current_price = float(row.get("current_price", np.nan))
+        output.at[index, "actual_price"] = actual_price
+        output.at[index, "actual_timestamp"] = actual_timestamp.isoformat()
+        output.at[index, "absolute_error"] = abs(predicted_price - actual_price)
+        output.at[index, "absolute_pct_error"] = abs(predicted_price / actual_price - 1.0) if actual_price else np.nan
+        predicted_direction = np.sign(predicted_price - current_price)
+        actual_direction = np.sign(actual_price - current_price)
+        output.at[index, "direction_correct"] = bool(predicted_direction == actual_direction)
+        output.at[index, "status"] = "matured"
+    return output
+
+
+def _ledger_summary(ledger: pd.DataFrame) -> dict[str, object]:
+    matured = ledger[ledger.get("status") == "matured"] if "status" in ledger else pd.DataFrame()
+    if matured.empty:
+        return {"rows": int(len(ledger)), "matured_rows": 0}
+    return {
+        "rows": int(len(ledger)),
+        "matured_rows": int(len(matured)),
+        "mean_absolute_error": float(pd.to_numeric(matured["absolute_error"], errors="coerce").mean()),
+        "mean_absolute_pct_error": float(pd.to_numeric(matured["absolute_pct_error"], errors="coerce").mean()),
+        "directional_accuracy": float(pd.to_numeric(matured["direction_correct"], errors="coerce").mean()),
+        "by_horizon_hours": matured.groupby("horizon_hours")
+        .agg(
+            matured_rows=("status", "count"),
+            mean_absolute_error=("absolute_error", "mean"),
+            mean_absolute_pct_error=("absolute_pct_error", "mean"),
+            directional_accuracy=("direction_correct", "mean"),
+        )
+        .reset_index()
+        .to_dict(orient="records"),
+    }
 
 
 def _write_hour_named_validation_aliases(report: dict, output_dir: Path) -> dict[str, str]:

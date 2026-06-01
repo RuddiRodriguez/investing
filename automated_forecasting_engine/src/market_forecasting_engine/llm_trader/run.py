@@ -74,6 +74,7 @@ def run_autonomous_trader(args):
             item=item,
             use_web_search=not args.no_web_search,
             search_context_size=args.search_context_size,
+            usage_context={"purpose": "autonomous_trader_decision", "ticker": args.ticker.upper(), "profile": args.profile},
         )
         emit_progress(
             args,
@@ -124,6 +125,7 @@ def run_autonomous_trader(args):
             item=summary_item,
             use_web_search=False,
             search_context_size="low",
+            usage_context={"purpose": "nontechnical_trader_summary", "ticker": args.ticker.upper(), "profile": args.profile},
         )
         emit_progress(args, "SUMMARY", "non-technical summary received")
     result = {
@@ -276,6 +278,8 @@ def build_technical_packet(report):
             "chapter_18_final_action": chapter_18.get("final_action"),
             "chapter_18_rule_gate": chapter_18.get("rule_gate", {}),
             "chapter_18_trade_plan": chapter_18.get("trade_plan", {}),
+            "production_gate": decision.get("production_gate", {}),
+            "mean_reversion_dip_buy": decision.get("mean_reversion_dip_buy", {}),
             "chapter_19_status": chapter_19.get("status"),
             "chapter_19_action_gate": chapter_19.get("action_gate", {}),
             "chapter_20_profile_fit": chapter_20.get("profile_fit", {}),
@@ -286,6 +290,11 @@ def build_technical_packet(report):
             "portfolio_capital_summary": portfolio_risk.get("capital_summary", {}),
             "discipline_gate": discipline.get("discipline_gate", {}),
             "discipline_status": discipline.get("status"),
+        },
+        "options_decision": {
+            "mode": report.get("options_decision", {}).get("mode"),
+            "best_trade": report.get("options_decision", {}).get("best_trade", {}),
+            "policy": report.get("options_decision", {}).get("policy", {}),
         },
         "backtests": report.get("backtests", {}),
         "selection_metric": report.get("selection_metric"),

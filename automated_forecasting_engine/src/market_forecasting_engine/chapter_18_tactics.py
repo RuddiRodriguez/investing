@@ -653,6 +653,7 @@ def _execute_openai_review(
             json_schema=_openai_tactical_review_schema(),
             reasoning_effort=reasoning_effort,
             item={"packet": json.dumps(packet, sort_keys=True)},
+            usage_context={"purpose": "chapter_18_tactical_review", "ticker": packet.get("ticker")},
         )
         if not isinstance(parsed, dict):
             raise ValueError("LLM response JSON must be an object.")

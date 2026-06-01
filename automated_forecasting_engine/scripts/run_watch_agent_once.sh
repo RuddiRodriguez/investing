@@ -10,6 +10,7 @@ STATE_DIR="${STATE_DIR:-automated_forecasting_engine/runs/watch_agent_state}"
 REFRESH_AFTER_HOURS="${REFRESH_AFTER_HOURS:-12}"
 LLM_ENV_FILE="${LLM_ENV_FILE:-$PROJECT_DIR/.env}"
 QUIET_UNCHANGED="${QUIET_UNCHANGED:-1}"
+OPENAI_USAGE_PROCESS_NAME="${OPENAI_USAGE_PROCESS_NAME:-watch_agent}"
 
 if [[ "$STATE_DIR" = /* ]]; then
   STATE_ROOT="$STATE_DIR"
@@ -41,6 +42,7 @@ fi
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH=automated_forecasting_engine/src \
 MPLCONFIGDIR=/private/tmp/mfe_mpl \
+OPENAI_USAGE_PROCESS_NAME="$OPENAI_USAGE_PROCESS_NAME" \
 "$PYTHON" -m market_forecasting_engine.watch_agent.cli "${WATCH_ARGS[@]}"
 
 if [[ "$QUIET_UNCHANGED" != "1" && "$QUIET_UNCHANGED" != "true" && "$QUIET_UNCHANGED" != "TRUE" ]]; then
