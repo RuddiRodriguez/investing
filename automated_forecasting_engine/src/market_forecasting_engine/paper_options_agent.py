@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--liquidate-and-stop", action="store_true", help="Emergency command: request the running ticker agent to stop, cancel open ticker option orders, and close all open ticker option positions.")
     parser.add_argument("--stop-agent", action="store_true", help="Request the running ticker agent to stop without submitting liquidation orders.")
     parser.add_argument("--clear-stop-request", action="store_true", help="Clear a prior ticker stop request so the agent can run again.")
-    parser.add_argument("--liquidation-limit-offset-pct", type=float, default=0.05, help="Emergency liquidation sell limit below current option mark. Example 0.05 means current mark minus 5%.")
+    parser.add_argument("--liquidation-limit-offset-pct", type=float, default=0.05, help="Emergency liquidation sell limit below current option mark. Example 0.05 means current mark minus 5%%.")
     parser.add_argument("--liquidation-retry-limit-offset-pct", type=float, default=0.15, help="If emergency liquidation is not flat after the first attempt, retry with a wider sell limit below current mark.")
     parser.add_argument("--liquidation-wait-seconds", type=float, default=30.0, help="After emergency liquidation, wait this many seconds while checking whether ticker option positions are flat.")
     parser.add_argument("--liquidation-poll-seconds", type=float, default=2.0, help="Polling interval while verifying emergency liquidation.")
