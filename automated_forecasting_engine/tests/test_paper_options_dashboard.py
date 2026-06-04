@@ -4,6 +4,7 @@ import json
 
 from market_forecasting_engine.paper_options_dashboard import (
     build_dashboard_state,
+    _recent_stock_bar_points,
     read_history,
     read_latest_report,
     summarize_position_pl,
@@ -93,7 +94,7 @@ def test_options_dashboard_reads_ticker_specific_report_and_history(tmp_path) ->
     (tmp_path / "logs").mkdir()
     (tmp_path / "logs" / "AAPL_20260601.jsonl").write_text(json.dumps(report) + "\n", encoding="utf-8")
 
-    payload = build_dashboard_state(state_dir=tmp_path, ticker="AAPL")
+    payload = build_dashboard_state(state_dir=tmp_path, ticker="AAPL", include_live_bars=False)
 
     assert payload["ticker"] == "AAPL"
     assert payload["summary"]["contract"] == "AAPL260605C00205000"
@@ -122,6 +123,19 @@ def test_options_dashboard_missing_ticker_is_empty_not_tsla_specific(tmp_path) -
     assert path is None
     assert history == []
     assert log_path is None
+
+
+def test_recent_stock_bar_points_falls_back_to_iex(monkeypatch) -> None:
+    class FakeBroker:
+        def stock_bars(self, symbol, *, feed=None, **kwargs):
+            if feed is None:
+                raise RuntimeError("SIP forbidden")
+            assert feed == "iex"
+            return [{"t": "2026-06-04T15:00:00Z", "c": 420.25}]
+
+    monkeypatch.setattr("market_forecasting_engine.paper_options_dashboard.AlpacaPaperBroker", FakeBroker)
+
+    assert _recent_stock_bar_points("TSLA") == [{"timestamp": "2026-06-04T15:00:00Z", "price": 420.25}]
 
 
 def test_summarize_position_pl_calculates_plain_english_status() -> None:

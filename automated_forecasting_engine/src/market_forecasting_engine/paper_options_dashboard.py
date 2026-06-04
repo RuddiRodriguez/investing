@@ -18,7 +18,9 @@ DEFAULT_STATE_DIR = Path("automated_forecasting_engine/runs/paper_options_agent"
 DEFAULT_REFRESH_SECONDS = 30
 
 
-def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50) -> dict[str, Any]:
+def build_dashboard_state(
+    *, state_dir: Path, ticker: str, max_history: int = 50, include_live_bars: bool = True
+) -> dict[str, Any]:
     report, report_path = read_latest_report(state_dir, ticker)
     state, state_path = read_state(state_dir, ticker)
     history, log_path = read_history(state_dir, ticker, max_history=max_history)
@@ -28,7 +30,7 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
     exit_plan = trade_plan.get("exit_plan") or {}
     position_pl = summarize_position_pl(report.get("option_positions") or [])
     option_type = _option_type_label(trade_plan.get("option_type"), selected.get("symbol") or order.get("symbol"))
-    chart = build_stock_chart_payload(report=report, history=history, ticker=ticker)
+    chart = build_stock_chart_payload(report=report, history=history, ticker=ticker, include_live_bars=include_live_bars)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "ticker": ticker.upper(),
@@ -71,8 +73,14 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
     }
 
 
-def build_stock_chart_payload(*, report: dict[str, Any], history: list[dict[str, Any]], ticker: str | None = None) -> dict[str, Any]:
-    broker_points = _recent_stock_bar_points(ticker or str(report.get("ticker") or ""))
+def build_stock_chart_payload(
+    *,
+    report: dict[str, Any],
+    history: list[dict[str, Any]],
+    ticker: str | None = None,
+    include_live_bars: bool = True,
+) -> dict[str, Any]:
+    broker_points = _recent_stock_bar_points(ticker or str(report.get("ticker") or "")) if include_live_bars else []
     actual_points = broker_points if broker_points else _history_actual_points(history)
     forecast_plan = report.get("forecast_plan") or {}
     selected_forecast = report.get("selected_forecast") or {}
@@ -129,16 +137,22 @@ def _recent_stock_bar_points(ticker: str) -> list[dict[str, Any]]:
         return []
     end = datetime.now(UTC)
     start = end - pd.Timedelta(hours=8)
-    try:
-        rows = AlpacaPaperBroker().stock_bars(
-            symbol,
-            start=start.isoformat().replace("+00:00", "Z"),
-            end=end.isoformat().replace("+00:00", "Z"),
-            timeframe="1Min",
-            limit=1000,
-        )
-    except Exception:
-        return []
+    broker = AlpacaPaperBroker()
+    rows: list[dict[str, Any]] = []
+    for feed in (None, "iex"):
+        try:
+            rows = broker.stock_bars(
+                symbol,
+                start=start.isoformat().replace("+00:00", "Z"),
+                end=end.isoformat().replace("+00:00", "Z"),
+                timeframe="1Min",
+                feed=feed,
+                limit=1000,
+            )
+            if rows:
+                break
+        except Exception:
+            continue
     points: list[dict[str, Any]] = []
     for row in rows:
         timestamp = row.get("t") or row.get("timestamp")
