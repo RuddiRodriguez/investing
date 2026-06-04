@@ -39,7 +39,7 @@ class OptionTickerSelectorConfig:
     provider: str = "alpaca"
     interval: str = "1m"
     lookback_days: int = 20
-    forecast_hours: tuple[float, ...] = (1.0, 2.0, 4.0)
+    forecast_hours: tuple[float, ...] = (0.25,)
     risk_profile: str = "aggressive"
     max_training_rows: int = 3500
     min_dte: int = 1
@@ -51,11 +51,11 @@ class OptionTickerSelectorConfig:
     max_position_equity_pct: float = 0.02
     max_spread_pct: float = 0.15
     max_contracts: int = 1
-    target_delta: float = 0.35
-    max_delta_distance: float = 0.28
+    target_delta: float = 0.45
+    max_delta_distance: float = 0.30
     require_greeks: bool = True
-    max_theta_edge_ratio: float = 0.90
-    max_theta_premium_pct_per_day: float = 0.45
+    max_theta_edge_ratio: float = 0.75
+    max_theta_premium_pct_per_day: float = 0.35
     min_open_interest: int = 0
     limit_price_offset_pct: float = 0.03
     stop_loss_pct: float = 0.10

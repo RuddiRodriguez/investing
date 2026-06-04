@@ -140,8 +140,8 @@ def test_apply_option_profile_defaults_sets_aggressive_today_defaults() -> None:
     assert applied.loss_cooldown_minutes == 2
     assert applied.max_trades_per_day == 50
     assert applied.max_consecutive_losses == 10
-    assert applied.max_open_option_positions == 4
-    assert applied.max_open_option_contracts == 4
+    assert applied.max_open_option_positions == 1
+    assert applied.max_open_option_contracts == 2
     assert applied.max_open_option_exposure == 2500.0
     assert applied.max_realized_loss_per_day == 300.0
     assert applied.max_position_unrealized_loss == 150.0

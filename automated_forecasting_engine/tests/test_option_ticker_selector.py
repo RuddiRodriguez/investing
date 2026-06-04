@@ -10,6 +10,8 @@ from market_forecasting_engine.option_ticker_selector import (
     evaluate_option_ticker,
     select_option_ticker,
 )
+from market_forecasting_engine.paper_options_agent import apply_option_profile_defaults
+from market_forecasting_engine.paper_options_auto_agent import build_parser, _selector_config_from_args
 
 
 class FakeBroker:
@@ -105,6 +107,19 @@ def test_evaluate_ticker_blocks_when_forecast_edge_is_too_small(monkeypatch) -> 
 
     assert row["eligible"] is False
     assert "forecast_edge_below_selector_min" in row["reasons"]
+
+
+def test_auto_options_default_horizon_matches_eth_style_15_minutes() -> None:
+    args = apply_option_profile_defaults(build_parser().parse_args([]))
+    config = _selector_config_from_args(args)
+
+    assert args.forecast_hours == "0.25"
+    assert args.close_before_expiry_hours == 12.0
+    assert args.target_delta == 0.45
+    assert args.max_delta_distance == 0.30
+    assert config.forecast_hours == (0.25,)
+    assert config.target_delta == 0.45
+    assert config.max_delta_distance == 0.30
 
 
 def _prices() -> pd.DataFrame:

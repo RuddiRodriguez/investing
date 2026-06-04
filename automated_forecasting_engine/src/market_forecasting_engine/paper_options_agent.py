@@ -33,14 +33,14 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "take_profit_position_pl": 50.0,
         "profit_retrace_from_peak_pct": 0.35,
         "max_spread_pct": 0.15,
-        "max_theta_edge_ratio": 0.90,
-        "max_theta_premium_pct_per_day": 0.45,
+        "max_theta_edge_ratio": 0.75,
+        "max_theta_premium_pct_per_day": 0.35,
         "entry_cooldown_minutes": 1,
         "loss_cooldown_minutes": 2,
         "max_trades_per_day": 50,
         "max_consecutive_losses": 10,
-        "max_open_option_positions": 4,
-        "max_open_option_contracts": 4,
+        "max_open_option_positions": 1,
+        "max_open_option_contracts": 2,
         "max_open_option_exposure": 2500.0,
         "max_realized_loss_per_day": 300.0,
         "max_position_unrealized_loss": 150.0,
@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", default="alpaca")
     parser.add_argument("--interval", default="1m")
     parser.add_argument("--lookback-days", type=int, default=20)
-    parser.add_argument("--forecast-hours", default="1,2,4")
+    parser.add_argument("--forecast-hours", default="0.25", help="Forecast horizon in hours. Default 0.25 matches the 15-minute ETH paper-trader horizon.")
     parser.add_argument("--check-interval-seconds", type=int, default=60)
     parser.add_argument("--forecast-refresh-seconds", type=int, default=900)
     parser.add_argument("--max-training-rows", type=int, default=3500)
@@ -141,8 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-position-equity-pct", type=float, default=0.02)
     parser.add_argument("--max-spread-pct", type=float, default=None)
     parser.add_argument("--max-contracts", type=int, default=1)
-    parser.add_argument("--target-delta", type=float, default=0.35)
-    parser.add_argument("--max-delta-distance", type=float, default=0.28)
+    parser.add_argument("--target-delta", type=float, default=0.45)
+    parser.add_argument("--max-delta-distance", type=float, default=0.30)
     parser.add_argument("--require-greeks", action=argparse.BooleanOptionalAction, default=True, help="Require live option delta/gamma/theta/vega before entry.")
     parser.add_argument("--max-theta-edge-ratio", type=float, default=None, help="Profile default: reject contracts when expected theta decay over the forecast horizon is too large versus delta-adjusted forecast edge.")
     parser.add_argument("--max-theta-premium-pct-per-day", type=float, default=None, help="Profile default: reject contracts when daily theta decay is too large versus option premium.")
@@ -167,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-position-unrealized-profit", type=float, default=None, help="Optional explicit per-position dollar profit target. Use the profile take-profit-position-pl by default; set this only to override with a hard P/L guard.")
     parser.add_argument("--enable-forecast-reversal-exit", action=argparse.BooleanOptionalAction, default=True, help="Close calls when the refreshed forecast turns bearish, and close puts when it turns bullish.")
     parser.add_argument("--min-reversal-edge-pct", type=float, default=0.001, help="Minimum underlying forecast move required before closing a position because the forecast reversed.")
-    parser.add_argument("--close-before-expiry-hours", type=float, default=2.0, help="Close open option positions this many hours before option expiry.")
+    parser.add_argument("--close-before-expiry-hours", type=float, default=12.0, help="Close open option positions this many hours before option expiry.")
     parser.add_argument("--expiry-warning-hours", type=float, default=24.0, help="Write a visible warning when open option positions are this close to expiry.")
     parser.add_argument("--max-open-option-positions", type=int, default=None, help="Profile default: maximum same-ticker option positions allowed before blocking new entries.")
     parser.add_argument("--max-open-option-contracts", type=float, default=None, help="Profile default: maximum same-ticker open option contracts allowed before blocking new entries.")
