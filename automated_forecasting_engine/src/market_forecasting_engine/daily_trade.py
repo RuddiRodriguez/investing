@@ -359,7 +359,25 @@ def add_trading_bars(
             future_count += 1
             if future_count >= bars:
                 return candidate
+        live_regular_session_candidate = _same_day_regular_session_projection(current, interval * bars)
+        if day.date() == current.date() and observed[-1].date() == current.date() and live_regular_session_candidate is not None:
+            return live_regular_session_candidate
+        observed_span_minutes = max(0.0, (len(session_template) - 1) * interval)
+        if day.date() == current.date() and observed[-1].date() == current.date() and observed_span_minutes < 385.0:
+            return add_trading_minutes(current, interval * bars)
         day += pd.Timedelta(days=1)
+
+
+def _same_day_regular_session_projection(timestamp: pd.Timestamp, minutes: float) -> pd.Timestamp | None:
+    current = pd.Timestamp(timestamp)
+    minute_of_day = current.hour * 60 + current.minute + current.second / 60.0
+    regular_open_utc = 13 * 60 + 30
+    regular_close_utc = 20 * 60
+    projected = current + pd.Timedelta(minutes=float(minutes))
+    projected_minute = projected.hour * 60 + projected.minute + projected.second / 60.0
+    if regular_open_utc <= minute_of_day < regular_close_utc and current.date() == projected.date() and projected_minute <= regular_close_utc:
+        return projected
+    return None
 
 
 def _observed_session_template(index: pd.DatetimeIndex) -> list[float] | None:
