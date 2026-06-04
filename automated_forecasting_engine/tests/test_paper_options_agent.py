@@ -110,6 +110,7 @@ def test_apply_option_profile_defaults_sets_aggressive_today_defaults() -> None:
         profit_lock_ratio=None,
         take_profit_position_pl=None,
         profit_retrace_from_peak_pct=None,
+        profit_close_limit_offset_pct=None,
         max_spread_pct=None,
         max_theta_edge_ratio=None,
         max_theta_premium_pct_per_day=None,
@@ -130,11 +131,12 @@ def test_apply_option_profile_defaults_sets_aggressive_today_defaults() -> None:
     applied = apply_option_profile_defaults(args)
 
     assert applied.stop_loss_pct == 0.10
-    assert applied.take_profit_pct == 0.55
+    assert applied.take_profit_pct == 0.25
     assert applied.profit_lock_trigger_pct == 0.08
     assert applied.profit_lock_ratio == 0.75
-    assert applied.take_profit_position_pl == 50.0
-    assert applied.profit_retrace_from_peak_pct == 0.35
+    assert applied.take_profit_position_pl == 35.0
+    assert applied.profit_retrace_from_peak_pct == 0.20
+    assert applied.profit_close_limit_offset_pct == 0.01
     assert applied.max_spread_pct == 0.15
     assert applied.entry_cooldown_minutes == 1
     assert applied.loss_cooldown_minutes == 2
@@ -160,6 +162,7 @@ def test_apply_option_profile_defaults_keeps_cli_overrides() -> None:
         profit_lock_ratio=None,
         take_profit_position_pl=None,
         profit_retrace_from_peak_pct=None,
+        profit_close_limit_offset_pct=None,
         max_spread_pct=0.2,
         max_theta_edge_ratio=None,
         max_theta_premium_pct_per_day=None,
@@ -181,6 +184,7 @@ def test_apply_option_profile_defaults_keeps_cli_overrides() -> None:
 
     assert applied.stop_loss_pct == 0.12
     assert applied.take_profit_pct == 0.40
+    assert applied.profit_close_limit_offset_pct == 0.02
     assert applied.max_spread_pct == 0.2
     assert applied.entry_cooldown_minutes == 5
     assert applied.max_total_unrealized_profit == 250.0

@@ -29,11 +29,12 @@ from market_forecasting_engine.risk_profiles import risk_profile_for_name
 OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "aggressive": {
         "stop_loss_pct": 0.10,
-        "take_profit_pct": 0.55,
+        "take_profit_pct": 0.25,
         "profit_lock_trigger_pct": 0.08,
         "profit_lock_ratio": 0.75,
-        "take_profit_position_pl": 50.0,
-        "profit_retrace_from_peak_pct": 0.35,
+        "take_profit_position_pl": 35.0,
+        "profit_retrace_from_peak_pct": 0.20,
+        "profit_close_limit_offset_pct": 0.01,
         "max_spread_pct": 0.15,
         "max_theta_edge_ratio": 0.75,
         "max_theta_premium_pct_per_day": 0.35,
@@ -55,6 +56,7 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "profit_lock_ratio": 0.60,
         "take_profit_position_pl": 75.0,
         "profit_retrace_from_peak_pct": 0.30,
+        "profit_close_limit_offset_pct": 0.02,
         "max_spread_pct": 0.10,
         "max_theta_edge_ratio": 0.75,
         "max_theta_premium_pct_per_day": 0.35,
@@ -76,6 +78,7 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "profit_lock_ratio": 0.75,
         "take_profit_position_pl": 50.0,
         "profit_retrace_from_peak_pct": 0.25,
+        "profit_close_limit_offset_pct": 0.03,
         "max_spread_pct": 0.08,
         "max_theta_edge_ratio": 0.60,
         "max_theta_premium_pct_per_day": 0.25,
@@ -159,7 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profit-lock-ratio", type=float, default=None, help="Fraction of the open per-contract gain to protect when raising the stop.")
     parser.add_argument("--take-profit-position-pl", type=float, default=None, help="Profile default: close an individual option position when that position's unrealized dollar P/L reaches this amount.")
     parser.add_argument("--profit-retrace-from-peak-pct", type=float, default=None, help="Profile default: after a position reaches the per-position profit target, close if it gives back this fraction of peak open profit.")
-    parser.add_argument("--profit-close-limit-offset-pct", type=float, default=0.03, help="When take-profit is reached, sell with a limit this fraction below the current option mark to improve fill odds without using market orders.")
+    parser.add_argument("--profit-close-limit-offset-pct", type=float, default=None, help="Profile default: when take-profit is reached, sell with a limit this fraction below the current option mark to improve fill odds without using market orders.")
     parser.add_argument("--disable-profit-taking", action="store_true", help="Disable autonomous take-profit closes for open option positions.")
     parser.add_argument("--stop-limit-offset-pct", type=float, default=0.08)
     parser.add_argument("--max-total-unrealized-loss", type=float, default=None, help="Optional ticker-level dollar loss cutoff. If open option P/L for this ticker is <= -abs(value), close all open option positions for the ticker.")
@@ -679,6 +682,7 @@ def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
         "profit_lock_ratio": float(args.profit_lock_ratio),
         "take_profit_position_pl": float(args.take_profit_position_pl),
         "profit_retrace_from_peak_pct": float(args.profit_retrace_from_peak_pct),
+        "profit_close_limit_offset_pct": float(args.profit_close_limit_offset_pct),
         "max_spread_pct": args.max_spread_pct,
         "entry_cooldown_minutes": float(args.entry_cooldown_minutes),
         "loss_cooldown_minutes": float(args.loss_cooldown_minutes),
