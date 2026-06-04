@@ -10,6 +10,9 @@ from market_forecasting_engine.paper_options_agent import (
     _cancel_open_option_orders,
     _liquidate_option_positions,
     _manage_configured_stop_loss,
+    _manage_expiry_risk,
+    _manage_forecast_reversal_exit,
+    _manage_position_unrealized_guards,
     _manage_take_profit,
     _manage_total_unrealized_profit,
     _manage_total_unrealized_loss,
@@ -78,10 +81,18 @@ def _args(**overrides) -> argparse.Namespace:
         "total_loss_close_mode": "all",
         "max_total_unrealized_profit": None,
         "total_profit_close_mode": "all",
+        "max_position_unrealized_loss": None,
+        "max_position_unrealized_profit": None,
+        "enable_forecast_reversal_exit": True,
+        "min_reversal_edge_pct": 0.001,
+        "close_before_expiry_hours": 2.0,
+        "expiry_warning_hours": 24.0,
         "max_open_option_orders": 1,
         "max_open_option_positions": 4,
+        "max_open_option_contracts": 4,
         "max_open_option_exposure": 2500.0,
         "max_realized_loss_per_day": 300.0,
+        "allow_mixed_option_direction": False,
         "execute_paper_orders": True,
         "disable_profit_taking": False,
     }
@@ -107,8 +118,10 @@ def test_apply_option_profile_defaults_sets_aggressive_today_defaults() -> None:
         max_trades_per_day=None,
         max_consecutive_losses=None,
         max_open_option_positions=None,
+        max_open_option_contracts=None,
         max_open_option_exposure=None,
         max_realized_loss_per_day=None,
+        max_position_unrealized_loss=None,
         max_total_unrealized_profit=None,
         max_total_unrealized_loss=None,
         one_trade_per_forecast=None,
@@ -128,8 +141,10 @@ def test_apply_option_profile_defaults_sets_aggressive_today_defaults() -> None:
     assert applied.max_trades_per_day == 50
     assert applied.max_consecutive_losses == 10
     assert applied.max_open_option_positions == 4
+    assert applied.max_open_option_contracts == 4
     assert applied.max_open_option_exposure == 2500.0
     assert applied.max_realized_loss_per_day == 300.0
+    assert applied.max_position_unrealized_loss == 150.0
     assert applied.max_total_unrealized_profit == 150.0
     assert applied.max_total_unrealized_loss == 225.0
     assert applied.one_trade_per_forecast is False
@@ -153,8 +168,10 @@ def test_apply_option_profile_defaults_keeps_cli_overrides() -> None:
         max_trades_per_day=None,
         max_consecutive_losses=None,
         max_open_option_positions=None,
+        max_open_option_contracts=None,
         max_open_option_exposure=None,
         max_realized_loss_per_day=None,
+        max_position_unrealized_loss=None,
         max_total_unrealized_profit=250.0,
         max_total_unrealized_loss=100.0,
         one_trade_per_forecast=False,
@@ -745,6 +762,108 @@ def test_execution_blocks_when_position_count_or_exposure_is_full() -> None:
         "max_open_option_positions_reached",
         "max_open_option_exposure_reached",
     ]
+
+
+def test_execution_blocks_when_contract_cap_or_mixed_direction_reached() -> None:
+    reasons = execution_block_reasons(
+        args=_args(
+            max_open_option_orders=3,
+            max_open_option_positions=4,
+            max_open_option_contracts=2,
+            max_open_option_exposure=5000.0,
+            require_market_open=True,
+            allow_duplicate_contract_order=False,
+            allow_mixed_option_direction=False,
+        ),
+        clock={"is_open": True},
+        trade_plan={
+            "action": "buy_option",
+            "order": {"symbol": "NVDA260603P00225000", "qty": 1, "limit_price": 3.25},
+        },
+        open_orders=[],
+        option_positions=[
+            {"symbol": "NVDA260603C00220000", "qty": "2", "market_value": "700"},
+        ],
+    )
+
+    assert reasons == [
+        "max_open_option_contracts_reached",
+        "mixed_option_direction_blocked",
+    ]
+
+
+def test_position_unrealized_loss_guard_closes_single_position() -> None:
+    broker = FakeBroker()
+    actions = _manage_position_unrealized_guards(
+        broker=broker,  # type: ignore[arg-type]
+        args=_args(ticker="NVDA", max_position_unrealized_loss=75.0),
+        open_orders=[{"id": "old-stop", "symbol": "NVDA260603C00225000", "side": "sell"}],
+        option_positions=[
+            {
+                "symbol": "NVDA260603C00225000",
+                "qty": "1",
+                "current_price": "2.25",
+                "unrealized_pl": "-90",
+            }
+        ],
+        now=datetime(2026, 6, 1, 16, 0, tzinfo=UTC),
+    )
+
+    assert [action["action"] for action in actions] == [
+        "position_loss_position_close_triggered",
+        "cancelled_existing_exit_for_position_loss_position_close_triggered",
+        "submitted_position_loss_position_close_triggered_close",
+    ]
+    assert broker.cancelled == ["old-stop"]
+    assert broker.submitted[0]["symbol"] == "NVDA260603C00225000"
+    assert broker.submitted[0]["order_type"] == "limit"
+
+
+def test_forecast_reversal_exit_closes_opposite_option_type() -> None:
+    broker = FakeBroker()
+    actions = _manage_forecast_reversal_exit(
+        broker=broker,  # type: ignore[arg-type]
+        args=_args(ticker="TSLA"),
+        open_orders=[],
+        option_positions=[
+            {
+                "symbol": "TSLA260605C00425000",
+                "qty": "1",
+                "current_price": "5.10",
+                "unrealized_pl": "55",
+            }
+        ],
+        now=datetime(2026, 6, 1, 16, 0, tzinfo=UTC),
+        forecast={"expected_direction": "downward", "spot": 425.0, "predicted_price": 420.0},
+        underlying_price=425.0,
+    )
+
+    assert actions[0]["action"] == "forecast_reversal_position_close_triggered"
+    assert actions[0]["position_option_type"] == "call"
+    assert actions[0]["desired_option_type"] == "put"
+    assert broker.submitted[0]["symbol"] == "TSLA260605C00425000"
+
+
+def test_expiry_risk_closes_near_expiry_position() -> None:
+    broker = FakeBroker()
+    actions = _manage_expiry_risk(
+        broker=broker,  # type: ignore[arg-type]
+        args=_args(ticker="TSLA", close_before_expiry_hours=2.0, expiry_warning_hours=24.0),
+        open_orders=[],
+        option_positions=[
+            {
+                "symbol": "TSLA260605P00425000",
+                "qty": "1",
+                "current_price": "3.20",
+                "unrealized_pl": "-20",
+            }
+        ],
+        now=datetime(2026, 6, 5, 18, 30, tzinfo=UTC),
+    )
+
+    assert actions[0]["action"] == "expiry_position_close_triggered"
+    assert actions[0]["hours_to_expiry"] == 1.5
+    assert broker.submitted[0]["symbol"] == "TSLA260605P00425000"
 
 
 def test_option_entry_guard_blocks_overtrading() -> None:

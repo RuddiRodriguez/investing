@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from uuid import uuid4
 from datetime import UTC, datetime, timedelta
@@ -39,8 +40,10 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_trades_per_day": 50,
         "max_consecutive_losses": 10,
         "max_open_option_positions": 4,
+        "max_open_option_contracts": 4,
         "max_open_option_exposure": 2500.0,
         "max_realized_loss_per_day": 300.0,
+        "max_position_unrealized_loss": 150.0,
         "one_trade_per_forecast": False,
     },
     "medium": {
@@ -58,8 +61,10 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_trades_per_day": 3,
         "max_consecutive_losses": 2,
         "max_open_option_positions": 2,
+        "max_open_option_contracts": 2,
         "max_open_option_exposure": 1500.0,
         "max_realized_loss_per_day": 150.0,
+        "max_position_unrealized_loss": 100.0,
         "one_trade_per_forecast": True,
     },
     "conservative": {
@@ -77,8 +82,10 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_trades_per_day": 2,
         "max_consecutive_losses": 1,
         "max_open_option_positions": 1,
+        "max_open_option_contracts": 1,
         "max_open_option_exposure": 750.0,
         "max_realized_loss_per_day": 75.0,
+        "max_position_unrealized_loss": 50.0,
         "one_trade_per_forecast": True,
     },
 }
@@ -156,7 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-loss-close-mode", choices=("all", "losing_only"), default="all", help="When max total unrealized loss is breached, close all ticker positions or only positions currently losing.")
     parser.add_argument("--max-total-unrealized-profit", type=float, default=None, help="Optional ticker-level dollar profit target. If open option P/L for this ticker is >= value, close ticker positions.")
     parser.add_argument("--total-profit-close-mode", choices=("all", "winning_only"), default="all", help="When max total unrealized profit is reached, close all ticker positions or only positions currently winning.")
+    parser.add_argument("--max-position-unrealized-loss", type=float, default=None, help="Profile default: close an individual option position when its unrealized dollar P/L is <= -abs(value). Use 0 to close any losing position.")
+    parser.add_argument("--max-position-unrealized-profit", type=float, default=None, help="Optional explicit per-position dollar profit target. Use the profile take-profit-position-pl by default; set this only to override with a hard P/L guard.")
+    parser.add_argument("--enable-forecast-reversal-exit", action=argparse.BooleanOptionalAction, default=True, help="Close calls when the refreshed forecast turns bearish, and close puts when it turns bullish.")
+    parser.add_argument("--min-reversal-edge-pct", type=float, default=0.001, help="Minimum underlying forecast move required before closing a position because the forecast reversed.")
+    parser.add_argument("--close-before-expiry-hours", type=float, default=2.0, help="Close open option positions this many hours before option expiry.")
+    parser.add_argument("--expiry-warning-hours", type=float, default=24.0, help="Write a visible warning when open option positions are this close to expiry.")
     parser.add_argument("--max-open-option-positions", type=int, default=None, help="Profile default: maximum same-ticker option positions allowed before blocking new entries.")
+    parser.add_argument("--max-open-option-contracts", type=float, default=None, help="Profile default: maximum same-ticker open option contracts allowed before blocking new entries.")
     parser.add_argument("--max-open-option-exposure", type=float, default=None, help="Profile default: maximum same-ticker open option debit exposure before blocking new entries.")
     parser.add_argument("--max-realized-loss-per-day", type=float, default=None, help="Profile default: block new entries after same-ticker realized option losses reach this dollar amount for the UTC day.")
     parser.add_argument("--entry-cooldown-minutes", type=float, default=None, help="Profile default: wait this many minutes after any filled option order before opening a new entry.")
@@ -174,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--abandon-entry-after-seconds", type=int, default=300)
     parser.add_argument("--require-market-open", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-duplicate-contract-order", action="store_true")
+    parser.add_argument("--allow-mixed-option-direction", action="store_true", help="Allow opening calls while same-ticker puts are open, or puts while same-ticker calls are open.")
     parser.add_argument("--max-open-option-orders", type=int, default=1)
     parser.add_argument("--execute-paper-orders", action="store_true")
     parser.add_argument("--output-dir", default="automated_forecasting_engine/runs/paper_options_agent")
@@ -306,6 +321,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         option_positions=option_positions,
         state=state,
         now=now,
+        forecast=forecast,
+        underlying_price=float(plan["latest_price"]),
     )
     if read_stop_request(output_dir, args.ticker):
         management_actions.append({"action": "entry_blocked_by_stop_request", "ticker": args.ticker.upper()})
@@ -604,12 +621,27 @@ def execution_block_reasons(
     open_positions = [position for position in option_positions if _int_float(position.get("qty")) > 0]
     if len(open_positions) >= int(args.max_open_option_positions):
         reasons.append("max_open_option_positions_reached")
+    max_contracts = _float_or_none(getattr(args, "max_open_option_contracts", None))
+    if max_contracts is not None and max_contracts > 0:
+        current_contracts = sum(_int_float(position.get("qty")) for position in open_positions)
+        planned_contracts = _int_float((trade_plan.get("order") or {}).get("qty"))
+        if current_contracts >= max_contracts or current_contracts + planned_contracts > max_contracts:
+            reasons.append("max_open_option_contracts_reached")
     current_exposure = _option_position_exposure(open_positions)
     planned_debit = _planned_option_debit(trade_plan)
     max_exposure = _float_or_none(getattr(args, "max_open_option_exposure", None))
     if max_exposure is not None and max_exposure > 0 and current_exposure + planned_debit > max_exposure:
         reasons.append("max_open_option_exposure_reached")
     planned_symbol = ((trade_plan.get("order") or {}).get("symbol") or "").upper()
+    planned_option_type = _option_type_from_symbol(planned_symbol)
+    if planned_option_type and not bool(getattr(args, "allow_mixed_option_direction", False)):
+        existing_types = {
+            option_type
+            for option_type in (_option_type_from_symbol(str(position.get("symbol") or "")) for position in open_positions)
+            if option_type
+        }
+        if existing_types and planned_option_type not in existing_types:
+            reasons.append("mixed_option_direction_blocked")
     if planned_symbol and not args.allow_duplicate_contract_order:
         for order in open_orders:
             if str(order.get("symbol") or "").upper() == planned_symbol:
@@ -637,9 +669,17 @@ def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
         "total_loss_close_mode": getattr(args, "total_loss_close_mode", None),
         "max_total_unrealized_profit": getattr(args, "max_total_unrealized_profit", None),
         "total_profit_close_mode": getattr(args, "total_profit_close_mode", None),
+        "max_position_unrealized_loss": getattr(args, "max_position_unrealized_loss", None),
+        "max_position_unrealized_profit": getattr(args, "max_position_unrealized_profit", None),
+        "enable_forecast_reversal_exit": getattr(args, "enable_forecast_reversal_exit", None),
+        "min_reversal_edge_pct": getattr(args, "min_reversal_edge_pct", None),
+        "close_before_expiry_hours": getattr(args, "close_before_expiry_hours", None),
+        "expiry_warning_hours": getattr(args, "expiry_warning_hours", None),
         "max_open_option_positions": int(args.max_open_option_positions),
+        "max_open_option_contracts": float(args.max_open_option_contracts),
         "max_open_option_exposure": float(args.max_open_option_exposure),
         "max_realized_loss_per_day": float(args.max_realized_loss_per_day),
+        "allow_mixed_option_direction": bool(getattr(args, "allow_mixed_option_direction", False)),
     }
 
 
@@ -787,6 +827,8 @@ def manage_existing_option_orders_and_positions(
     option_positions: list[dict[str, Any]],
     state: dict[str, Any],
     now: datetime,
+    forecast: dict[str, Any] | None = None,
+    underlying_price: float | None = None,
 ) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     actions.extend(_abandon_stale_entry_orders(broker=broker, args=args, open_orders=open_orders, state=state, now=now))
@@ -812,6 +854,41 @@ def manage_existing_option_orders_and_positions(
     if total_profit_actions:
         actions.extend(total_profit_actions)
         return actions
+    position_guard_actions = _manage_position_unrealized_guards(
+        broker=broker,
+        args=args,
+        open_orders=open_orders,
+        option_positions=option_positions,
+        now=now,
+    )
+    if position_guard_actions:
+        actions.extend(position_guard_actions)
+        if _protective_close_triggered(position_guard_actions):
+            return actions
+    expiry_actions = _manage_expiry_risk(
+        broker=broker,
+        args=args,
+        open_orders=open_orders,
+        option_positions=option_positions,
+        now=now,
+    )
+    if expiry_actions:
+        actions.extend(expiry_actions)
+        if _protective_close_triggered(expiry_actions):
+            return actions
+    reversal_actions = _manage_forecast_reversal_exit(
+        broker=broker,
+        args=args,
+        open_orders=open_orders,
+        option_positions=option_positions,
+        now=now,
+        forecast=forecast or {},
+        underlying_price=underlying_price,
+    )
+    if reversal_actions:
+        actions.extend(reversal_actions)
+        if _protective_close_triggered(reversal_actions):
+            return actions
     _prune_position_profit_peaks(state, option_positions)
     active_trade = state.get("active_trade") or {}
     trade_plan = active_trade.get("trade_plan") or {}
@@ -1068,6 +1145,243 @@ def _manage_total_unrealized_profit(
     return actions
 
 
+def _manage_position_unrealized_guards(
+    *,
+    broker: AlpacaPaperBroker,
+    args: argparse.Namespace,
+    open_orders: list[dict[str, Any]],
+    option_positions: list[dict[str, Any]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    loss_threshold = _float_or_none(getattr(args, "max_position_unrealized_loss", None))
+    profit_threshold = _float_or_none(getattr(args, "max_position_unrealized_profit", None))
+    if loss_threshold is not None:
+        loss_threshold = abs(float(loss_threshold))
+    profit_enabled = profit_threshold is not None and float(profit_threshold) >= 0.0
+    if loss_threshold is None and not profit_enabled:
+        return []
+    actions: list[dict[str, Any]] = []
+    open_positions = [position for position in option_positions if _int_float(position.get("qty")) > 0]
+    for position in open_positions:
+        unrealized_pl = _float_or_none(position.get("unrealized_pl"))
+        if unrealized_pl is None:
+            actions.append({"action": "position_unrealized_guard_skipped_missing_pl", "symbol": position.get("symbol")})
+            continue
+        trigger_reason = None
+        threshold_payload: dict[str, Any] = {}
+        if loss_threshold is not None:
+            loss_cutoff = -abs(float(loss_threshold))
+            if (float(loss_threshold) == 0.0 and unrealized_pl < 0.0) or (float(loss_threshold) > 0.0 and unrealized_pl <= loss_cutoff):
+                trigger_reason = "position_loss_position_close_triggered"
+                threshold_payload = {"position_loss_cutoff": round(loss_cutoff, 2)}
+        if trigger_reason is None and profit_enabled and profit_threshold is not None:
+            if (float(profit_threshold) == 0.0 and unrealized_pl > 0.0) or (float(profit_threshold) > 0.0 and unrealized_pl >= float(profit_threshold)):
+                trigger_reason = "position_profit_position_close_triggered"
+                threshold_payload = {"position_profit_target": round(float(profit_threshold), 2)}
+        if trigger_reason is None:
+            actions.append(
+                {
+                    "action": "position_unrealized_guard_not_triggered",
+                    "symbol": position.get("symbol"),
+                    "position_unrealized_pl": round(float(unrealized_pl), 2),
+                    "loss_guard": loss_threshold,
+                    "profit_guard": profit_threshold,
+                }
+            )
+            continue
+        actions.extend(
+            _close_position_with_limit(
+                broker=broker,
+                args=args,
+                open_orders=open_orders,
+                position=position,
+                now=now,
+                reason=trigger_reason,
+                limit_offset_pct=float(getattr(args, "profit_close_limit_offset_pct", 0.03)),
+                extra={
+                    "position_unrealized_pl": round(float(unrealized_pl), 2),
+                    **threshold_payload,
+                },
+            )
+        )
+    return actions
+
+
+def _manage_forecast_reversal_exit(
+    *,
+    broker: AlpacaPaperBroker,
+    args: argparse.Namespace,
+    open_orders: list[dict[str, Any]],
+    option_positions: list[dict[str, Any]],
+    now: datetime,
+    forecast: dict[str, Any],
+    underlying_price: float | None,
+) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "enable_forecast_reversal_exit", True)):
+        return []
+    spot = _float_or_none(forecast.get("spot")) or _float_or_none(underlying_price)
+    predicted_price = _float_or_none(forecast.get("predicted_price"))
+    if spot is None or spot <= 0 or predicted_price is None:
+        return []
+    forecast_move_pct = (float(predicted_price) - float(spot)) / float(spot)
+    min_edge = abs(float(getattr(args, "min_reversal_edge_pct", 0.001)))
+    if abs(forecast_move_pct) < min_edge:
+        return [
+            {
+                "action": "forecast_reversal_exit_not_triggered_edge_too_small",
+                "forecast_direction": forecast.get("expected_direction"),
+                "forecast_move_pct": round(forecast_move_pct, 6),
+                "min_reversal_edge_pct": min_edge,
+            }
+        ]
+    expected_direction = str(forecast.get("expected_direction") or "").lower()
+    desired_type = None
+    if expected_direction == "upward" or forecast_move_pct > 0:
+        desired_type = "call"
+    elif expected_direction == "downward" or forecast_move_pct < 0:
+        desired_type = "put"
+    if desired_type is None:
+        return []
+    actions: list[dict[str, Any]] = []
+    open_positions = [position for position in option_positions if _int_float(position.get("qty")) > 0]
+    for position in open_positions:
+        symbol = str(position.get("symbol") or "")
+        current_type = _option_type_from_symbol(symbol)
+        if not current_type:
+            continue
+        if current_type == desired_type:
+            actions.append(
+                {
+                    "action": "forecast_reversal_exit_not_triggered_position_aligned",
+                    "symbol": symbol,
+                    "position_option_type": current_type,
+                    "desired_option_type": desired_type,
+                    "forecast_direction": forecast.get("expected_direction"),
+                    "forecast_move_pct": round(forecast_move_pct, 6),
+                }
+            )
+            continue
+        actions.extend(
+            _close_position_with_limit(
+                broker=broker,
+                args=args,
+                open_orders=open_orders,
+                position=position,
+                now=now,
+                reason="forecast_reversal_position_close_triggered",
+                limit_offset_pct=float(getattr(args, "profit_close_limit_offset_pct", 0.03)),
+                extra={
+                    "position_option_type": current_type,
+                    "desired_option_type": desired_type,
+                    "forecast_direction": forecast.get("expected_direction"),
+                    "forecast_spot": round(float(spot), 4),
+                    "forecast_price": round(float(predicted_price), 4),
+                    "forecast_move_pct": round(forecast_move_pct, 6),
+                    "min_reversal_edge_pct": min_edge,
+                },
+            )
+        )
+    return actions
+
+
+def _manage_expiry_risk(
+    *,
+    broker: AlpacaPaperBroker,
+    args: argparse.Namespace,
+    open_orders: list[dict[str, Any]],
+    option_positions: list[dict[str, Any]],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    active_positions = [position for position in option_positions if _int_float(position.get("qty")) > 0]
+    if not active_positions:
+        return []
+    close_before_hours = max(0.0, float(getattr(args, "close_before_expiry_hours", 2.0)))
+    warning_hours = max(close_before_hours, float(getattr(args, "expiry_warning_hours", 24.0)))
+    actions: list[dict[str, Any]] = []
+    for position in active_positions:
+        symbol = str(position.get("symbol") or "")
+        expiry = _option_expiry_utc_from_symbol(symbol)
+        hours_to_expiry = None if expiry is None else (expiry - now).total_seconds() / 3600.0
+        if not symbol or hours_to_expiry is None:
+            actions.append({"action": "expiry_risk_skipped_missing_symbol_or_expiry", "symbol": symbol})
+            continue
+        expiry_payload = {
+            "symbol": symbol,
+            "expiration_utc": expiry.isoformat(),
+            "hours_to_expiry": round(hours_to_expiry, 2),
+            "close_before_expiry_hours": close_before_hours,
+            "expiry_warning_hours": warning_hours,
+        }
+        if hours_to_expiry <= close_before_hours:
+            actions.extend(
+                _close_position_with_limit(
+                    broker=broker,
+                    args=args,
+                    open_orders=open_orders,
+                    position=position,
+                    now=now,
+                    reason="expiry_position_close_triggered",
+                    limit_offset_pct=float(getattr(args, "liquidation_limit_offset_pct", 0.05)),
+                    extra=expiry_payload,
+                )
+            )
+        elif hours_to_expiry <= warning_hours:
+            actions.append({"action": "expiry_position_warning", **expiry_payload})
+    return actions
+
+
+def _close_position_with_limit(
+    *,
+    broker: AlpacaPaperBroker,
+    args: argparse.Namespace,
+    open_orders: list[dict[str, Any]],
+    position: dict[str, Any],
+    now: datetime,
+    reason: str,
+    limit_offset_pct: float,
+    extra: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    symbol = str(position.get("symbol") or "")
+    qty = _int_float(position.get("qty"))
+    current_price = _current_option_price(position)
+    if not symbol or qty <= 0 or current_price is None:
+        return [{"action": f"{reason}_skipped_missing_price_or_qty", "symbol": symbol, "qty": qty}]
+    sell_orders = [
+        order
+        for order in open_orders
+        if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == "sell"
+    ]
+    close_limit = _profit_close_limit_price(current_price, float(limit_offset_pct))
+    return _replace_sell_orders(
+        broker=broker,
+        args=args,
+        symbol=symbol,
+        qty=qty,
+        sell_orders=sell_orders,
+        replacement={
+            "symbol": symbol,
+            "side": "sell",
+            "order_type": "limit",
+            "qty": qty,
+            "limit_price": close_limit,
+            "time_in_force": "day",
+            "client_order_id": _client_order_id("opt-riskguard", args.ticker.upper(), symbol, now),
+        },
+        trigger_action={
+            "action": reason,
+            "symbol": symbol,
+            "qty": qty,
+            "current_price": round(float(current_price), 4),
+            "close_limit_price": close_limit,
+            "position_unrealized_pl": _float_or_none(position.get("unrealized_pl")),
+            **(extra or {}),
+        },
+        cancel_action=f"cancelled_existing_exit_for_{reason}",
+        submit_action=f"submitted_{reason}_close",
+        now=now,
+    )
+
+
 def verify_liquidation_until_flat(
     *,
     broker: AlpacaPaperBroker,
@@ -1288,6 +1602,10 @@ def _protective_close_triggered(actions: list[dict[str, Any]]) -> bool:
     close_markers = (
         "total_loss_position_close_triggered",
         "total_profit_position_close_triggered",
+        "position_loss_position_close_triggered",
+        "position_profit_position_close_triggered",
+        "forecast_reversal_position_close_triggered",
+        "expiry_position_close_triggered",
         "configured_stop_already_breached",
         "take_profit_triggered",
         "manual_liquidation_position_close_triggered",
@@ -1747,6 +2065,26 @@ def _forecast_key(forecast_bundle: dict[str, Any]) -> str | None:
     if not created:
         return None
     return f"{created}|{horizon}"
+
+
+def _option_type_from_symbol(symbol: str) -> str | None:
+    match = re.search(r"\d{6}([CP])\d{8}$", str(symbol or "").upper())
+    if not match:
+        return None
+    return "call" if match.group(1) == "C" else "put"
+
+
+def _option_expiry_utc_from_symbol(symbol: str) -> datetime | None:
+    match = re.search(r"(\d{2})(\d{2})(\d{2})[CP]\d{8}$", str(symbol or "").upper())
+    if not match:
+        return None
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    try:
+        return datetime(year, month, day, 20, 0, tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 def _current_option_price(position: dict[str, Any]) -> float | None:
