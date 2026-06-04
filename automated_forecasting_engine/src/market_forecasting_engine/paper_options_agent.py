@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from uuid import uuid4
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -126,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ticker", default="TSLA")
     parser.add_argument("--risk-profile", choices=("conservative", "medium", "aggressive"), default="aggressive")
     parser.add_argument("--provider", default="alpaca")
+    parser.add_argument("--alpaca-data-feed", choices=("iex", "sip", "auto"), default="iex", help="Alpaca stock market-data feed for forecasts. IEX is the default for paper accounts without SIP access.")
     parser.add_argument("--interval", default="1m")
     parser.add_argument("--lookback-days", type=int, default=20)
     parser.add_argument("--forecast-hours", default="0.25,0.5,0.75,1", help="Forecast horizons in hours. Defaults match the ETH-style 15m/30m/45m/1h dashboard path; trading uses the shortest horizon first.")
@@ -590,17 +593,34 @@ def _client_symbol_part(symbol: str) -> str:
 
 def _load_prices(args: argparse.Namespace) -> pd.DataFrame:
     start = (datetime.now(UTC) - timedelta(days=int(args.lookback_days))).isoformat().replace("+00:00", "Z")
-    result = load_prices_with_provider(
-        args.provider,
-        DataRequest(ticker=args.ticker.upper(), start=start, interval=args.interval, target_column="close"),
-        store=None,
-        use_cache=False,
-        refresh_cache=True,
-    )
+    feed = str(getattr(args, "alpaca_data_feed", "") or "").strip().lower()
+    env_feed = feed if str(args.provider).lower() == "alpaca" and feed and feed != "auto" else None
+    with _temporary_env("ALPACA_DATA_FEED", env_feed):
+        result = load_prices_with_provider(
+            args.provider,
+            DataRequest(ticker=args.ticker.upper(), start=start, interval=args.interval, target_column="close"),
+            store=None,
+            use_cache=False,
+            refresh_cache=True,
+        )
     prices = normalize_price_frame(result.frame, target_column="close")
     if args.max_training_rows and len(prices) > int(args.max_training_rows):
         prices = prices.tail(int(args.max_training_rows))
     return prices
+
+
+@contextmanager
+def _temporary_env(name: str, value: str | None):
+    old_value = os.environ.get(name)
+    if value is not None:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old_value
 
 
 def execution_block_reasons(

@@ -87,6 +87,14 @@ def test_forecast_timestamp_keeps_short_live_equity_horizon_same_day() -> None:
     assert forecast_time == pd.Timestamp("2026-06-04 14:48")
 
 
+def test_forecast_timestamp_prefers_live_projection_before_next_template_day() -> None:
+    index = pd.date_range("2026-06-04 08:00", periods=424, freq="1min")
+
+    forecast_time = add_trading_bars(index, pd.Timestamp("2026-06-04 15:03"), 15, 1.0)
+
+    assert forecast_time == pd.Timestamp("2026-06-04 15:18")
+
+
 def test_forecast_timestamp_keeps_weekends_for_247_markets() -> None:
     index = pd.date_range("2026-05-29 00:00", periods=3 * 288, freq="5min")
 

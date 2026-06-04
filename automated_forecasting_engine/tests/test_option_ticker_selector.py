@@ -114,10 +114,12 @@ def test_auto_options_default_horizons_match_eth_style_short_path() -> None:
     config = _selector_config_from_args(args)
 
     assert args.forecast_hours == "0.25,0.5,0.75,1"
+    assert args.alpaca_data_feed == "iex"
     assert args.close_before_expiry_hours == 12.0
     assert args.target_delta == 0.45
     assert args.max_delta_distance == 0.30
     assert config.forecast_hours == (0.25, 0.5, 0.75, 1.0)
+    assert config.alpaca_data_feed == "iex"
     assert config.target_delta == 0.45
     assert config.max_delta_distance == 0.30
 

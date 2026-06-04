@@ -186,7 +186,7 @@ class AlpacaProvider:
         _load_env_file()
         self.key_id = key_id or os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
         self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
-        self.feed = feed or os.getenv("ALPACA_DATA_FEED", "sip")
+        self.feed = feed or os.getenv("ALPACA_DATA_FEED", "iex")
         self.crypto_location = os.getenv("ALPACA_CRYPTO_LOCATION", "us")
 
     def fetch_prices(self, request: DataRequest) -> ProviderResult:

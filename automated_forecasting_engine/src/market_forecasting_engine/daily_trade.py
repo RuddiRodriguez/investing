@@ -350,6 +350,9 @@ def add_trading_bars(
         if int(day.dayofweek) >= 5 and not trades_weekends:
             day += pd.Timedelta(days=1)
             continue
+        live_regular_session_candidate = _same_day_regular_session_projection(current, interval * bars)
+        if day.date() == current.date() and observed[-1].date() == current.date() and live_regular_session_candidate is not None:
+            return live_regular_session_candidate
         session_times = [
             day + pd.Timedelta(minutes=minute)
             for minute in session_template
@@ -359,9 +362,6 @@ def add_trading_bars(
             future_count += 1
             if future_count >= bars:
                 return candidate
-        live_regular_session_candidate = _same_day_regular_session_projection(current, interval * bars)
-        if day.date() == current.date() and observed[-1].date() == current.date() and live_regular_session_candidate is not None:
-            return live_regular_session_candidate
         observed_span_minutes = max(0.0, (len(session_template) - 1) * interval)
         if day.date() == current.date() and observed[-1].date() == current.date() and observed_span_minutes < 385.0:
             return add_trading_minutes(current, interval * bars)

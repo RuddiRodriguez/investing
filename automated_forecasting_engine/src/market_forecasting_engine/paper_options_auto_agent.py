@@ -124,6 +124,7 @@ def _selector_config_from_args(args: argparse.Namespace) -> OptionTickerSelector
     return OptionTickerSelectorConfig(
         tickers=tuple(_parse_tickers(args.candidate_tickers)),
         provider=args.provider,
+        alpaca_data_feed=str(args.alpaca_data_feed),
         interval=args.interval,
         lookback_days=int(args.lookback_days),
         forecast_hours=tuple(float(value.strip()) for value in str(args.forecast_hours).split(",") if value.strip()),

@@ -82,6 +82,7 @@ def build_stock_chart_payload(
 ) -> dict[str, Any]:
     broker_points = _recent_stock_bar_points(ticker or str(report.get("ticker") or "")) if include_live_bars else []
     actual_points = broker_points if broker_points else _history_actual_points(history)
+    latest_actual = actual_points[-1] if actual_points else {}
     forecast_plan = report.get("forecast_plan") or {}
     selected_forecast = report.get("selected_forecast") or {}
     as_of = forecast_plan.get("as_of") or report.get("forecast_created_at_utc") or report.get("checked_at")
@@ -109,6 +110,7 @@ def build_stock_chart_payload(
         "forecast_points": forecast_points,
         "as_of": as_of,
         "as_of_price": as_of_price,
+        "latest_actual": latest_actual,
         "source": "alpaca_stock_bars" if broker_points else "agent_history",
     }
 
@@ -430,10 +432,14 @@ def dashboard_html(refresh_seconds: int) -> str:
       const pad = {{ left: 62, right: 28, top: 20, bottom: 44 }};
       svg.setAttribute("viewBox", `0 0 ${{width}} ${{height}}`);
       svg.innerHTML = "";
-      const actual = (chart.actual_points || []).map(p => [new Date(p.timestamp).getTime(), Number(p.price)]).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-      const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: new Date(p.timestamp).getTime(), y: Number(p.predicted_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
-      set("chartMeta", `actual points ${{actual.length}} | forecast points ${{forecasts.length}} | source ${{chart.source || "-"}}`);
-      const asOfTime = chart.as_of ? new Date(chart.as_of).getTime() : null;
+      const actual = (chart.actual_points || []).map(p => [parseTimestampMs(p.timestamp), Number(p.price)]).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: parseTimestampMs(p.timestamp), y: Number(p.predicted_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+      const latestActual = actual.length ? actual[actual.length - 1] : null;
+      const latestActualTime = latestActual ? latestActual[0] : null;
+      const maturedCount = forecasts.filter(p => Number.isFinite(latestActualTime) && p.x <= latestActualTime).length;
+      const pendingCount = forecasts.length - maturedCount;
+      set("chartMeta", `actual ${{actual.length}} | forecast ${{forecasts.length}} | matured ${{maturedCount}} | pending ${{pendingCount}} | source ${{chart.source || "-"}}`);
+      const asOfTime = chart.as_of ? parseTimestampMs(chart.as_of) : null;
       const asOfPrice = Number(chart.as_of_price);
       const focusStart = Number.isFinite(asOfTime) ? asOfTime - 2 * 60 * 60 * 1000 : null;
       const focusEnd = forecasts.length ? Math.max(...forecasts.map(p => p.x)) + 15 * 60 * 1000 : null;
@@ -488,10 +494,19 @@ def dashboard_html(refresh_seconds: int) -> str:
       if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) {{
         svg.appendChild(el("circle", {{ cx: x(asOfTime), cy: y(asOfPrice), r: 5, fill: "#2563eb" }}));
       }}
+      if (latestActual) {{
+        svg.appendChild(el("circle", {{ cx: x(latestActual[0]), cy: y(latestActual[1]), r: 4, fill: "#111827" }}));
+        const latest = el("text", {{ x: Math.min(x(latestActual[0]) + 7, width - pad.right - 90), y: y(latestActual[1]) + 4, fill: "#111827", "font-size": 11 }});
+        latest.textContent = `latest $${{price(latestActual[1])}}`;
+        svg.appendChild(latest);
+      }}
       forecasts.forEach(p => {{
-        svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5, fill: "#dc2626" }}));
-        const t = el("text", {{ x: x(p.x) + 7, y: y(p.y) - 7, fill: "#991b1b", "font-size": 11 }});
-        t.textContent = `${{Number(p.horizon_hours) === 0.25 ? "15m" : price(p.horizon_hours) + "h"}} ${{price(p.y)}}`;
+        const matured = Number.isFinite(latestActualTime) && p.x <= latestActualTime;
+        const fill = matured ? "#dc2626" : "#f59e0b";
+        const textFill = matured ? "#991b1b" : "#92400e";
+        svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5, fill }}));
+        const t = el("text", {{ x: x(p.x) + 7, y: y(p.y) - 7, fill: textFill, "font-size": 11 }});
+        t.textContent = `${{Number(p.horizon_hours) === 0.25 ? "15m" : price(p.horizon_hours) + "h"}} ${{price(p.y)}}${{matured ? " checked" : ""}}`;
         svg.appendChild(t);
       }});
       const axis = el("line", {{ x1: pad.left, y1: height - pad.bottom, x2: width - pad.right, y2: height - pad.bottom, stroke: "#9ca3af" }});
@@ -507,6 +522,12 @@ def dashboard_html(refresh_seconds: int) -> str:
       const node = document.createElementNS("http://www.w3.org/2000/svg", name);
       Object.entries(attrs || {{}}).forEach(([key, value]) => node.setAttribute(key, value));
       return node;
+    }}
+    function parseTimestampMs(value) {{
+      const raw = String(value || "");
+      if (!raw) return NaN;
+      const hasZone = /(?:Z|[+-]\\d{{2}}:?\\d{{2}})$/.test(raw);
+      return new Date(hasZone ? raw : `${{raw}}Z`).getTime();
     }}
     function renderPositionPl(pl) {{
       const total = Number(pl.total_unrealized_pl || 0);

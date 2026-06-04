@@ -110,6 +110,7 @@ def test_options_dashboard_reads_ticker_specific_report_and_history(tmp_path) ->
     assert payload["chart"]["as_of"] == "2026-06-01T10:00:00+00:00"
     assert payload["chart"]["as_of_price"] == 200.0
     assert payload["chart"]["actual_points"] == [{"timestamp": "2026-06-01T10:00:00+00:00", "price": 200.0}]
+    assert payload["chart"]["latest_actual"] == {"timestamp": "2026-06-01T10:00:00+00:00", "price": 200.0}
     assert payload["chart"]["source"] == "agent_history"
     assert [row["horizon_hours"] for row in payload["chart"]["forecast_points"]] == [0.25, 0.5, 0.75, 1.0]
     assert payload["chart"]["forecast_points"][-1]["predicted_price"] == 205.0

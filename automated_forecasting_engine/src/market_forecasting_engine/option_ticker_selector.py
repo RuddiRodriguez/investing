@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ DEFAULT_OPTION_TICKER_UNIVERSE = (
 class OptionTickerSelectorConfig:
     tickers: tuple[str, ...] = DEFAULT_OPTION_TICKER_UNIVERSE
     provider: str = "alpaca"
+    alpaca_data_feed: str = "iex"
     interval: str = "1m"
     lookback_days: int = 20
     forecast_hours: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
@@ -282,13 +284,16 @@ def _safe_asset(broker: AlpacaPaperBroker, ticker: str, reasons: list[str]) -> d
 def _safe_load_prices(*, ticker: str, config: OptionTickerSelectorConfig, now: datetime, reasons: list[str]) -> pd.DataFrame | None:
     start = (now - timedelta(days=int(config.lookback_days))).isoformat().replace("+00:00", "Z")
     try:
-        result = load_prices_with_provider(
-            config.provider,
-            DataRequest(ticker=ticker, start=start, interval=config.interval, target_column="close"),
-            store=None,
-            use_cache=False,
-            refresh_cache=True,
-        )
+        feed = str(config.alpaca_data_feed or "").strip().lower()
+        env_feed = feed if config.provider.lower() == "alpaca" and feed and feed != "auto" else None
+        with _temporary_env("ALPACA_DATA_FEED", env_feed):
+            result = load_prices_with_provider(
+                config.provider,
+                DataRequest(ticker=ticker, start=start, interval=config.interval, target_column="close"),
+                store=None,
+                use_cache=False,
+                refresh_cache=True,
+            )
         frame = normalize_price_frame(result.frame, target_column="close")
         if config.max_training_rows and len(frame) > int(config.max_training_rows):
             frame = frame.tail(int(config.max_training_rows))
@@ -296,6 +301,20 @@ def _safe_load_prices(*, ticker: str, config: OptionTickerSelectorConfig, now: d
     except Exception as exc:
         reasons.append(f"price_load_failed:{str(exc)[:160]}")
         return None
+
+
+@contextmanager
+def _temporary_env(name: str, value: str | None):
+    old_value = os.environ.get(name)
+    if value is not None:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old_value
 
 
 def _price_metrics(prices: pd.DataFrame | None) -> dict[str, Any]:

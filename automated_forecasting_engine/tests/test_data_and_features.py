@@ -129,9 +129,11 @@ def test_polygon_provider_normalizes_aggregate_bars(monkeypatch) -> None:
 def test_alpaca_provider_normalizes_historical_bars(monkeypatch) -> None:
     monkeypatch.setenv("ALPACA_API_KEY_ID", "key-id")
     monkeypatch.setenv("ALPACA_API_SECRET_KEY", "secret")
+    monkeypatch.delenv("ALPACA_DATA_FEED", raising=False)
 
     def fake_get_json(url: str, headers=None):
         assert "timeframe=5Min" in url
+        assert "feed=iex" in url
         assert headers["APCA-API-KEY-ID"] == "key-id"
         return {
             "bars": [
