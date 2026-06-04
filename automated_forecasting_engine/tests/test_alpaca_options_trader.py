@@ -47,11 +47,11 @@ class FakeBroker:
         return {
             "TSLA260605C00450000": {
                 "latestQuote": {"bp": 9.8, "ap": 10.2},
-                "greeks": {"delta": 0.38},
+                "greeks": {"delta": 0.38, "gamma": 0.012, "theta": -0.18, "vega": 0.42, "rho": 0.04},
             },
             "TSLA260605C00550000": {
                 "latestQuote": {"bp": 0.1, "ap": 2.0},
-                "greeks": {"delta": 0.08},
+                "greeks": {"delta": 0.08, "gamma": 0.004, "theta": -0.08, "vega": 0.18, "rho": 0.01},
             },
         }
 
@@ -69,16 +69,60 @@ def test_score_option_contracts_applies_spread_and_premium_gates() -> None:
         contracts=contracts,
         snapshots=snapshots,
         underlying_price=440.0,
-        forecast={"predicted_price": 465.0, "expected_return": 0.02},
+        forecast={"predicted_price": 465.0, "expected_return": 0.02, "horizon_hours": 2},
         option_type="call",
-            config=OptionExecutionConfig(underlying="TSLA", max_contract_premium=1500.0, max_total_debit=1500.0, max_spread_pct=0.2),
+        config=OptionExecutionConfig(underlying="TSLA", max_contract_premium=1500.0, max_total_debit=1500.0, max_spread_pct=0.2),
         now=datetime(2026, 6, 1, tzinfo=UTC),
     )
 
     assert scored[0]["symbol"] == "TSLA260605C00450000"
     assert scored[0]["accepted"] is True
+    assert scored[0]["greeks"]["gamma"] == 0.012
+    assert scored[0]["greeks"]["theta_decay_usd_for_horizon"] == 1.5
     assert scored[1]["accepted"] is False
     assert "spread_too_wide" in scored[1]["reasons"]
+
+
+def test_score_option_contracts_blocks_missing_or_unsafe_greeks() -> None:
+    contracts = [
+        {
+            "symbol": "AAPL260605C00200000",
+            "status": "active",
+            "tradable": True,
+            "expiration_date": "2026-06-05",
+            "strike_price": "200",
+            "open_interest": "100",
+        },
+        {
+            "symbol": "AAPL260605C00205000",
+            "status": "active",
+            "tradable": True,
+            "expiration_date": "2026-06-05",
+            "strike_price": "205",
+            "open_interest": "100",
+        },
+    ]
+    snapshots = {
+        "AAPL260605C00200000": {"latestQuote": {"bp": 4.9, "ap": 5.1}, "greeks": {"delta": 0.42}},
+        "AAPL260605C00205000": {
+            "latestQuote": {"bp": 4.9, "ap": 5.1},
+            "greeks": {"delta": 0.40, "gamma": 0.01, "theta": -100.0, "vega": 0.3},
+        },
+    }
+
+    scored = score_option_contracts(
+        contracts=contracts,
+        snapshots=snapshots,
+        underlying_price=198.0,
+        forecast={"predicted_price": 210.0, "expected_return": 0.02, "horizon_hours": 4},
+        option_type="call",
+        config=OptionExecutionConfig(underlying="AAPL", max_spread_pct=0.1),
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+    by_symbol = {row["symbol"]: row for row in scored}
+    assert "missing_greeks" in by_symbol["AAPL260605C00200000"]["reasons"]
+    assert "theta_decay_too_large_vs_forecast_edge" in by_symbol["AAPL260605C00205000"]["reasons"]
 
 
 def test_build_real_option_trade_plan_returns_limit_order_with_whole_contract_qty() -> None:
@@ -88,7 +132,7 @@ def test_build_real_option_trade_plan_returns_limit_order_with_whole_contract_qt
         broker=broker,  # type: ignore[arg-type]
         underlying="TSLA",
         underlying_price=440.0,
-        forecast={"predicted_price": 465.0, "expected_return": 0.02, "expected_direction": "Upward", "account_equity": 100_000.0},
+        forecast={"predicted_price": 465.0, "expected_return": 0.02, "expected_direction": "Upward", "account_equity": 100_000.0, "horizon_hours": 2},
         config=OptionExecutionConfig(underlying="TSLA", max_contract_premium=1500.0, max_total_debit=1500.0, max_spread_pct=0.2),
         now=datetime(2026, 6, 1, tzinfo=UTC),
     )

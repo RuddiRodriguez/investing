@@ -3,11 +3,13 @@ from argparse import Namespace
 from pathlib import Path
 
 from market_forecasting_engine.watch_agent.cli import (
+    apply_portfolio_context_to_args,
     append_decision_log,
     asset_class_for_ticker,
     decide_action,
     find_decision_file,
     latest_alpaca_price_snapshot,
+    load_portfolio_context,
     load_decision,
     memory_file,
     memory_needs_refresh,
@@ -185,6 +187,44 @@ def test_watch_dashboard_reads_latest_record_per_ticker_profile(tmp_path) -> Non
     assert len(state["histories"]["ASML_medium"]) == 2
 
 
+def test_watch_dashboard_shows_portfolio_placeholders_before_first_log(tmp_path) -> None:
+    log_dir = tmp_path / "logs"
+    context_dir = tmp_path / "portfolio_contexts"
+    log_dir.mkdir()
+    context_dir.mkdir()
+    (context_dir / "nvd.de_medium.json").write_text(
+        json.dumps(
+            {
+                "broker": "trade_republic",
+                "name": "NVIDIA",
+                "isin": "US67066G1040",
+                "ticker": "NVD.DE",
+                "listing": {"price_provider": "yahoo"},
+                "position": {
+                    "holding_status": "owned",
+                    "quantity": 0.059796,
+                    "avg_cost": 195.8304,
+                    "current_price": 195.04,
+                    "current_value": 11.66,
+                    "unrealized_pl": -0.049,
+                    "unrealized_pl_pct": -0.42,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = read_watch_logs(log_dir)
+
+    assert len(state["latest"]) == 1
+    row = state["latest"][0]
+    assert row["ticker"] == "NVD.DE"
+    assert row["profile"] == "medium"
+    assert row["action"] == "STARTING"
+    assert row["portfolio_name"] == "NVIDIA"
+    assert row["portfolio_entry_price"] == 195.8304
+
+
 def test_watch_agent_alerts_buy_when_not_owned_and_breakout_reached() -> None:
     action, reason = decide_action(_decision(), price=1660.0, holding_status="not_owned")
 
@@ -338,6 +378,68 @@ def test_watch_agent_appends_daily_decision_log(tmp_path) -> None:
     assert record["printed"] is True
 
 
+def test_watch_agent_appends_portfolio_context_to_decision_log(tmp_path) -> None:
+    args = _args(tmp_path)
+    args.log_dir = str(tmp_path / "logs")
+    args.portfolio_context = {
+        "broker": "trade_republic",
+        "name": "ASML",
+        "isin": "NL0010273215",
+        "position": {
+            "quantity": 0.25,
+            "avg_cost": 650.0,
+            "current_value": 170.0,
+            "unrealized_pl": 7.5,
+            "unrealized_pl_pct": 4.6,
+        },
+    }
+    memory = {
+        "source": "startup_forecast_llm_trader",
+        "decision_file": str(tmp_path / "trader_decision.json"),
+    }
+
+    append_decision_log(args, memory, _decision(), 700.0, "HOLD", "OWNED_NO_SELL_TRIGGER", True)
+
+    logs = list((tmp_path / "logs").glob("ASML_medium_*.jsonl"))
+    record = json.loads(logs[0].read_text().splitlines()[0])
+    assert record["portfolio_broker"] == "trade_republic"
+    assert record["portfolio_name"] == "ASML"
+    assert record["portfolio_isin"] == "NL0010273215"
+    assert record["portfolio_quantity"] == 0.25
+    assert record["portfolio_entry_price"] == 650.0
+    assert record["portfolio_position_value"] == 170.0
+    assert record["portfolio_unrealized_pl"] == 7.5
+    assert record["portfolio_unrealized_pl_pct"] == 4.6
+
+
+def test_watch_agent_loads_portfolio_context_and_applies_position_defaults(tmp_path) -> None:
+    context_path = tmp_path / "portfolio_context.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "broker": "trade_republic",
+                "name": "NVIDIA",
+                "isin": "US67066G1040",
+                "ticker": "NVD.DE",
+                "position": {"quantity": 0.059796, "avg_cost": 195.8304, "current_value": 11.66},
+                "portfolio_summary": {"total_current_value": 108.45},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = _args(tmp_path)
+    args.portfolio_context_file = str(context_path)
+
+    args.portfolio_context = load_portfolio_context(args)
+    apply_portfolio_context_to_args(args)
+
+    assert args.quantity == 0.059796
+    assert args.entry_price == 195.8304
+    assert args.position_value == 11.66
+    assert args.account_equity == 108.45
+    assert "trade_republic" in args.portfolio_notes
+
+
 def test_watch_agent_quiet_unchanged_suppresses_repeated_hold(tmp_path) -> None:
     args = _args(tmp_path)
     args.quiet_unchanged = True
@@ -420,6 +522,8 @@ def _args(tmp_path):
         price=1500.0,
         csv=None,
         provider=None,
+        live_price_provider="auto",
+        live_price_interval="1m",
         start="2020-01-01",
         end=None,
         interval="1d",
@@ -439,6 +543,8 @@ def _args(tmp_path):
         position_value=None,
         account_equity=None,
         portfolio_notes="",
+        portfolio_context_json=None,
+        portfolio_context_file=None,
         write_plots=False,
         dry_run=True,
         llm_model=None,

@@ -110,6 +110,29 @@ class AlpacaPaperBroker:
                 output.update(snapshots)
         return output
 
+    def stock_bars(
+        self,
+        symbol: str,
+        *,
+        start: str,
+        end: str,
+        timeframe: str = "1Min",
+        feed: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "start": start,
+            "end": end,
+            "timeframe": timeframe,
+            "limit": int(limit),
+        }
+        selected_feed = feed or os.getenv("ALPACA_DATA_FEED")
+        if selected_feed:
+            params["feed"] = selected_feed
+        payload = self._data_request("GET", f"/v2/stocks/{quote(symbol.upper(), safe='')}/bars?" + urlencode(params))
+        rows = payload.get("bars", []) if isinstance(payload, dict) else []
+        return rows if isinstance(rows, list) else []
+
     def submit_order(
         self,
         *,

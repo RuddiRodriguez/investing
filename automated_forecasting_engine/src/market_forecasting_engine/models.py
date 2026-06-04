@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -9,11 +10,12 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeRegressor
 
 
 class ForecastCandidate:
@@ -195,6 +197,9 @@ class SklearnRegressorCandidate(ForecastCandidate):
         if estimator is None or not isinstance(estimator, Pipeline):
             return {}
         final_step = estimator.steps[-1][1]
+        tree_diagnostics = _tree_model_diagnostics(estimator, final_step)
+        if tree_diagnostics:
+            return tree_diagnostics
         coefficients = getattr(final_step, "coef_", None)
         if coefficients is None:
             return {}
@@ -621,14 +626,19 @@ class LSTMReturnCandidate(ForecastCandidate):
     max_epochs: int = 25
     learning_rate: float = 0.01
     min_rows: int = 120
+    device: str = "auto"
     random_state: int = 42
     name: str = "lstm"
     family: str = "deep_learning"
     model_: Any | None = None
     target_mean_: float = 0.0
     target_std_: float = 1.0
+    prediction_clip_low_: float = -0.25
+    prediction_clip_high_: float = 0.25
     last_sequence_: np.ndarray | None = None
     fallback_: float = 0.0
+    device_used_: str = "unavailable"
+    epochs_run_: int = 0
 
     def fit(self, features: pd.DataFrame, target: pd.Series) -> "LSTMReturnCandidate":
         import torch
@@ -647,6 +657,11 @@ class LSTMReturnCandidate(ForecastCandidate):
 
         self.target_mean_ = float(np.mean(values))
         self.target_std_ = float(max(np.std(values), 1e-6))
+        quantile_low = float(np.quantile(values, 0.01))
+        quantile_high = float(np.quantile(values, 0.99))
+        clip_width = max(5.0 * self.target_std_, 0.02)
+        self.prediction_clip_low_ = float(max(quantile_low - clip_width, -0.50))
+        self.prediction_clip_high_ = float(min(quantile_high + clip_width, 0.50))
         scaled = ((values - self.target_mean_) / self.target_std_).astype(np.float32)
         x_train = []
         y_train = []
@@ -654,8 +669,10 @@ class LSTMReturnCandidate(ForecastCandidate):
             x_train.append(scaled[index - self.sequence_length : index])
             y_train.append(scaled[index])
 
-        x_tensor = torch.tensor(np.asarray(x_train), dtype=torch.float32).unsqueeze(-1)
-        y_tensor = torch.tensor(np.asarray(y_train), dtype=torch.float32).unsqueeze(-1)
+        device = _torch_device(self.device)
+        self.device_used_ = str(device)
+        x_tensor = torch.tensor(np.asarray(x_train), dtype=torch.float32, device=device).unsqueeze(-1)
+        y_tensor = torch.tensor(np.asarray(y_train), dtype=torch.float32, device=device).unsqueeze(-1)
 
         class _TinyLSTM(nn.Module):
             def __init__(self, hidden_size: int) -> None:
@@ -667,18 +684,21 @@ class LSTMReturnCandidate(ForecastCandidate):
                 encoded, _ = self.lstm(data)
                 return self.output(encoded[:, -1, :])
 
-        self.model_ = _TinyLSTM(self.hidden_size)
+        self.model_ = _TinyLSTM(self.hidden_size).to(device)
         optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate)
         loss_function = nn.MSELoss()
         self.model_.train()
-        for _ in range(self.max_epochs):
+        for epoch in range(self.max_epochs):
             optimizer.zero_grad()
             prediction = self.model_(x_tensor)
             loss = loss_function(prediction, y_tensor)
             loss.backward()
             optimizer.step()
+            self.epochs_run_ = epoch + 1
 
         self.last_sequence_ = scaled[-self.sequence_length :]
+        self.model_.to("cpu")
+        self.device_used_ = f"{self.device_used_}->cpu_for_prediction"
         return self
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
@@ -694,7 +714,8 @@ class LSTMReturnCandidate(ForecastCandidate):
             for _ in range(len(features)):
                 x_tensor = torch.tensor(sequence[-self.sequence_length :], dtype=torch.float32).reshape(1, -1, 1)
                 scaled_prediction = float(self.model_(x_tensor).item())
-                predictions.append(scaled_prediction * self.target_std_ + self.target_mean_)
+                prediction = scaled_prediction * self.target_std_ + self.target_mean_
+                predictions.append(float(np.clip(prediction, self.prediction_clip_low_, self.prediction_clip_high_)))
                 sequence = np.append(sequence, scaled_prediction).astype(np.float32)
         return _clean_predictions(predictions, len(features), fallback=self.fallback_)
 
@@ -708,9 +729,428 @@ class LSTMReturnCandidate(ForecastCandidate):
             "max_epochs": self.max_epochs,
             "learning_rate": self.learning_rate,
             "min_rows": self.min_rows,
+            "device": self.device,
+            "device_used": self.device_used_,
+            "epochs_run": self.epochs_run_,
             "target_mean": self.target_mean_,
             "target_std": self.target_std_,
+            "prediction_clip_low": self.prediction_clip_low_,
+            "prediction_clip_high": self.prediction_clip_high_,
             "fallback_return": self.fallback_,
+        }
+
+    def model_diagnostics(self) -> dict[str, Any]:
+        return {
+            "chapter_17_deep_learning": {
+                "architecture": "target_sequence_lstm",
+                "device_used": self.device_used_,
+                "epochs_run": int(self.epochs_run_),
+            }
+        }
+
+
+@dataclass
+class TabularMLPReturnCandidate(ForecastCandidate):
+    hidden_size: int = 24
+    max_epochs: int = 30
+    learning_rate: float = 0.003
+    weight_decay: float = 1e-4
+    dropout: float = 0.15
+    validation_fraction: float = 0.20
+    patience: int = 5
+    min_rows: int = 140
+    time_budget_seconds: float = 12.0
+    device: str = "auto"
+    random_state: int = 42
+    name: str = "tabular_mlp_fast"
+    family: str = "deep_learning"
+    model_: Any | None = None
+    feature_columns_: list[Any] | None = None
+    feature_median_: pd.Series | None = None
+    feature_mean_: pd.Series | None = None
+    feature_std_: pd.Series | None = None
+    target_mean_: float = 0.0
+    target_std_: float = 1.0
+    prediction_clip_low_: float = -0.25
+    prediction_clip_high_: float = 0.25
+    fallback_: float = 0.0
+    best_validation_loss_: float | None = None
+    final_train_loss_: float | None = None
+    epochs_run_: int = 0
+    stopped_reason_: str = "not_fitted"
+    device_used_: str = "unavailable"
+
+    def fit(self, features: pd.DataFrame, target: pd.Series) -> "TabularMLPReturnCandidate":
+        import torch
+        from torch import nn
+
+        torch.manual_seed(self.random_state)
+        torch.set_num_threads(1)
+
+        clean_target = _target_series(target).astype(float)
+        if len(clean_target) < self.min_rows:
+            raise ValueError(f"{self.name} requires at least {self.min_rows} rows.")
+        self.fallback_ = float(clean_target.tail(20).mean()) if len(clean_target) else 0.0
+        self.feature_columns_ = list(features.columns)
+        frame = pd.DataFrame(features).replace([np.inf, -np.inf], np.nan)
+        self.feature_median_ = frame.median(numeric_only=True).reindex(frame.columns).fillna(0.0)
+        imputed = frame.fillna(self.feature_median_)
+        self.feature_mean_ = imputed.mean(numeric_only=True).reindex(frame.columns).fillna(0.0)
+        self.feature_std_ = imputed.std(numeric_only=True).reindex(frame.columns).replace(0.0, 1.0).fillna(1.0)
+        x_values = ((imputed - self.feature_mean_) / self.feature_std_).to_numpy(dtype=np.float32)
+        y_values = clean_target.to_numpy(dtype=np.float32)
+        self.target_mean_ = float(np.mean(y_values))
+        self.target_std_ = float(max(np.std(y_values), 1e-6))
+        quantile_low = float(np.quantile(y_values, 0.01))
+        quantile_high = float(np.quantile(y_values, 0.99))
+        clip_width = max(5.0 * self.target_std_, 0.02)
+        self.prediction_clip_low_ = float(max(quantile_low - clip_width, -0.50))
+        self.prediction_clip_high_ = float(min(quantile_high + clip_width, 0.50))
+        y_scaled = ((y_values - self.target_mean_) / self.target_std_).astype(np.float32)
+
+        validation_rows = max(10, int(round(len(y_scaled) * self.validation_fraction)))
+        validation_rows = min(validation_rows, max(10, len(y_scaled) // 3))
+        train_stop = len(y_scaled) - validation_rows
+        if train_stop < 50:
+            raise ValueError(f"{self.name} requires at least 50 training rows after validation split.")
+
+        device = _torch_device(self.device)
+        self.device_used_ = str(device)
+        x_train = torch.tensor(x_values[:train_stop], dtype=torch.float32, device=device)
+        y_train = torch.tensor(y_scaled[:train_stop], dtype=torch.float32, device=device).unsqueeze(-1)
+        x_validation = torch.tensor(x_values[train_stop:], dtype=torch.float32, device=device)
+        y_validation = torch.tensor(y_scaled[train_stop:], dtype=torch.float32, device=device).unsqueeze(-1)
+
+        class _TabularMLP(nn.Module):
+            def __init__(self, n_features: int, hidden_size: int, dropout: float) -> None:
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(n_features, hidden_size),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_size, max(4, hidden_size // 2)),
+                    nn.ReLU(),
+                    nn.Linear(max(4, hidden_size // 2), 1),
+                )
+
+            def forward(self, data: Any) -> Any:
+                return self.net(data)
+
+        self.model_ = _TabularMLP(x_train.shape[1], self.hidden_size, self.dropout).to(device)
+        optimizer = torch.optim.AdamW(self.model_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        loss_function = nn.MSELoss()
+        best_state = copy.deepcopy(self.model_.state_dict())
+        best_loss = float("inf")
+        stale_epochs = 0
+        started = time.monotonic()
+        self.model_.train()
+        for epoch in range(self.max_epochs):
+            optimizer.zero_grad()
+            train_prediction = self.model_(x_train)
+            train_loss = loss_function(train_prediction, y_train)
+            train_loss.backward()
+            optimizer.step()
+            self.final_train_loss_ = float(train_loss.detach().cpu().item())
+
+            self.model_.eval()
+            with torch.no_grad():
+                validation_loss = float(loss_function(self.model_(x_validation), y_validation).detach().cpu().item())
+            self.model_.train()
+            self.epochs_run_ = epoch + 1
+            if validation_loss + 1e-7 < best_loss:
+                best_loss = validation_loss
+                best_state = copy.deepcopy(self.model_.state_dict())
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if stale_epochs >= self.patience:
+                self.stopped_reason_ = "early_stopping"
+                break
+            if time.monotonic() - started >= self.time_budget_seconds:
+                self.stopped_reason_ = "time_budget"
+                break
+        else:
+            self.stopped_reason_ = "max_epochs"
+
+        self.model_.load_state_dict(best_state)
+        self.best_validation_loss_ = float(best_loss) if np.isfinite(best_loss) else None
+        self.model_.to("cpu")
+        self.device_used_ = f"{self.device_used_}->cpu_for_prediction"
+        return self
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        if self.model_ is None or self.feature_columns_ is None:
+            return np.full(len(features), self.fallback_, dtype=float)
+        import torch
+
+        frame = pd.DataFrame(features).reindex(columns=self.feature_columns_).replace([np.inf, -np.inf], np.nan)
+        imputed = frame.fillna(self.feature_median_)
+        scaled = ((imputed - self.feature_mean_) / self.feature_std_).to_numpy(dtype=np.float32)
+        self.model_.eval()
+        with torch.no_grad():
+            raw = self.model_(torch.tensor(scaled, dtype=torch.float32)).cpu().numpy().reshape(-1)
+        predictions = raw * self.target_std_ + self.target_mean_
+        predictions = np.clip(predictions, self.prediction_clip_low_, self.prediction_clip_high_)
+        return _clean_predictions(predictions, len(features), fallback=self.fallback_)
+
+    def parameter_count(self, n_features: int) -> int:
+        hidden_2 = max(4, self.hidden_size // 2)
+        return int((n_features + 1) * self.hidden_size + (self.hidden_size + 1) * hidden_2 + hidden_2 + 1)
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "hidden_size": self.hidden_size,
+            "max_epochs": self.max_epochs,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "dropout": self.dropout,
+            "validation_fraction": self.validation_fraction,
+            "patience": self.patience,
+            "min_rows": self.min_rows,
+            "time_budget_seconds": self.time_budget_seconds,
+            "device": self.device,
+            "device_used": self.device_used_,
+            "epochs_run": self.epochs_run_,
+            "stopped_reason": self.stopped_reason_,
+            "best_validation_loss": self.best_validation_loss_,
+            "final_train_loss": self.final_train_loss_,
+            "target_mean": self.target_mean_,
+            "target_std": self.target_std_,
+            "prediction_clip_low": self.prediction_clip_low_,
+            "prediction_clip_high": self.prediction_clip_high_,
+            "fallback_return": self.fallback_,
+        }
+
+    def model_diagnostics(self) -> dict[str, Any]:
+        return {
+            "chapter_17_deep_learning": {
+                "architecture": "bounded_tabular_mlp",
+                "device_used": self.device_used_,
+                "epochs_run": int(self.epochs_run_),
+                "stopped_reason": self.stopped_reason_,
+                "best_validation_loss": self.best_validation_loss_,
+                "final_train_loss": self.final_train_loss_,
+            }
+        }
+
+
+@dataclass
+class TemporalCNNReturnCandidate(ForecastCandidate):
+    lookback: int = 30
+    channels: int = 16
+    kernel_size: int = 5
+    max_epochs: int = 45
+    learning_rate: float = 0.002
+    weight_decay: float = 1e-4
+    dropout: float = 0.15
+    validation_fraction: float = 0.20
+    patience: int = 6
+    min_rows: int = 220
+    time_budget_seconds: float = 30.0
+    device: str = "auto"
+    random_state: int = 42
+    name: str = "temporal_cnn_research"
+    family: str = "deep_learning"
+    model_: Any | None = None
+    feature_columns_: list[Any] | None = None
+    feature_median_: pd.Series | None = None
+    feature_mean_: pd.Series | None = None
+    feature_std_: pd.Series | None = None
+    last_feature_window_: np.ndarray | None = None
+    target_mean_: float = 0.0
+    target_std_: float = 1.0
+    prediction_clip_low_: float = -0.25
+    prediction_clip_high_: float = 0.25
+    fallback_: float = 0.0
+    best_validation_loss_: float | None = None
+    final_train_loss_: float | None = None
+    epochs_run_: int = 0
+    stopped_reason_: str = "not_fitted"
+    device_used_: str = "unavailable"
+
+    def fit(self, features: pd.DataFrame, target: pd.Series) -> "TemporalCNNReturnCandidate":
+        import torch
+        from torch import nn
+
+        torch.manual_seed(self.random_state)
+        torch.set_num_threads(1)
+
+        clean_target = _target_series(target).astype(float)
+        if len(clean_target) < self.min_rows:
+            raise ValueError(f"{self.name} requires at least {self.min_rows} rows.")
+        if len(clean_target) <= self.lookback + 20:
+            raise ValueError(f"{self.name} requires enough rows for {self.lookback}-bar windows.")
+
+        self.fallback_ = float(clean_target.tail(20).mean()) if len(clean_target) else 0.0
+        self.feature_columns_ = list(features.columns)
+        frame = pd.DataFrame(features).replace([np.inf, -np.inf], np.nan)
+        self.feature_median_ = frame.median(numeric_only=True).reindex(frame.columns).fillna(0.0)
+        imputed = frame.fillna(self.feature_median_)
+        self.feature_mean_ = imputed.mean(numeric_only=True).reindex(frame.columns).fillna(0.0)
+        self.feature_std_ = imputed.std(numeric_only=True).reindex(frame.columns).replace(0.0, 1.0).fillna(1.0)
+        x_values = ((imputed - self.feature_mean_) / self.feature_std_).to_numpy(dtype=np.float32)
+        y_values = clean_target.to_numpy(dtype=np.float32)
+        self.target_mean_ = float(np.mean(y_values))
+        self.target_std_ = float(max(np.std(y_values), 1e-6))
+        quantile_low = float(np.quantile(y_values, 0.01))
+        quantile_high = float(np.quantile(y_values, 0.99))
+        clip_width = max(5.0 * self.target_std_, 0.02)
+        self.prediction_clip_low_ = float(max(quantile_low - clip_width, -0.50))
+        self.prediction_clip_high_ = float(min(quantile_high + clip_width, 0.50))
+        y_scaled = ((y_values - self.target_mean_) / self.target_std_).astype(np.float32)
+
+        windows = []
+        labels = []
+        for idx in range(self.lookback, len(x_values)):
+            windows.append(x_values[idx - self.lookback : idx].T)
+            labels.append(y_scaled[idx])
+        x_window = np.asarray(windows, dtype=np.float32)
+        y_window = np.asarray(labels, dtype=np.float32)
+        validation_rows = max(10, int(round(len(y_window) * self.validation_fraction)))
+        validation_rows = min(validation_rows, max(10, len(y_window) // 3))
+        train_stop = len(y_window) - validation_rows
+        if train_stop < 50:
+            raise ValueError(f"{self.name} requires at least 50 training windows after validation split.")
+
+        device = _torch_device(self.device)
+        self.device_used_ = str(device)
+        x_train = torch.tensor(x_window[:train_stop], dtype=torch.float32, device=device)
+        y_train = torch.tensor(y_window[:train_stop], dtype=torch.float32, device=device).unsqueeze(-1)
+        x_validation = torch.tensor(x_window[train_stop:], dtype=torch.float32, device=device)
+        y_validation = torch.tensor(y_window[train_stop:], dtype=torch.float32, device=device).unsqueeze(-1)
+
+        class _TemporalCNN(nn.Module):
+            def __init__(self, n_features: int, channels: int, kernel_size: int, dropout: float) -> None:
+                super().__init__()
+                padding = max(kernel_size // 2, 0)
+                self.net = nn.Sequential(
+                    nn.Conv1d(n_features, channels, kernel_size=kernel_size, padding=padding),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                    nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool1d(1),
+                    nn.Flatten(),
+                    nn.Linear(channels, 1),
+                )
+
+            def forward(self, data: Any) -> Any:
+                return self.net(data)
+
+        self.model_ = _TemporalCNN(x_train.shape[1], self.channels, self.kernel_size, self.dropout).to(device)
+        optimizer = torch.optim.AdamW(self.model_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        loss_function = nn.MSELoss()
+        best_state = copy.deepcopy(self.model_.state_dict())
+        best_loss = float("inf")
+        stale_epochs = 0
+        started = time.monotonic()
+        self.model_.train()
+        for epoch in range(self.max_epochs):
+            optimizer.zero_grad()
+            train_prediction = self.model_(x_train)
+            train_loss = loss_function(train_prediction, y_train)
+            train_loss.backward()
+            optimizer.step()
+            self.final_train_loss_ = float(train_loss.detach().cpu().item())
+
+            self.model_.eval()
+            with torch.no_grad():
+                validation_loss = float(loss_function(self.model_(x_validation), y_validation).detach().cpu().item())
+            self.model_.train()
+            self.epochs_run_ = epoch + 1
+            if validation_loss + 1e-7 < best_loss:
+                best_loss = validation_loss
+                best_state = copy.deepcopy(self.model_.state_dict())
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if stale_epochs >= self.patience:
+                self.stopped_reason_ = "early_stopping"
+                break
+            if time.monotonic() - started >= self.time_budget_seconds:
+                self.stopped_reason_ = "time_budget"
+                break
+        else:
+            self.stopped_reason_ = "max_epochs"
+
+        self.model_.load_state_dict(best_state)
+        self.best_validation_loss_ = float(best_loss) if np.isfinite(best_loss) else None
+        self.last_feature_window_ = x_values[-self.lookback :].copy()
+        self.model_.to("cpu")
+        self.device_used_ = f"{self.device_used_}->cpu_for_prediction"
+        return self
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        if self.model_ is None or self.feature_columns_ is None:
+            return np.full(len(features), self.fallback_, dtype=float)
+        import torch
+
+        frame = pd.DataFrame(features).reindex(columns=self.feature_columns_).replace([np.inf, -np.inf], np.nan)
+        imputed = frame.fillna(self.feature_median_)
+        scaled = ((imputed - self.feature_mean_) / self.feature_std_).to_numpy(dtype=np.float32)
+        windows = self._prediction_windows(scaled)
+        self.model_.eval()
+        with torch.no_grad():
+            raw = self.model_(torch.tensor(windows, dtype=torch.float32)).cpu().numpy().reshape(-1)
+        predictions = raw * self.target_std_ + self.target_mean_
+        predictions = np.clip(predictions, self.prediction_clip_low_, self.prediction_clip_high_)
+        return _clean_predictions(predictions, len(features), fallback=self.fallback_)
+
+    def _prediction_windows(self, scaled: np.ndarray) -> np.ndarray:
+        if len(scaled) == 0:
+            return np.empty((0, 0, self.lookback), dtype=np.float32)
+        history = self.last_feature_window_
+        if history is None or len(history) < self.lookback:
+            pad = np.repeat(scaled[[0]], self.lookback, axis=0)
+            history = pad.astype(np.float32)
+        combined = np.vstack([history, scaled]).astype(np.float32)
+        windows = []
+        for idx in range(len(scaled)):
+            end = len(history) + idx
+            windows.append(combined[end - self.lookback : end].T)
+        return np.asarray(windows, dtype=np.float32)
+
+    def parameter_count(self, n_features: int) -> int:
+        first = (n_features * self.kernel_size + 1) * self.channels
+        second = (self.channels * 3 + 1) * self.channels
+        dense = self.channels + 1
+        return int(first + second + dense)
+
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "lookback": self.lookback,
+            "channels": self.channels,
+            "kernel_size": self.kernel_size,
+            "max_epochs": self.max_epochs,
+            "learning_rate": self.learning_rate,
+            "weight_decay": self.weight_decay,
+            "dropout": self.dropout,
+            "validation_fraction": self.validation_fraction,
+            "patience": self.patience,
+            "min_rows": self.min_rows,
+            "time_budget_seconds": self.time_budget_seconds,
+            "device": self.device,
+            "device_used": self.device_used_,
+            "epochs_run": self.epochs_run_,
+            "stopped_reason": self.stopped_reason_,
+            "best_validation_loss": self.best_validation_loss_,
+            "final_train_loss": self.final_train_loss_,
+            "prediction_clip_low": self.prediction_clip_low_,
+            "prediction_clip_high": self.prediction_clip_high_,
+            "fallback_return": self.fallback_,
+        }
+
+    def model_diagnostics(self) -> dict[str, Any]:
+        return {
+            "chapter_18_cnn": {
+                "architecture": "temporal_conv1d",
+                "device_used": self.device_used_,
+                "epochs_run": int(self.epochs_run_),
+                "stopped_reason": self.stopped_reason_,
+                "best_validation_loss": self.best_validation_loss_,
+                "final_train_loss": self.final_train_loss_,
+                "trading_gate": False,
+            }
         }
 
 
@@ -719,15 +1159,18 @@ def default_candidates(
     include_lightgbm: bool = True,
     include_statistical_models: bool = True,
     include_lstm: bool = False,
+    deep_learning_profile: str = "off",
     search_level: str = "fast",
     tuning_mode: str = "fixed",
     optuna_trials: int = 25,
     optuna_timeout_seconds: int | None = None,
     optuna_inner_splits: int = 3,
-    optuna_families: tuple[str, ...] = ("lightgbm", "elastic_net", "random_forest", "gradient_boosting"),
+    optuna_families: tuple[str, ...] = ("lightgbm", "xgboost", "elastic_net", "random_forest", "extra_trees", "gradient_boosting"),
 ) -> list[ForecastCandidate]:
     if tuning_mode not in {"fixed", "optuna"}:
         raise ValueError("tuning_mode must be `fixed` or `optuna`.")
+    if deep_learning_profile not in {"off", "fast", "research"}:
+        raise ValueError("deep_learning_profile must be `off`, `fast`, or `research`.")
     expanded = search_level == "expanded"
     candidates: list[ForecastCandidate] = [
         HistoricalMeanReturn(),
@@ -744,10 +1187,23 @@ def default_candidates(
             _ridge_candidate("ridge_alpha_1_0", alpha=1.0),
             _lasso_candidate("lasso_alpha_0_0001", alpha=0.0001, random_state=random_state),
             _elastic_net_candidate("elastic_net_alpha_0_0005_l1_0_25", alpha=0.0005, l1_ratio=0.25, random_state=random_state),
+            _decision_tree_candidate(
+                "decision_tree_shallow",
+                max_depth=3,
+                min_samples_leaf=8,
+                random_state=random_state,
+            ),
             _random_forest_candidate(
                 "random_forest_balanced",
                 n_estimators=180,
                 min_samples_leaf=5,
+                max_features="sqrt",
+                random_state=random_state,
+            ),
+            _extra_trees_candidate(
+                "extra_trees_balanced",
+                n_estimators=180,
+                min_samples_leaf=6,
                 max_features="sqrt",
                 random_state=random_state,
             ),
@@ -757,6 +1213,14 @@ def default_candidates(
                 learning_rate=0.03,
                 max_depth=2,
                 min_samples_leaf=6,
+                random_state=random_state,
+            ),
+            _hist_gradient_boosting_candidate(
+                "hist_gradient_boosting_conservative",
+                max_iter=120,
+                learning_rate=0.03,
+                max_leaf_nodes=15,
+                min_samples_leaf=12,
                 random_state=random_state,
             ),
         ]
@@ -770,8 +1234,21 @@ def default_candidates(
                 _lasso_candidate("lasso_alpha_0_001", alpha=0.001, random_state=random_state),
                 _elastic_net_candidate("elastic_net_alpha_0_0001_l1_0_10", alpha=0.0001, l1_ratio=0.10, random_state=random_state),
                 _elastic_net_candidate("elastic_net_alpha_0_001_l1_0_60", alpha=0.001, l1_ratio=0.60, random_state=random_state),
+                _decision_tree_candidate(
+                    "decision_tree_medium",
+                    max_depth=5,
+                    min_samples_leaf=12,
+                    random_state=random_state,
+                ),
                 _random_forest_candidate(
                     "random_forest_smoother",
+                    n_estimators=220,
+                    min_samples_leaf=10,
+                    max_features=0.65,
+                    random_state=random_state,
+                ),
+                _extra_trees_candidate(
+                    "extra_trees_smoother",
                     n_estimators=220,
                     min_samples_leaf=10,
                     max_features=0.65,
@@ -785,6 +1262,14 @@ def default_candidates(
                     min_samples_leaf=8,
                     random_state=random_state,
                 ),
+                _hist_gradient_boosting_candidate(
+                    "hist_gradient_boosting_regularized",
+                    max_iter=180,
+                    learning_rate=0.02,
+                    max_leaf_nodes=31,
+                    min_samples_leaf=18,
+                    random_state=random_state,
+                ),
             ]
         )
 
@@ -793,6 +1278,7 @@ def default_candidates(
 
     if include_lightgbm:
         candidates.extend(_lightgbm_candidates(random_state=random_state, expanded=expanded))
+    candidates.extend(_xgboost_candidates(random_state=random_state, expanded=expanded))
 
     if tuning_mode == "optuna":
         candidates.extend(
@@ -806,10 +1292,19 @@ def default_candidates(
             )
         )
 
-    if include_lstm:
+    if deep_learning_profile in {"fast", "research"}:
+        mlp = _tabular_mlp_candidate(random_state=random_state, profile=deep_learning_profile)
+        if mlp is not None:
+            candidates.append(mlp)
+
+    if include_lstm or deep_learning_profile == "research":
         lstm = _lstm_candidate(random_state=random_state)
         if lstm is not None:
             candidates.append(lstm)
+    if deep_learning_profile == "research":
+        cnn = _temporal_cnn_candidate(random_state=random_state)
+        if cnn is not None:
+            candidates.append(cnn)
 
     return candidates
 
@@ -863,7 +1358,9 @@ def _optuna_candidates(
     for family in normalized:
         if family == "lightgbm" and (not include_lightgbm or importlib.util.find_spec("lightgbm") is None):
             continue
-        if family not in {"elastic_net", "random_forest", "gradient_boosting", "lightgbm"}:
+        if family == "xgboost" and importlib.util.find_spec("xgboost") is None:
+            continue
+        if family not in {"elastic_net", "random_forest", "extra_trees", "gradient_boosting", "lightgbm", "xgboost"}:
             continue
         candidates.append(
             OptunaTunedRegressorCandidate(
@@ -916,6 +1413,13 @@ def _suggest_optuna_params(trial: Any, model_kind: str) -> dict[str, Any]:
             "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.8]),
             "max_depth": trial.suggest_int("max_depth", 2, 12),
         }
+    if model_kind == "extra_trees":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 80, 320),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 30),
+            "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5, 0.8]),
+            "max_depth": trial.suggest_int("max_depth", 2, 12),
+        }
     if model_kind == "gradient_boosting":
         return {
             "n_estimators": trial.suggest_int("n_estimators", 60, 260),
@@ -934,6 +1438,16 @@ def _suggest_optuna_params(trial: Any, model_kind: str) -> dict[str, Any]:
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.65, 1.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
+        }
+    if model_kind == "xgboost":
+        return {
+            "n_estimators": trial.suggest_int("n_estimators", 80, 320),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.08, log=True),
+            "max_depth": trial.suggest_int("max_depth", 1, 4),
+            "min_child_weight": trial.suggest_int("min_child_weight", 2, 20),
+            "subsample": trial.suggest_float("subsample", 0.65, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.65, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
         }
     raise ValueError(f"Unsupported Optuna model family `{model_kind}`.")
 
@@ -956,6 +1470,15 @@ def _optuna_estimator_pipeline(model_kind: str, params: dict[str, Any], random_s
         )
     if model_kind == "random_forest":
         model = RandomForestRegressor(
+            n_estimators=int(params["n_estimators"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=params["max_features"],
+            max_depth=int(params["max_depth"]),
+            random_state=random_state,
+            n_jobs=1,
+        )
+    elif model_kind == "extra_trees":
+        model = ExtraTreesRegressor(
             n_estimators=int(params["n_estimators"]),
             min_samples_leaf=int(params["min_samples_leaf"]),
             max_features=params["max_features"],
@@ -987,6 +1510,22 @@ def _optuna_estimator_pipeline(model_kind: str, params: dict[str, Any], random_s
             random_state=random_state,
             n_jobs=1,
             verbosity=-1,
+        )
+    elif model_kind == "xgboost":
+        from xgboost import XGBRegressor
+
+        model = XGBRegressor(
+            n_estimators=int(params["n_estimators"]),
+            learning_rate=float(params["learning_rate"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=int(params["min_child_weight"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_lambda=float(params["reg_lambda"]),
+            objective="reg:squarederror",
+            random_state=random_state,
+            n_jobs=1,
+            verbosity=0,
         )
     else:
         raise ValueError(f"Unsupported Optuna model family `{model_kind}`.")
@@ -1059,7 +1598,7 @@ def _random_forest_candidate(
 ) -> ForecastCandidate:
     return SklearnRegressorCandidate(
         name=name,
-        family="machine_learning",
+        family="tree_ensemble",
         estimator_factory=lambda: Pipeline(
             [
                 ("drop_all_nan", DropAllNaNColumns()),
@@ -1067,6 +1606,63 @@ def _random_forest_candidate(
                 (
                     "model",
                     RandomForestRegressor(
+                        n_estimators=n_estimators,
+                        min_samples_leaf=min_samples_leaf,
+                        max_features=max_features,
+                        random_state=random_state,
+                        n_jobs=1,
+                    ),
+                ),
+            ]
+        ),
+        parameter_count_hint=n_estimators,
+    )
+
+
+def _decision_tree_candidate(
+    name: str,
+    max_depth: int,
+    min_samples_leaf: int,
+    random_state: int,
+) -> ForecastCandidate:
+    return SklearnRegressorCandidate(
+        name=name,
+        family="tree_model",
+        estimator_factory=lambda: Pipeline(
+            [
+                ("drop_all_nan", DropAllNaNColumns()),
+                ("imputer", DataFrameSimpleImputer(strategy="median")),
+                (
+                    "model",
+                    DecisionTreeRegressor(
+                        max_depth=max_depth,
+                        min_samples_leaf=min_samples_leaf,
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
+        parameter_count_hint=max(1, 2 ** max_depth),
+    )
+
+
+def _extra_trees_candidate(
+    name: str,
+    n_estimators: int,
+    min_samples_leaf: int,
+    max_features: str | float,
+    random_state: int,
+) -> ForecastCandidate:
+    return SklearnRegressorCandidate(
+        name=name,
+        family="tree_ensemble",
+        estimator_factory=lambda: Pipeline(
+            [
+                ("drop_all_nan", DropAllNaNColumns()),
+                ("imputer", DataFrameSimpleImputer(strategy="median")),
+                (
+                    "model",
+                    ExtraTreesRegressor(
                         n_estimators=n_estimators,
                         min_samples_leaf=min_samples_leaf,
                         max_features=max_features,
@@ -1090,7 +1686,7 @@ def _gradient_boosting_candidate(
 ) -> ForecastCandidate:
     return SklearnRegressorCandidate(
         name=name,
-        family="machine_learning",
+        family="boosting_model",
         estimator_factory=lambda: Pipeline(
             [
                 ("drop_all_nan", DropAllNaNColumns()),
@@ -1108,6 +1704,38 @@ def _gradient_boosting_candidate(
             ]
         ),
         parameter_count_hint=n_estimators,
+    )
+
+
+def _hist_gradient_boosting_candidate(
+    name: str,
+    max_iter: int,
+    learning_rate: float,
+    max_leaf_nodes: int,
+    min_samples_leaf: int,
+    random_state: int,
+) -> ForecastCandidate:
+    return SklearnRegressorCandidate(
+        name=name,
+        family="boosting_model",
+        estimator_factory=lambda: Pipeline(
+            [
+                ("drop_all_nan", DropAllNaNColumns()),
+                ("imputer", DataFrameSimpleImputer(strategy="median")),
+                (
+                    "model",
+                    HistGradientBoostingRegressor(
+                        max_iter=max_iter,
+                        learning_rate=learning_rate,
+                        max_leaf_nodes=max_leaf_nodes,
+                        min_samples_leaf=min_samples_leaf,
+                        l2_regularization=0.01,
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
+        parameter_count_hint=max_iter,
     )
 
 
@@ -1131,7 +1759,7 @@ def _lightgbm_candidates(random_state: int, expanded: bool) -> list[ForecastCand
     return [
         SklearnRegressorCandidate(
             name=name,
-            family="machine_learning",
+            family="boosting_model",
             estimator_factory=lambda n_estimators=n_estimators, learning_rate=learning_rate, num_leaves=num_leaves, min_child_samples=min_child_samples: Pipeline(
                 [
                     ("drop_all_nan", DropAllNaNColumns()),
@@ -1158,10 +1786,96 @@ def _lightgbm_candidates(random_state: int, expanded: bool) -> list[ForecastCand
     ]
 
 
+def _xgboost_candidates(random_state: int, expanded: bool) -> list[ForecastCandidate]:
+    try:
+        from xgboost import XGBRegressor
+    except ImportError:
+        return []
+
+    configs = [
+        ("xgboost_conservative", 160, 0.025, 2, 8),
+    ]
+    if expanded:
+        configs.extend(
+            [
+                ("xgboost_regularized", 220, 0.02, 3, 12),
+            ]
+        )
+    return [
+        SklearnRegressorCandidate(
+            name=name,
+            family="boosting_model",
+            estimator_factory=lambda n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth, min_child_weight=min_child_weight: Pipeline(
+                [
+                    ("drop_all_nan", DropAllNaNColumns()),
+                    ("imputer", DataFrameSimpleImputer(strategy="median")),
+                    (
+                        "model",
+                        XGBRegressor(
+                            n_estimators=n_estimators,
+                            learning_rate=learning_rate,
+                            max_depth=max_depth,
+                            min_child_weight=min_child_weight,
+                            subsample=0.85,
+                            colsample_bytree=0.85,
+                            reg_lambda=1.0,
+                            objective="reg:squarederror",
+                            random_state=random_state,
+                            n_jobs=1,
+                            verbosity=0,
+                        ),
+                    ),
+                ]
+            ),
+            parameter_count_hint=n_estimators,
+        )
+        for name, n_estimators, learning_rate, max_depth, min_child_weight in configs
+    ]
+
+
 def _lstm_candidate(random_state: int) -> ForecastCandidate | None:
     if importlib.util.find_spec("torch") is None:
         return None
     return LSTMReturnCandidate(random_state=random_state)
+
+
+def _tabular_mlp_candidate(random_state: int, profile: str) -> ForecastCandidate | None:
+    if importlib.util.find_spec("torch") is None:
+        return None
+    if profile == "research":
+        return TabularMLPReturnCandidate(
+            name="tabular_mlp_research",
+            hidden_size=48,
+            max_epochs=60,
+            patience=8,
+            min_rows=180,
+            time_budget_seconds=30.0,
+            random_state=random_state,
+        )
+    return TabularMLPReturnCandidate(random_state=random_state)
+
+
+def _temporal_cnn_candidate(random_state: int) -> ForecastCandidate | None:
+    if importlib.util.find_spec("torch") is None:
+        return None
+    return TemporalCNNReturnCandidate(random_state=random_state)
+
+
+def _torch_device(preferred: str) -> Any:
+    import torch
+
+    requested = preferred.lower()
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "mps":
+        return torch.device("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def _order_name(order: tuple[int, ...]) -> str:
@@ -1192,3 +1906,45 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, tuple):
         return list(value)
     return str(value)
+
+
+def _tree_model_diagnostics(estimator: Pipeline, final_step: Any) -> dict[str, Any]:
+    importances = getattr(final_step, "feature_importances_", None)
+    if importances is None:
+        return {}
+    values = np.asarray(importances, dtype=float).reshape(-1)
+    columns = _pipeline_feature_names(estimator)
+    if len(columns) != len(values):
+        columns = [f"feature_{idx}" for idx in range(len(values))]
+    total = float(np.sum(values))
+    normalized = values / total if total > 0 else np.zeros_like(values)
+    ranked = sorted(
+        (
+            {
+                "feature": str(column),
+                "importance": _json_safe(value),
+                "normalized_importance": _json_safe(norm),
+            }
+            for column, value, norm in zip(columns, values, normalized)
+        ),
+        key=lambda row: float(row["importance"]),
+        reverse=True,
+    )
+    top_share = float(sum(float(row["normalized_importance"]) for row in ranked[:5]))
+    estimators = getattr(final_step, "estimators_", None)
+    tree_count = int(len(estimators)) if estimators is not None else 0
+    if tree_count == 0 and hasattr(final_step, "tree_"):
+        tree_count = 1
+    depth = getattr(final_step, "get_depth", lambda: None)()
+    leaf_count = getattr(final_step, "get_n_leaves", lambda: None)()
+    return {
+        "tree_model": {
+            "tree_count": tree_count,
+            "max_depth": _json_safe(depth),
+            "leaf_count": _json_safe(leaf_count),
+            "feature_importance_count": int(len(ranked)),
+            "top_5_importance_share": _json_safe(top_share),
+            "top_importances": ranked[:20],
+            "interpretation": "Tree importances explain fitted split usage; they are model diagnostics, not causal proof.",
+        }
+    }

@@ -25,6 +25,9 @@ class OptionExecutionConfig:
     max_contracts: int = 1
     target_delta: float = 0.35
     max_delta_distance: float = 0.28
+    require_greeks: bool = True
+    max_theta_edge_ratio: float = 0.75
+    max_theta_premium_pct_per_day: float = 0.35
     min_open_interest: int = 0
     limit_price_offset_pct: float = 0.03
     stop_loss_pct: float = 0.35
@@ -179,8 +182,22 @@ def score_option_contracts(
         mid = None if bid is None or ask is None else (bid + ask) / 2.0
         spread_pct = None if bid is None or ask is None or mid is None else (ask - bid) / max(mid, 1e-9)
         delta = _float_or_none(greeks.get("delta"))
+        gamma = _float_or_none(greeks.get("gamma"))
+        theta = _float_or_none(greeks.get("theta"))
+        vega = _float_or_none(greeks.get("vega"))
+        rho = _float_or_none(greeks.get("rho"))
         dte = None if expiry is None else max(0, (expiry - now.date()).days)
         premium = None if ask is None else ask * 100.0
+        horizon_hours = _float_or_none(forecast.get("horizon_hours"))
+        forecast_edge_usd = None
+        theta_decay_usd_for_horizon = None
+        theta_premium_pct_per_day = None
+        if forecast_price is not None and delta is not None:
+            forecast_edge_usd = abs(forecast_price - underlying_price) * abs(delta) * 100.0
+        if theta is not None and horizon_hours is not None:
+            theta_decay_usd_for_horizon = abs(theta) * 100.0 * max(horizon_hours, 0.0) / 24.0
+        if theta is not None and premium is not None and premium > 0:
+            theta_premium_pct_per_day = abs(theta) * 100.0 / premium
         reasons = []
         if not symbol:
             reasons.append("missing_symbol")
@@ -210,8 +227,18 @@ def score_option_contracts(
         open_interest = _float_or_none(contract.get("open_interest"))
         if open_interest is not None and open_interest < config.min_open_interest:
             reasons.append("open_interest_below_min")
+        if config.require_greeks and (delta is None or gamma is None or theta is None or vega is None):
+            reasons.append("missing_greeks")
         if delta is not None and abs(abs(delta) - config.target_delta) > config.max_delta_distance:
             reasons.append("delta_too_far_from_target")
+        if (
+            theta_decay_usd_for_horizon is not None
+            and forecast_edge_usd is not None
+            and theta_decay_usd_for_horizon > forecast_edge_usd * config.max_theta_edge_ratio
+        ):
+            reasons.append("theta_decay_too_large_vs_forecast_edge")
+        if theta_premium_pct_per_day is not None and theta_premium_pct_per_day > config.max_theta_premium_pct_per_day:
+            reasons.append("theta_too_large_vs_premium")
         intrinsic_ok = True
         if strike is not None and forecast_price is not None:
             intrinsic_ok = forecast_price > strike if option_type == "call" else forecast_price < strike
@@ -222,6 +249,8 @@ def score_option_contracts(
             underlying_price=underlying_price,
             forecast_price=forecast_price,
             delta=delta,
+            gamma=gamma,
+            theta_premium_pct_per_day=theta_premium_pct_per_day,
             spread_pct=spread_pct,
             dte=dte,
             config=config,
@@ -240,6 +269,17 @@ def score_option_contracts(
                 "mid": mid,
                 "spread_pct": spread_pct,
                 "delta": delta,
+                "greeks": {
+                    "delta": delta,
+                    "gamma": gamma,
+                    "theta": theta,
+                    "vega": vega,
+                    "rho": rho,
+                    "theta_decay_usd_for_horizon": theta_decay_usd_for_horizon,
+                    "theta_premium_pct_per_day": theta_premium_pct_per_day,
+                    "forecast_edge_usd_delta_adjusted": forecast_edge_usd,
+                    "horizon_hours": horizon_hours,
+                },
                 "open_interest": open_interest,
                 "premium": premium,
                 "limit_price": limit_price,
@@ -419,6 +459,8 @@ def _candidate_score(
     underlying_price: float,
     forecast_price: float | None,
     delta: float | None,
+    gamma: float | None,
+    theta_premium_pct_per_day: float | None,
     spread_pct: float | None,
     dte: int | None,
     config: OptionExecutionConfig,
@@ -426,6 +468,10 @@ def _candidate_score(
     score = 0.0
     if delta is not None:
         score += abs(abs(delta) - config.target_delta)
+    if gamma is not None:
+        score -= min(abs(gamma), 0.05) * 0.40
+    if theta_premium_pct_per_day is not None:
+        score += theta_premium_pct_per_day * 0.35
     if spread_pct is not None:
         score += spread_pct
     if strike is not None:

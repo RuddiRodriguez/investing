@@ -24,6 +24,7 @@ def build_parser():
     parser.add_argument("--no-lightgbm", action="store_true")
     parser.add_argument("--no-statistical-models", action="store_true")
     parser.add_argument("--include-lstm", action="store_true")
+    parser.add_argument("--deep-learning-profile", choices=("off", "fast", "research"), default="off")
     parser.add_argument("--profile", choices=("aggressive", "medium", "conservative"), default="medium")
     parser.add_argument("--trader-name", default="autonomous_trader_1")
     parser.add_argument("--holding-status", choices=("not_owned", "owned"), default="not_owned")

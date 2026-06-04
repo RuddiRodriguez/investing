@@ -35,6 +35,8 @@ from market_forecasting_engine.models import (
     KalmanFilterReturnCandidate,
     LSTMReturnCandidate,
     RecentMeanReturn,
+    TabularMLPReturnCandidate,
+    TemporalCNNReturnCandidate,
     default_candidates,
 )
 from market_forecasting_engine.plots import write_plot_artifacts
@@ -177,6 +179,12 @@ def test_default_candidates_register_advanced_model_families_when_available() ->
     assert "ridge_alpha_1_0" in names
     assert "lasso_alpha_0_0001" in names
     assert "elastic_net_alpha_0_0005_l1_0_25" in names
+    assert "decision_tree_shallow" in names
+    assert "random_forest_balanced" in names
+    assert "extra_trees_balanced" in names
+    assert "gradient_boosting_conservative" in names
+    assert "hist_gradient_boosting_conservative" in names
+    assert "xgboost_conservative" in names
     if importlib.util.find_spec("statsmodels") is not None:
         assert any(name.startswith("arima_") for name in names)
         assert any(name.startswith("sarima_") for name in names)
@@ -185,6 +193,49 @@ def test_default_candidates_register_advanced_model_families_when_available() ->
         assert any(name.startswith("garch_") for name in names)
     if importlib.util.find_spec("torch") is not None:
         assert "lstm" in names
+
+
+def test_deep_learning_profile_is_off_by_default_and_optional() -> None:
+    default_names = {
+        candidate.name
+        for candidate in default_candidates(
+            include_lightgbm=False,
+            include_statistical_models=False,
+            include_lstm=False,
+        )
+    }
+    assert not any("mlp" in name for name in default_names)
+    assert "lstm" not in default_names
+
+    optional_names = {
+        candidate.name
+        for candidate in default_candidates(
+            include_lightgbm=False,
+            include_statistical_models=False,
+            include_lstm=False,
+            deep_learning_profile="fast",
+        )
+    }
+    if importlib.util.find_spec("torch") is not None:
+        assert "tabular_mlp_fast" in optional_names
+        assert "lstm" not in optional_names
+        assert "temporal_cnn_research" not in optional_names
+    else:
+        assert not any("mlp" in name for name in optional_names)
+
+    research_names = {
+        candidate.name
+        for candidate in default_candidates(
+            include_lightgbm=False,
+            include_statistical_models=False,
+            include_lstm=False,
+            deep_learning_profile="research",
+        )
+    }
+    if importlib.util.find_spec("torch") is not None:
+        assert "tabular_mlp_research" in research_names
+        assert "lstm" in research_names
+        assert "temporal_cnn_research" in research_names
 
 
 def test_expanded_search_registers_multiple_tuning_variants() -> None:
@@ -204,8 +255,12 @@ def test_expanded_search_registers_multiple_tuning_variants() -> None:
         "lasso_alpha_0_00001",
         "lasso_alpha_0_001",
         "elastic_net_alpha_0_0001_l1_0_10",
+        "decision_tree_medium",
         "random_forest_smoother",
+        "extra_trees_smoother",
         "gradient_boosting_deeper",
+        "hist_gradient_boosting_regularized",
+        "xgboost_regularized",
     }.issubset(names)
     if importlib.util.find_spec("statsmodels") is not None:
         assert sum(name.startswith("arima_") for name in names) >= 3
@@ -272,6 +327,33 @@ def test_lightgbm_candidate_preserves_feature_names_on_predict() -> None:
     assert not any("does not have valid feature names" in str(item.message) for item in caught)
 
 
+def test_tree_candidate_exposes_feature_importance_diagnostics() -> None:
+    rng = np.random.default_rng(31)
+    dates = pd.bdate_range("2024-01-02", periods=90)
+    features = pd.DataFrame(
+        {
+            "signal": np.linspace(-1.0, 1.0, 90),
+            "noise": rng.normal(size=90),
+            "volume_z": rng.normal(size=90),
+        },
+        index=dates,
+    )
+    target = pd.Series(features["signal"] * 0.005 + rng.normal(0.0, 0.001, 90), index=dates)
+    candidate = next(
+        candidate
+        for candidate in default_candidates(include_lightgbm=False, include_statistical_models=False, include_lstm=False)
+        if candidate.name == "extra_trees_balanced"
+    )
+
+    model = candidate.clone().fit(features.iloc[:80], target.iloc[:80])
+    diagnostics = model.model_diagnostics()
+
+    tree = diagnostics["tree_model"]
+    assert tree["tree_count"] == 180
+    assert tree["feature_importance_count"] == 3
+    assert tree["top_importances"][0]["feature"] in {"signal", "noise", "volume_z"}
+
+
 def test_kalman_filter_candidate_fit_predicts() -> None:
     dates = pd.bdate_range("2024-01-02", periods=80)
     features = pd.DataFrame({"x": np.arange(80)}, index=dates)
@@ -295,6 +377,64 @@ def test_lstm_candidate_fit_predicts_small_series() -> None:
 
     assert predicted.shape == (4,)
     assert np.isfinite(predicted).all()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_tabular_mlp_candidate_fit_predicts_small_series() -> None:
+    rng = np.random.default_rng(41)
+    dates = pd.bdate_range("2024-01-02", periods=90)
+    features = pd.DataFrame(
+        {
+            "momentum": np.linspace(-1.0, 1.0, 90),
+            "noise": rng.normal(size=90),
+            "volume_z": rng.normal(size=90),
+        },
+        index=dates,
+    )
+    target = pd.Series(features["momentum"] * 0.004 + rng.normal(0.0, 0.001, 90), index=dates)
+
+    model = TabularMLPReturnCandidate(
+        hidden_size=6,
+        max_epochs=3,
+        min_rows=70,
+        patience=2,
+        time_budget_seconds=5.0,
+    ).fit(features, target)
+    predicted = model.predict(features.tail(5))
+
+    assert predicted.shape == (5,)
+    assert np.isfinite(predicted).all()
+    assert model.parameters()["stopped_reason"] in {"early_stopping", "time_budget", "max_epochs"}
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed")
+def test_temporal_cnn_candidate_fit_predicts_small_series() -> None:
+    rng = np.random.default_rng(43)
+    dates = pd.bdate_range("2024-01-02", periods=100)
+    features = pd.DataFrame(
+        {
+            "momentum": np.sin(np.arange(100) / 8),
+            "trend": np.linspace(-1.0, 1.0, 100),
+            "noise": rng.normal(size=100),
+        },
+        index=dates,
+    )
+    target = pd.Series(features["momentum"] * 0.003 + rng.normal(0.0, 0.001, 100), index=dates)
+
+    model = TemporalCNNReturnCandidate(
+        lookback=8,
+        channels=4,
+        kernel_size=3,
+        max_epochs=3,
+        min_rows=70,
+        patience=2,
+        time_budget_seconds=5.0,
+    ).fit(features, target)
+    predicted = model.predict(features.tail(5))
+
+    assert predicted.shape == (5,)
+    assert np.isfinite(predicted).all()
+    assert model.parameters()["stopped_reason"] in {"early_stopping", "time_budget", "max_epochs"}
 
 
 def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
@@ -530,11 +670,39 @@ def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
     assert "chapter_6_process_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
     assert "chapter_8_backtest_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
     assert "chapter_10_bayesian_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
+    assert "chapter_11_tree_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
+    assert "chapter_12_boosting_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
+    assert "chapter_17_deep_learning_selection_penalty" in report["candidate_results"]["1"][0]["metrics"]
     chapter_10_bayesian_ml = report["technical_view"]["chapter_10_bayesian_ml"]
     assert chapter_10_bayesian_ml["decision_policy"]["influences_model_selection"] is True
     assert chapter_10_bayesian_ml["decision_policy"]["influences_forecast_confidence"] is True
     assert chapter_10_bayesian_ml["heavy_bayesian_policy"]["enabled"] is False
     assert chapter_10_bayesian_ml["horizons"]["1"]["heavy_bayesian_path"]["status"] == "disabled"
+    chapter_11_tree_models = report["technical_view"]["chapter_11_tree_models"]
+    assert chapter_11_tree_models["decision_policy"]["influences_final_action"] is False
+    assert chapter_11_tree_models["decision_policy"]["influences_model_selection"] is True
+    assert set(chapter_11_tree_models["horizons"]) == {"1", "5", "30"}
+    assert "tree_candidate_comparison" in chapter_11_tree_models["horizons"]["1"]
+    chapter_12_boosting_models = report["technical_view"]["chapter_12_boosting_models"]
+    assert chapter_12_boosting_models["decision_policy"]["influences_final_action"] is False
+    assert chapter_12_boosting_models["decision_policy"]["influences_model_selection"] is True
+    assert set(chapter_12_boosting_models["horizons"]) == {"1", "5", "30"}
+    assert "boosting_candidate_comparison" in chapter_12_boosting_models["horizons"]["1"]
+    jansen_chapter_17_deep_learning = report["technical_view"]["jansen_chapter_17_deep_learning"]
+    assert jansen_chapter_17_deep_learning["decision_policy"]["influences_final_action"] is False
+    assert jansen_chapter_17_deep_learning["decision_policy"]["influences_model_selection"] is True
+    assert jansen_chapter_17_deep_learning["model_policy"]["default_in_live_agents"] is False
+    assert jansen_chapter_17_deep_learning["model_policy"]["gpu_required"] is False
+    assert jansen_chapter_17_deep_learning["model_policy"]["deep_learning_buy_sell_gate"] is False
+    assert jansen_chapter_17_deep_learning["model_policy"]["transformer_or_cnn_stack"] is False
+    assert set(jansen_chapter_17_deep_learning["horizons"]) == {"1", "5", "30"}
+    jansen_chapter_18_cnn = report["technical_view"]["jansen_chapter_18_cnn"]
+    assert jansen_chapter_18_cnn["decision_policy"]["influences_final_action"] is False
+    assert jansen_chapter_18_cnn["decision_policy"]["influences_model_selection"] is True
+    assert jansen_chapter_18_cnn["model_policy"]["default_in_watch_agents"] is False
+    assert jansen_chapter_18_cnn["model_policy"]["cnn_trading_gate"] is False
+    assert jansen_chapter_18_cnn["model_policy"]["baseline_requirement"].startswith("A CNN is used only if")
+    assert set(jansen_chapter_18_cnn["horizons"]) == {"1", "5", "30"}
     assert "ml4t_feature_selection_policy" in report["governance"]["model_cards"]["1"]
     assert "ml4t_selection_adjustment" in report["governance"]["model_cards"]["1"]
     assert "chapter_3_alternative_data" in report["diagnostics"]
@@ -544,6 +712,10 @@ def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
     assert "chapter_7_linear_models" in report["diagnostics"]
     assert "chapter_8_backtesting" in report["diagnostics"]
     assert "chapter_9_time_series" in report["diagnostics"]
+    assert "chapter_11_tree_models" in report["diagnostics"]
+    assert "chapter_12_boosting_models" in report["diagnostics"]
+    assert "chapter_17_deep_learning" in report["diagnostics"]
+    assert "chapter_18_cnn" in report["diagnostics"]
     assert "chapter_1_ml4t_workflow" in report["diagnostics"]
     assert "chapter_2_market_data" in report["diagnostics"]
     assert (
@@ -585,6 +757,22 @@ def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
     assert (
         report["governance"]["technical_method_cards"]["chapter_10_bayesian_ml"]["name"]
         == "jansen_ml4t_chapter_10_bayesian_ml"
+    )
+    assert (
+        report["governance"]["technical_method_cards"]["chapter_11_tree_models"]["name"]
+        == "jansen_ml4t_chapter_11_tree_models"
+    )
+    assert (
+        report["governance"]["technical_method_cards"]["chapter_12_boosting_models"]["name"]
+        == "jansen_ml4t_chapter_12_boosting_models"
+    )
+    assert (
+        report["governance"]["technical_method_cards"]["jansen_chapter_17_deep_learning"]["name"]
+        == "jansen_ml4t_chapter_17_deep_learning"
+    )
+    assert (
+        report["governance"]["technical_method_cards"]["jansen_chapter_18_cnn"]["name"]
+        == "jansen_ml4t_chapter_18_cnn_time_series"
     )
     assert report["part_i_suggested_action"] in {"Buy", "Hold", "Sell"}
     assert "technical_history_quality" in report["technical_view"]

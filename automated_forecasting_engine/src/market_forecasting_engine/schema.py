@@ -26,12 +26,13 @@ class ForecastConfig:
     include_lightgbm: bool = True
     include_statistical_models: bool = True
     include_lstm: bool = False
+    deep_learning_profile: str = "off"
     search_level: str = "fast"
     tuning_mode: str = "fixed"
     optuna_trials: int = 25
     optuna_timeout_seconds: int | None = None
     optuna_inner_splits: int = 3
-    optuna_families: tuple[str, ...] = ("lightgbm", "elastic_net", "random_forest", "gradient_boosting")
+    optuna_families: tuple[str, ...] = ("lightgbm", "xgboost", "elastic_net", "random_forest", "extra_trees", "gradient_boosting")
     tactical_profile: str = "intermediate"
     enable_llm_review: bool = False
     llm_provider: str = "openai"

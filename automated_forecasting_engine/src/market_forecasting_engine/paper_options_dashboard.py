@@ -24,6 +24,9 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
     selected = trade_plan.get("selected_contract") or {}
     order = trade_plan.get("order") or {}
     exit_plan = trade_plan.get("exit_plan") or {}
+    position_pl = summarize_position_pl(report.get("option_positions") or [])
+    option_type = _option_type_label(trade_plan.get("option_type"), selected.get("symbol") or order.get("symbol"))
+    chart = build_stock_chart_payload(report=report, history=history)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "ticker": ticker.upper(),
@@ -43,8 +46,12 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
             "predicted_price": (report.get("selected_forecast") or {}).get("predicted_price"),
             "action": trade_plan.get("action"),
             "option_type": trade_plan.get("option_type"),
+            "option_type_label": option_type,
             "contract": selected.get("symbol"),
             "contract_name": selected.get("name"),
+            "greeks": selected.get("greeks") or {},
+            "spread_pct": selected.get("spread_pct"),
+            "open_interest": selected.get("open_interest"),
             "entry_type": order.get("type"),
             "entry_limit": order.get("limit_price"),
             "take_profit": (exit_plan.get("take_profit") or {}).get("limit_price"),
@@ -55,8 +62,106 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
             "execution_blocks": report.get("execution_blocks") or [],
             "order_submitted": (report.get("order_result") or {}).get("submitted"),
             "order_result": report.get("order_result"),
+            "position_pl": position_pl,
         },
         "history": history,
+        "chart": chart,
+    }
+
+
+def build_stock_chart_payload(*, report: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
+    actual_points: list[dict[str, Any]] = []
+    seen_actual: set[str] = set()
+    for row in history:
+        timestamp = row.get("checked_at")
+        price = _to_float((row.get("selected_forecast") or {}).get("spot"))
+        if price is None:
+            price = _to_float((row.get("forecast_plan") or {}).get("latest_price"))
+        if not timestamp or price is None:
+            continue
+        key = str(timestamp)
+        if key in seen_actual:
+            continue
+        seen_actual.add(key)
+        actual_points.append({"timestamp": key, "price": price})
+    forecast_plan = report.get("forecast_plan") or {}
+    selected_forecast = report.get("selected_forecast") or {}
+    as_of = forecast_plan.get("as_of") or report.get("forecast_created_at_utc") or report.get("checked_at")
+    as_of_price = _to_float(forecast_plan.get("latest_price")) or _to_float(selected_forecast.get("spot"))
+    forecasts = forecast_plan.get("forecasts") or []
+    if not forecasts and selected_forecast:
+        forecasts = [selected_forecast]
+    forecast_points: list[dict[str, Any]] = []
+    for forecast in forecasts:
+        timestamp = forecast.get("forecast_timestamp") or forecast.get("forecast_date")
+        predicted = _to_float(forecast.get("predicted_price"))
+        if not timestamp or predicted is None:
+            continue
+        forecast_points.append(
+            {
+                "timestamp": str(timestamp),
+                "predicted_price": predicted,
+                "lower_price": _to_float(forecast.get("lower_price")),
+                "upper_price": _to_float(forecast.get("upper_price")),
+                "horizon_hours": _to_float(forecast.get("horizon_hours")),
+            }
+        )
+    return {
+        "actual_points": actual_points[-240:],
+        "forecast_points": forecast_points,
+        "as_of": as_of,
+        "as_of_price": as_of_price,
+    }
+
+
+def summarize_position_pl(positions: list[dict[str, Any]]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    total_cost = 0.0
+    total_value = 0.0
+    total_pl = 0.0
+    for position in positions:
+        symbol = str(position.get("symbol") or "")
+        if not symbol:
+            continue
+        qty = _to_float(position.get("qty"))
+        avg_entry = _to_float(position.get("avg_entry_price"))
+        current_price = _to_float(position.get("current_price"))
+        cost_basis = _to_float(position.get("cost_basis"))
+        market_value = _to_float(position.get("market_value"))
+        unrealized_pl = _to_float(position.get("unrealized_pl"))
+        if cost_basis is None and qty is not None and avg_entry is not None:
+            cost_basis = qty * avg_entry * 100
+        if market_value is None and qty is not None and current_price is not None:
+            market_value = qty * current_price * 100
+        if unrealized_pl is None and cost_basis is not None and market_value is not None:
+            unrealized_pl = market_value - cost_basis
+        total_cost += cost_basis or 0.0
+        total_value += market_value or 0.0
+        total_pl += unrealized_pl or 0.0
+        rows.append(
+            {
+                "symbol": symbol,
+                "option_type": _option_type_label(None, symbol),
+                "qty": qty,
+                "avg_entry_price": avg_entry,
+                "current_price": current_price,
+                "cost_basis": cost_basis,
+                "market_value": market_value,
+                "unrealized_pl": unrealized_pl,
+                "unrealized_plpc": _to_float(position.get("unrealized_plpc")),
+            }
+        )
+    status = "flat"
+    if total_pl > 0:
+        status = "winning"
+    elif total_pl < 0:
+        status = "losing"
+    return {
+        "status": status,
+        "total_cost": round(total_cost, 2),
+        "total_value": round(total_value, 2),
+        "total_unrealized_pl": round(total_pl, 2),
+        "rows": rows,
     }
 
 
@@ -116,7 +221,17 @@ def dashboard_html(refresh_seconds: int) -> str:
     .badge {{ display: inline-block; border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 750; color: white; background: var(--hold); text-transform: uppercase; }}
     .badge.buy_option {{ background: var(--buy); }}
     .badge.blocked {{ background: var(--blocked); }}
+    .win {{ color: var(--buy); }}
+    .loss {{ color: var(--blocked); }}
     .grid2 {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 0.8fr); gap: 14px; }}
+    .chart-panel {{ margin-bottom: 14px; overflow-x: auto; }}
+    .chart-head {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }}
+    .legend {{ display: flex; gap: 14px; flex-wrap: wrap; }}
+    .key {{ display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }}
+    .swatch {{ width: 18px; height: 0; border-top: 2px solid currentColor; display: inline-block; }}
+    .swatch.actual {{ color: #111827; }}
+    .swatch.forecast {{ color: #dc2626; border-top-style: dashed; }}
+    svg#stockChart {{ width: 100%; min-width: 820px; height: 360px; display: block; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ padding: 8px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 650; }}
@@ -137,20 +252,52 @@ def dashboard_html(refresh_seconds: int) -> str:
     <section class="cards">
       <div class="card"><div class="label">Decision</div><div class="value"><span id="actionBadge" class="badge">-</span></div><div class="small" id="blocks">-</div></div>
       <div class="card"><div class="label">Forecast</div><div class="value" id="forecast">-</div><div class="small" id="forecastMeta">-</div></div>
+      <div class="card"><div class="label">Option Type</div><div class="value" id="optionType">-</div><div class="small">Call profits if stock rises; Put profits if stock falls</div></div>
       <div class="card"><div class="label">Contract</div><div class="value" id="contract">-</div><div class="small" id="contractMeta">-</div></div>
-      <div class="card"><div class="label">Entry / Risk</div><div class="value" id="entry">-</div><div class="small" id="risk">-</div></div>
     </section>
     <section class="cards">
+      <div class="card"><div class="label">Entry / Risk</div><div class="value" id="entry">-</div><div class="small" id="risk">-</div></div>
       <div class="card"><div class="label">Take Profit</div><div class="value" id="takeProfit">-</div><div class="small">Autonomous sell limit</div></div>
       <div class="card"><div class="label">Stop Loss</div><div class="value" id="stopLoss">-</div><div class="small">Autonomous stop-limit</div></div>
       <div class="card"><div class="label">Market</div><div class="value" id="market">-</div><div class="small" id="nextOpen">-</div></div>
+    </section>
+    <section class="cards">
+      <div class="card"><div class="label">Delta</div><div class="value" id="greekDelta">-</div><div class="small">Directional exposure</div></div>
+      <div class="card"><div class="label">Gamma</div><div class="value" id="greekGamma">-</div><div class="small">Delta acceleration</div></div>
+      <div class="card"><div class="label">Theta</div><div class="value" id="greekTheta">-</div><div class="small" id="thetaMeta">Time decay review</div></div>
+      <div class="card"><div class="label">Vega / Liquidity</div><div class="value" id="greekVega">-</div><div class="small" id="liquidityMeta">-</div></div>
+    </section>
+    <section class="cards">
       <div class="card"><div class="label">Order Result</div><div class="value" id="orderResult">-</div><div class="small" id="checkedAt">-</div></div>
+    </section>
+    <section class="panel chart-panel">
+      <div class="chart-head">
+        <strong>Stock Price And Forecast</strong>
+        <div class="legend">
+          <span class="key"><span class="swatch actual"></span>Stock price</span>
+          <span class="key"><span class="swatch forecast"></span>Forecast line</span>
+        </div>
+      </div>
+      <svg id="stockChart" role="img" aria-label="Stock price chart with forecast line"></svg>
+    </section>
+    <section class="panel" style="margin-bottom: 14px;">
+      <strong>Open Profit / Loss</strong>
+      <div class="cards" style="margin: 12px 0 8px;">
+        <div class="card"><div class="label">Plain English</div><div class="value" id="plStatus">-</div><div class="small">Still open, not final profit</div></div>
+        <div class="card"><div class="label">Total P/L</div><div class="value" id="plTotal">-</div><div class="small">Unrealized</div></div>
+        <div class="card"><div class="label">Cost</div><div class="value" id="plCost">-</div><div class="small">What the open contracts cost</div></div>
+        <div class="card"><div class="label">Value Now</div><div class="value" id="plValue">-</div><div class="small">Current broker mark</div></div>
+      </div>
+      <table>
+        <thead><tr><th>Position</th><th>Type</th><th>Qty</th><th>Entry</th><th>Current</th><th>Cost</th><th>Value</th><th>P/L</th></tr></thead>
+        <tbody id="plRows"></tbody>
+      </table>
     </section>
     <section class="grid2">
       <div class="panel">
         <strong>Recent Decisions</strong>
         <table>
-          <thead><tr><th>Checked</th><th>Action</th><th>Contract</th><th>Entry</th><th>Blocks</th><th>Submitted</th></tr></thead>
+          <thead><tr><th>Checked</th><th>Action</th><th>Type</th><th>Contract</th><th>Entry</th><th>Blocks</th><th>Submitted</th></tr></thead>
           <tbody id="historyRows"></tbody>
         </table>
       </div>
@@ -164,6 +311,12 @@ def dashboard_html(refresh_seconds: int) -> str:
     const refreshMs = {refresh_seconds * 1000};
     const fmt = new Intl.NumberFormat(undefined, {{ maximumFractionDigits: 4 }});
     function price(v) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : fmt.format(Number(v)); }}
+    function money(v) {{
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+      const n = Number(v);
+      const sign = n > 0 ? "+" : "";
+      return `${{sign}}$${{fmt.format(n)}}`;
+    }}
     function time(v) {{ if (!v) return "-"; const d = new Date(v); return Number.isNaN(d.getTime()) ? v : d.toLocaleString(); }}
     function set(id, value) {{ document.getElementById(id).textContent = value; }}
     function summarize(row) {{
@@ -173,6 +326,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       return {{
         checked: row.checked_at,
         action: plan.action || "-",
+        type: optionTypeLabel(plan.option_type, selected.symbol || order.symbol),
         contract: selected.symbol || "-",
         entry: order.limit_price,
         blocks: row.execution_blocks || [],
@@ -190,26 +344,141 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("blocks", (s.execution_blocks || []).join(", ") || "no execution blocks");
       set("forecast", `${{s.forecast_direction || "-"}} → ${{price(s.predicted_price)}}`);
       set("forecastMeta", `spot ${{price(s.spot)}} | cache ${{s.forecast_cache_status || "-"}}`);
+      set("optionType", s.option_type_label || "-");
       set("contract", s.contract || "-");
-      set("contractMeta", s.contract_name || "-");
+      set("contractMeta", `${{s.option_type_label || "-"}} | ${{s.contract_name || "-"}}`);
       set("entry", `${{s.entry_type || "-"}} @ ${{price(s.entry_limit)}}`);
       const sizing = s.sizing || {{}};
       set("risk", `qty ${{sizing.qty ?? "-"}} | debit ${{price(s.estimated_debit)}} | budget ${{price(sizing.budget)}}`);
+      const g = s.greeks || {{}};
+      set("greekDelta", price(g.delta));
+      set("greekGamma", price(g.gamma));
+      set("greekTheta", price(g.theta));
+      set("thetaMeta", `horizon decay $${{price(g.theta_decay_usd_for_horizon)}} | premium/day ${{price((g.theta_premium_pct_per_day || 0) * 100)}}%`);
+      set("greekVega", price(g.vega));
+      set("liquidityMeta", `spread ${{price((s.spread_pct || 0) * 100)}}% | open interest ${{price(s.open_interest)}}`);
       set("takeProfit", price(s.take_profit));
       set("stopLoss", `${{price(s.stop_price)}} / ${{price(s.stop_limit)}}`);
       set("market", s.market_is_open ? "open" : "closed");
       set("nextOpen", `next open: ${{time(s.next_open)}}`);
       set("orderResult", s.order_submitted ? "submitted" : "not submitted");
       set("checkedAt", time(s.checked_at));
+      renderStockChart(data.chart || {{}});
+      renderPositionPl(s.position_pl || {{}});
       const rows = document.getElementById("historyRows");
       rows.innerHTML = "";
       (data.history || []).slice().reverse().forEach(row => {{
         const r = summarize(row);
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${{time(r.checked)}}</td><td>${{r.action}}</td><td>${{r.contract}}</td><td>${{price(r.entry)}}</td><td class="blocks">${{r.blocks.join(", ")}}</td><td>${{r.submitted}}</td>`;
+        tr.innerHTML = `<td>${{time(r.checked)}}</td><td>${{r.action}}</td><td>${{r.type || "-"}}</td><td>${{r.contract}}</td><td>${{price(r.entry)}}</td><td class="blocks">${{r.blocks.join(", ")}}</td><td>${{r.submitted}}</td>`;
         rows.appendChild(tr);
       }});
       set("details", JSON.stringify({{ summary: s, report_path: data.report_path, state_path: data.state_path, log_path: data.log_path, report: data.report }}, null, 2));
+    }}
+    function renderStockChart(chart) {{
+      const svg = document.getElementById("stockChart");
+      const width = Math.max(svg.clientWidth || 960, 820);
+      const height = 360;
+      const pad = {{ left: 62, right: 28, top: 20, bottom: 44 }};
+      svg.setAttribute("viewBox", `0 0 ${{width}} ${{height}}`);
+      svg.innerHTML = "";
+      const actual = (chart.actual_points || []).map(p => [new Date(p.timestamp).getTime(), Number(p.price)]).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: new Date(p.timestamp).getTime(), y: Number(p.predicted_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+      const asOfTime = chart.as_of ? new Date(chart.as_of).getTime() : null;
+      const asOfPrice = Number(chart.as_of_price);
+      const xs = actual.map(p => p[0]).concat(forecasts.map(p => p.x)).concat(Number.isFinite(asOfTime) ? [asOfTime] : []);
+      const ys = actual.map(p => p[1]).concat(forecasts.flatMap(p => [p.y, p.lower_price, p.upper_price]).map(Number).filter(Number.isFinite)).concat(Number.isFinite(asOfPrice) ? [asOfPrice] : []);
+      if (!xs.length || !ys.length) {{
+        const text = el("text", {{ x: 20, y: 32, fill: "#637083", "font-size": 14 }});
+        text.textContent = "No stock price history available yet.";
+        svg.appendChild(text);
+        return;
+      }}
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY0 = Math.min(...ys), maxY0 = Math.max(...ys);
+      const yPad = Math.max((maxY0 - minY0) * 0.08, 0.5);
+      const minY = minY0 - yPad, maxY = maxY0 + yPad;
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const x = v => pad.left + ((v - minX) / Math.max(maxX - minX, 1)) * plotW;
+      const y = v => pad.top + (1 - ((v - minY) / Math.max(maxY - minY, 1))) * plotH;
+      svg.appendChild(el("rect", {{ x: 0, y: 0, width, height, fill: "#fff" }}));
+      for (let i = 0; i <= 4; i++) {{
+        const yy = pad.top + i * plotH / 4;
+        svg.appendChild(el("line", {{ x1: pad.left, y1: yy, x2: width - pad.right, y2: yy, stroke: "#e5e7eb" }}));
+        const label = minY + (1 - i / 4) * (maxY - minY);
+        const t = el("text", {{ x: 8, y: yy + 4, fill: "#637083", "font-size": 12 }});
+        t.textContent = price(label);
+        svg.appendChild(t);
+      }}
+      if (actual.length > 1) {{
+        svg.appendChild(el("path", {{ d: actual.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#111827", "stroke-width": 2 }}));
+      }}
+      const forecastLine = [];
+      if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) forecastLine.push([asOfTime, asOfPrice]);
+      forecasts.forEach(p => forecastLine.push([p.x, p.y]));
+      if (forecastLine.length > 1) {{
+        svg.appendChild(el("path", {{ d: forecastLine.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#dc2626", "stroke-width": 2, "stroke-dasharray": "7 5" }}));
+      }}
+      if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) {{
+        svg.appendChild(el("circle", {{ cx: x(asOfTime), cy: y(asOfPrice), r: 5, fill: "#2563eb" }}));
+      }}
+      forecasts.forEach(p => {{
+        svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5, fill: "#dc2626" }}));
+        const t = el("text", {{ x: x(p.x) + 7, y: y(p.y) - 7, fill: "#991b1b", "font-size": 11 }});
+        t.textContent = `${{price(p.horizon_hours)}}h ${{price(p.y)}}`;
+        svg.appendChild(t);
+      }});
+      const axis = el("line", {{ x1: pad.left, y1: height - pad.bottom, x2: width - pad.right, y2: height - pad.bottom, stroke: "#9ca3af" }});
+      svg.appendChild(axis);
+      const minLabel = el("text", {{ x: pad.left, y: height - 14, fill: "#637083", "font-size": 12 }});
+      minLabel.textContent = new Date(minX).toLocaleTimeString();
+      svg.appendChild(minLabel);
+      const maxLabel = el("text", {{ x: width - pad.right - 90, y: height - 14, fill: "#637083", "font-size": 12 }});
+      maxLabel.textContent = new Date(maxX).toLocaleTimeString();
+      svg.appendChild(maxLabel);
+    }}
+    function el(name, attrs) {{
+      const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+      Object.entries(attrs || {{}}).forEach(([key, value]) => node.setAttribute(key, value));
+      return node;
+    }}
+    function renderPositionPl(pl) {{
+      const total = Number(pl.total_unrealized_pl || 0);
+      const status = pl.status || "flat";
+      const statusEl = document.getElementById("plStatus");
+      statusEl.textContent = status === "winning" ? "Winning" : status === "losing" ? "Losing" : "Flat";
+      statusEl.className = `value ${{status === "winning" ? "win" : status === "losing" ? "loss" : ""}}`;
+      const totalEl = document.getElementById("plTotal");
+      totalEl.textContent = money(total);
+      totalEl.className = `value ${{total > 0 ? "win" : total < 0 ? "loss" : ""}}`;
+      set("plCost", `$${{price(pl.total_cost)}}`);
+      set("plValue", `$${{price(pl.total_value)}}`);
+      const rows = document.getElementById("plRows");
+      rows.innerHTML = "";
+      (pl.rows || []).forEach(row => {{
+        const rowPl = Number(row.unrealized_pl || 0);
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${{row.symbol || "-"}}</td><td>${{row.option_type || optionTypeLabel(null, row.symbol) || "-"}}</td><td>${{price(row.qty)}}</td><td>$${{price(row.avg_entry_price)}}</td><td>$${{price(row.current_price)}}</td><td>$${{price(row.cost_basis)}}</td><td>$${{price(row.market_value)}}</td><td class="${{rowPl > 0 ? "win" : rowPl < 0 ? "loss" : ""}}">${{money(rowPl)}}</td>`;
+        rows.appendChild(tr);
+      }});
+      if (!(pl.rows || []).length) {{
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="8">No open option positions in the latest report.</td>`;
+        rows.appendChild(tr);
+      }}
+    }}
+    function optionTypeLabel(optionType, symbol) {{
+      const raw = String(optionType || "").toLowerCase();
+      if (raw === "call") return "CALL";
+      if (raw === "put") return "PUT";
+      const s = String(symbol || "").toUpperCase();
+      if (s.length >= 15) {{
+        const code = s.slice(-9, -8);
+        if (code === "C") return "CALL";
+        if (code === "P") return "PUT";
+      }}
+      return null;
     }}
     async function refresh() {{
       try {{
@@ -322,6 +591,34 @@ def _strict_json_value(value: Any) -> Any:
     if isinstance(value, (pd.Timestamp, datetime)):
         return value.isoformat()
     return value
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(parsed):
+        return None
+    return parsed
+
+
+def _option_type_label(option_type: Any, symbol: Any) -> str | None:
+    raw_type = str(option_type or "").strip().lower()
+    if raw_type == "call":
+        return "CALL"
+    if raw_type == "put":
+        return "PUT"
+    raw_symbol = str(symbol or "").upper()
+    if len(raw_symbol) >= 15:
+        option_code = raw_symbol[-9:-8]
+        if option_code == "C":
+            return "CALL"
+        if option_code == "P":
+            return "PUT"
+    return None
 
 
 def _query_value(params: dict[str, list[str]], key: str, default: str) -> str:

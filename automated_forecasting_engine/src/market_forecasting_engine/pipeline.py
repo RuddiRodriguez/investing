@@ -12,12 +12,16 @@ from market_forecasting_engine.chapter_1_ml4t_workflow import analyze_chapter_1_
 from market_forecasting_engine.chapter_10_bayesian_ml import analyze_chapter_10_bayesian_ml
 from market_forecasting_engine.chapter_10_patterns import analyze_chapter_10_patterns
 from market_forecasting_engine.chapter_11_patterns import analyze_chapter_11_patterns
+from market_forecasting_engine.chapter_11_tree_models import analyze_chapter_11_tree_models
+from market_forecasting_engine.chapter_12_boosting_models import analyze_chapter_12_boosting_models
 from market_forecasting_engine.chapter_12_gaps import analyze_chapter_12_gaps
 from market_forecasting_engine.chapter_13_support_resistance import analyze_chapter_13_support_resistance
 from market_forecasting_engine.chapter_14_trendlines import analyze_chapter_14_trendlines
 from market_forecasting_engine.chapter_15_major_trendlines import analyze_chapter_15_major_trendlines
 from market_forecasting_engine.chapter_16_market_context import analyze_chapter_16_market_context
+from market_forecasting_engine.chapter_17_deep_learning import analyze_chapter_17_deep_learning
 from market_forecasting_engine.chapter_17_governance_context import analyze_chapter_17_governance_context
+from market_forecasting_engine.chapter_18_cnn import analyze_chapter_18_cnn
 from market_forecasting_engine.chapter_18_tactics import analyze_chapter_18_tactical_problem
 from market_forecasting_engine.chapter_19_validation import apply_chapter_19_validation
 from market_forecasting_engine.chapter_2_market_data import analyze_chapter_2_market_data
@@ -376,6 +380,38 @@ class ForecastingEngine:
             mcmc_draws=self.config.bayesian_mcmc_draws,
             mcmc_tune=self.config.bayesian_mcmc_tune,
         )
+        chapter_11_tree_models = analyze_chapter_11_tree_models(
+            forecasts=forecasts,
+            candidate_results=all_candidate_results,
+            model_cards=model_cards,
+            horizons=self.config.horizons,
+            selection_metric=self.config.selection_metric,
+        )
+        chapter_12_boosting_models = analyze_chapter_12_boosting_models(
+            forecasts=forecasts,
+            candidate_results=all_candidate_results,
+            model_cards=model_cards,
+            horizons=self.config.horizons,
+            selection_metric=self.config.selection_metric,
+        )
+        chapter_17_deep_learning = analyze_chapter_17_deep_learning(
+            features=features,
+            forecasts=forecasts,
+            candidate_results=all_candidate_results,
+            model_cards=model_cards,
+            horizons=self.config.horizons,
+            deep_learning_profile=self.config.deep_learning_profile,
+            include_lstm=self.config.include_lstm,
+            selection_metric=self.config.selection_metric,
+        )
+        chapter_18_cnn = analyze_chapter_18_cnn(
+            forecasts=forecasts,
+            candidate_results=all_candidate_results,
+            model_cards=model_cards,
+            horizons=self.config.horizons,
+            deep_learning_profile=self.config.deep_learning_profile,
+            selection_metric=self.config.selection_metric,
+        )
         chapter_17_governance_context = analyze_chapter_17_governance_context(
             prices=normalized_prices,
             features=features,
@@ -500,6 +536,10 @@ class ForecastingEngine:
                 "chapter_8_backtesting": chapter_8_backtesting,
                 "chapter_9_time_series": chapter_9_time_series,
                 "chapter_10_bayesian_ml": chapter_10_bayesian_ml,
+                "chapter_11_tree_models": chapter_11_tree_models,
+                "chapter_12_boosting_models": chapter_12_boosting_models,
+                "chapter_17_deep_learning": chapter_17_deep_learning,
+                "chapter_18_cnn": chapter_18_cnn,
                 "trend_state": trend_view,
                 "dow_theory": dow_theory,
                 "magee_basing_points": magee_basing_points,
@@ -530,6 +570,8 @@ class ForecastingEngine:
                 "chapter_16_donchian_context": chapter_16_market_context.get("donchian_context", {}),
                 "chapter_16_futures_risk_context": chapter_16_market_context.get("futures_risk_context", {}),
                 "chapter_17_governance_context": chapter_17_governance_context,
+                "jansen_chapter_17_deep_learning": chapter_17_deep_learning,
+                "jansen_chapter_18_cnn": chapter_18_cnn,
                 "chapter_17_llm_decision_packet": chapter_17_governance_context.get("llm_decision_packet", {}),
                 "chapter_17_decision_fragility": chapter_17_governance_context.get("computer_humility", {}).get("decision_fragility", {}),
                 "chapter_18_tactical_problem": chapter_18_tactical_problem,
@@ -582,6 +624,10 @@ class ForecastingEngine:
                     "chapter_8_backtesting": chapter_8_backtesting.get("technical_method_card", {}),
                     "chapter_9_time_series": chapter_9_time_series.get("technical_method_card", {}),
                     "chapter_10_bayesian_ml": chapter_10_bayesian_ml.get("technical_method_card", {}),
+                    "chapter_11_tree_models": chapter_11_tree_models.get("technical_method_card", {}),
+                    "chapter_12_boosting_models": chapter_12_boosting_models.get("technical_method_card", {}),
+                    "jansen_chapter_17_deep_learning": chapter_17_deep_learning.get("technical_method_card", {}),
+                    "jansen_chapter_18_cnn": chapter_18_cnn.get("technical_method_card", {}),
                     "dow_theory": dow_theory.get("technical_method_card", {}),
                     "magee_basing_points": magee_basing_points.get("technical_method_card", {}),
                     "reversal_patterns": reversal_patterns.get("technical_method_card", {}),
@@ -618,6 +664,10 @@ class ForecastingEngine:
                 "chapter_8_backtesting": chapter_8_backtesting,
                 "chapter_9_time_series": chapter_9_time_series,
                 "chapter_10_bayesian_ml": chapter_10_bayesian_ml,
+                "chapter_11_tree_models": chapter_11_tree_models,
+                "chapter_12_boosting_models": chapter_12_boosting_models,
+                "chapter_17_deep_learning": chapter_17_deep_learning,
+                "chapter_18_cnn": chapter_18_cnn,
                 "selected_validation_predictions": selected_validation_predictions,
                 "factor_evaluation": factor_evaluation,
                 "technical_structure": structure_snapshot,
@@ -651,6 +701,8 @@ class ForecastingEngine:
                 "chapter_16_donchian_context": chapter_16_market_context.get("donchian_context", {}),
                 "chapter_16_futures_risk_context": chapter_16_market_context.get("futures_risk_context", {}),
                 "chapter_17_governance_context": chapter_17_governance_context,
+                "jansen_chapter_17_deep_learning": chapter_17_deep_learning,
+                "jansen_chapter_18_cnn": chapter_18_cnn,
                 "chapter_17_llm_decision_packet": chapter_17_governance_context.get("llm_decision_packet", {}),
                 "chapter_17_decision_fragility": chapter_17_governance_context.get("computer_humility", {}).get("decision_fragility", {}),
                 "chapter_18_tactical_problem": chapter_18_tactical_problem,
@@ -746,6 +798,7 @@ class ForecastingEngine:
             include_lightgbm=self.config.include_lightgbm,
             include_statistical_models=self.config.include_statistical_models,
             include_lstm=self.config.include_lstm,
+            deep_learning_profile=self.config.deep_learning_profile,
             search_level=self.config.search_level,
             tuning_mode=self.config.tuning_mode,
             optuna_trials=self.config.optuna_trials,
@@ -975,6 +1028,7 @@ class ForecastingEngine:
             include_lightgbm=self.config.include_lightgbm,
             include_statistical_models=self.config.include_statistical_models,
             include_lstm=self.config.include_lstm,
+            deep_learning_profile=self.config.deep_learning_profile,
             search_level=self.config.search_level,
         )
         validation_results = validate_candidates(

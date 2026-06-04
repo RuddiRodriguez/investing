@@ -110,11 +110,12 @@ def _normalized_frame(prices: pd.DataFrame, target: str) -> pd.DataFrame:
     if not isinstance(frame.index, pd.DatetimeIndex):
         frame.index = pd.to_datetime(frame.index, errors="coerce")
     frame = frame.loc[frame.index.notna()]
-    output = pd.DataFrame(index=pd.DatetimeIndex(frame.index))
+    numeric_columns = {}
     for column in frame.columns:
         converted = pd.to_numeric(frame[column], errors="coerce")
         if converted.notna().any():
-            output[str(column).lower()] = converted
+            numeric_columns[str(column).lower()] = converted
+    output = pd.DataFrame(numeric_columns, index=pd.DatetimeIndex(frame.index))
     return output.dropna(subset=[target]) if target in output.columns else output
 
 

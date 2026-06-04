@@ -14,6 +14,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from market_forecasting_engine.chapter_15_llm_topics import (
+    Chapter15TopicRequest,
+    aggregate_topic_features,
+    chapter_15_registry_entry,
+    extract_llm_topics_for_articles,
+)
+from market_forecasting_engine.chapter_16_text_embeddings import (
+    Chapter16EmbeddingRequest,
+    aggregate_embedding_features,
+    chapter_16_embedding_registry_entry,
+    extract_text_embeddings_for_articles,
+)
 from market_forecasting_engine.data_store import MarketDataStore, frame_sha256, request_key
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 from market_forecasting_engine.openai_responses import call_response
@@ -68,6 +80,14 @@ class AlternativeNewsRequest:
     llm_reasoning_effort: str = DEFAULT_REASONING_EFFORT
     llm_env_file: str | None = None
     llm_timeout_seconds: int = 30
+    topic_mode: str = "llm"
+    topic_max_articles: int = 24
+    topic_max_topics_per_article: int = 3
+    embedding_mode: str = "openai"
+    embedding_model: str | None = None
+    embedding_dimensions: int = 256
+    embedding_max_articles: int = 24
+    embedding_finance_knowledge_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -86,17 +106,86 @@ def collect_alternative_news_features(
     scored_articles, sentiment_metadata = score_news_articles(articles, request)
     raw_frame = pd.DataFrame(scored_articles)
     features = aggregate_news_sentiment_features(raw_frame, target_index)
+    topic_rows: list[dict[str, Any]] = []
+    topic_metadata: dict[str, Any] = {"mode": request.topic_mode, "status": "not_requested"}
+    topic_features = pd.DataFrame(index=pd.DatetimeIndex(target_index))
+    embedding_rows: list[dict[str, Any]] = []
+    embedding_metadata: dict[str, Any] = {"mode": request.embedding_mode, "status": "not_requested"}
+    embedding_features = pd.DataFrame(index=pd.DatetimeIndex(target_index))
+    if request.topic_mode.lower() in {"llm", "openai", "chapter15"}:
+        topic_rows, topic_metadata = extract_llm_topics_for_articles(
+            scored_articles,
+            Chapter15TopicRequest(
+                ticker=request.ticker,
+                max_articles=request.topic_max_articles,
+                max_topics_per_article=request.topic_max_topics_per_article,
+                llm_model=request.llm_model,
+                llm_reasoning_effort=request.llm_reasoning_effort,
+                llm_env_file=request.llm_env_file,
+                llm_timeout_seconds=request.llm_timeout_seconds,
+            ),
+        )
+        topic_features = aggregate_topic_features(topic_rows, target_index)
+        features = features.join(topic_features, how="left")
+    if request.embedding_mode.lower() in {"openai", "llm", "chapter16", "embeddings"}:
+        embedding_request = Chapter16EmbeddingRequest(
+            ticker=request.ticker,
+            model=request.embedding_model,
+            dimensions=request.embedding_dimensions,
+            max_articles=request.embedding_max_articles,
+            llm_env_file=request.llm_env_file,
+            timeout_seconds=request.llm_timeout_seconds,
+            finance_knowledge_path=request.embedding_finance_knowledge_path,
+        )
+        embedding_rows, embedding_metadata = extract_text_embeddings_for_articles(scored_articles, embedding_request)
+        embedding_features = aggregate_embedding_features(embedding_rows, target_index)
+        features = features.join(embedding_features, how="left")
     metadata: dict[str, Any] = {
         "kind": "alternative_news_sentiment",
         "request": request.to_dict(),
         "provider": provider_metadata,
         "sentiment": sentiment_metadata,
+        "topics": topic_metadata,
+        "embeddings": embedding_metadata,
         "article_count": int(len(raw_frame)),
         "feature_columns": [str(column) for column in features.columns],
         "raw_data_hash": frame_sha256(raw_frame) if not raw_frame.empty else None,
         "feature_data_hash": frame_sha256(features) if not features.empty else None,
         "registry": alternative_data_registry_entry(request, raw_frame, features, provider_metadata, sentiment_metadata),
     }
+    if request.topic_mode.lower() in {"llm", "openai", "chapter15"}:
+        topic_frame = pd.DataFrame(topic_rows)
+        metadata["topic_registry"] = chapter_15_registry_entry(
+            Chapter15TopicRequest(
+                ticker=request.ticker,
+                max_articles=request.topic_max_articles,
+                max_topics_per_article=request.topic_max_topics_per_article,
+                llm_model=request.llm_model,
+                llm_reasoning_effort=request.llm_reasoning_effort,
+                llm_env_file=request.llm_env_file,
+                llm_timeout_seconds=request.llm_timeout_seconds,
+            ),
+            topic_frame,
+            topic_features,
+            topic_metadata,
+        )
+    if request.embedding_mode.lower() in {"openai", "llm", "chapter16", "embeddings"}:
+        embedding_request = Chapter16EmbeddingRequest(
+            ticker=request.ticker,
+            model=request.embedding_model,
+            dimensions=request.embedding_dimensions,
+            max_articles=request.embedding_max_articles,
+            llm_env_file=request.llm_env_file,
+            timeout_seconds=request.llm_timeout_seconds,
+            finance_knowledge_path=request.embedding_finance_knowledge_path,
+        )
+        embedding_frame = pd.DataFrame(embedding_rows)
+        metadata["embedding_registry"] = chapter_16_embedding_registry_entry(
+            embedding_request,
+            embedding_frame,
+            embedding_features,
+            embedding_metadata,
+        )
     if store is not None:
         key = request_key({"kind": "alternative_news_sentiment", **request.to_dict()})
         artifacts: dict[str, Any] = {}
@@ -107,6 +196,22 @@ def collect_alternative_news_features(
                 request.ticker,
                 key,
                 _storable_articles(raw_frame),
+            ).to_dict()
+        if topic_rows:
+            artifacts["chapter_15_topics"] = store.write_frame(
+                "raw",
+                "chapter_15_topics",
+                request.ticker,
+                key,
+                pd.DataFrame(topic_rows),
+            ).to_dict()
+        if embedding_rows:
+            artifacts["chapter_16_embeddings"] = store.write_frame(
+                "raw",
+                "chapter_16_embeddings",
+                request.ticker,
+                key,
+                pd.DataFrame(embedding_rows),
             ).to_dict()
         if not features.empty:
             artifacts["features"] = store.write_frame(

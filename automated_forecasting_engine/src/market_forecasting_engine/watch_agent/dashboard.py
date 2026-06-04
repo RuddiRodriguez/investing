@@ -35,6 +35,11 @@ def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
         key = f"{ticker}_{profile}"
         latest_by_key[key] = row
         history_by_key.setdefault(key, []).append(row)
+    for placeholder in _portfolio_placeholders(log_dir):
+        ticker = str(placeholder.get("ticker") or "UNKNOWN")
+        profile = str(placeholder.get("profile") or "default")
+        key = f"{ticker}_{profile}"
+        latest_by_key.setdefault(key, placeholder)
     latest = sorted(latest_by_key.values(), key=lambda row: str(row.get("ticker") or ""))
     histories = {
         key: value[-max_history:]
@@ -48,6 +53,57 @@ def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
         "histories": histories,
         "errors": errors,
     }
+
+
+def _portfolio_placeholders(log_dir: Path) -> list[dict[str, Any]]:
+    context_dir = log_dir.parent / "portfolio_contexts"
+    placeholders = []
+    for path in sorted(context_dir.glob("*.json")):
+        try:
+            context = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(context, dict):
+            continue
+        position = context.get("position", {}) if isinstance(context.get("position"), dict) else {}
+        listing = context.get("listing", {}) if isinstance(context.get("listing"), dict) else {}
+        ticker = str(context.get("ticker") or "").upper()
+        if not ticker:
+            continue
+        profile = _profile_from_context_path(path)
+        placeholders.append(
+            {
+                "checked_at": None,
+                "ticker": ticker,
+                "profile": profile,
+                "holding_status": position.get("holding_status") or "owned",
+                "price": position.get("current_price"),
+                "action": "STARTING",
+                "reason": "Waiting for first watch-agent decision log.",
+                "portfolio_context": context,
+                "portfolio_name": context.get("name"),
+                "portfolio_isin": context.get("isin"),
+                "portfolio_broker": context.get("broker") or "trade_republic",
+                "portfolio_quantity": position.get("quantity"),
+                "portfolio_entry_price": position.get("avg_cost"),
+                "portfolio_position_value": position.get("current_value"),
+                "portfolio_unrealized_pl": position.get("unrealized_pl"),
+                "portfolio_unrealized_pl_pct": position.get("unrealized_pl_pct"),
+                "market_status": "pending_first_check",
+                "asset_class": "crypto" if ticker.endswith(("-USD", "-USDT")) else "stock",
+                "price_provider": listing.get("price_provider"),
+                "forecast_refreshed_this_run": False,
+            }
+        )
+    return placeholders
+
+
+def _profile_from_context_path(path: Path) -> str:
+    stem = path.stem
+    for suffix in ("_aggressive", "_medium", "_conservative"):
+        if stem.endswith(suffix):
+            return suffix.removeprefix("_")
+    return "medium"
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -152,6 +208,7 @@ def dashboard_html(refresh_seconds: int) -> str:
     .BUY {{ background: var(--buy); }}
     .SELL {{ background: var(--sell); }}
     .HOLD {{ background: var(--hold); }}
+    .STARTING {{ background: var(--accent); }}
     .PARSE_ERROR {{ background: var(--sell); }}
     .price {{ font-size: 34px; font-weight: 760; margin: 8px 0 2px; }}
     .reason {{ color: var(--muted); font-size: 14px; min-height: 20px; }}
@@ -242,7 +299,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
     }}
     function cls(action) {{
-      return ["BUY", "SELL", "HOLD", "PARSE_ERROR"].includes(action) ? action : "HOLD";
+      return ["BUY", "SELL", "HOLD", "STARTING", "PARSE_ERROR"].includes(action) ? action : "HOLD";
     }}
     function hasDecisionConflict(row) {{
       const llm = String(row.llm_decision || "").toUpperCase();
@@ -255,6 +312,7 @@ def dashboard_html(refresh_seconds: int) -> str:
           <div>
             <div class="ticker">${{row.ticker || "UNKNOWN"}}</div>
             <div class="profile">${{row.profile || "default"}} · ${{time(row.checked_at)}}</div>
+            ${{row.portfolio_name ? `<div class="profile">${{row.portfolio_name}}</div>` : ""}}
           </div>
           <div>
             <div class="badge-label">Watch alert</div>
@@ -271,6 +329,12 @@ def dashboard_html(refresh_seconds: int) -> str:
           <div class="field"><span>Asset Class</span><strong>${{row.asset_class || "-"}}</strong></div>
           <div class="field"><span>Price Provider</span><strong>${{row.price_provider || "-"}}</strong></div>
           <div class="field"><span>Latest Bar</span><strong>${{time(row.latest_price_time)}}</strong></div>
+          <div class="field"><span>Broker</span><strong>${{row.portfolio_broker || "-"}}</strong></div>
+          <div class="field"><span>ISIN</span><strong>${{row.portfolio_isin || "-"}}</strong></div>
+          <div class="field"><span>Quantity</span><strong>${{money(row.portfolio_quantity)}}</strong></div>
+          <div class="field"><span>Avg Cost</span><strong>${{money(row.portfolio_entry_price)}}</strong></div>
+          <div class="field"><span>Position Value</span><strong>${{money(row.portfolio_position_value)}}</strong></div>
+          <div class="field"><span>Unrealized P/L</span><strong>${{money(row.portfolio_unrealized_pl)}} (${{money(row.portfolio_unrealized_pl_pct)}}%)</strong></div>
           <div class="field"><span>Buy Near</span><strong>${{money(row.buy_near)}}</strong></div>
           <div class="field"><span>Buy Above</span><strong>${{money(row.buy_above)}}</strong></div>
           <div class="field"><span>Sell Near</span><strong>${{money(row.sell_near)}}</strong></div>
@@ -283,13 +347,15 @@ def dashboard_html(refresh_seconds: int) -> str:
     function historyTable(rows) {{
       const all = Object.values(rows.histories || {{}}).flat().sort((a, b) => String(b.checked_at || "").localeCompare(String(a.checked_at || ""))).slice(0, 30);
       if (!all.length) return '<div class="empty">No watch-agent records found.</div>';
-      return `<table><thead><tr><th>Time</th><th>Ticker</th><th>Action</th><th>Market</th><th>Price</th><th>Reason</th><th>Printed</th></tr></thead><tbody>${{all.map(row => `
+      return `<table><thead><tr><th>Time</th><th>Ticker</th><th>Name</th><th>Action</th><th>Market</th><th>Price</th><th>P/L</th><th>Reason</th><th>Printed</th></tr></thead><tbody>${{all.map(row => `
         <tr>
           <td>${{time(row.checked_at)}}</td>
           <td>${{row.ticker || "-"}}</td>
+          <td>${{row.portfolio_name || "-"}}</td>
           <td>${{row.action || "-"}}</td>
           <td>${{row.market_status || "-"}}</td>
           <td>${{money(row.price)}}</td>
+          <td>${{money(row.portfolio_unrealized_pl)}}</td>
           <td>${{row.reason || "-"}}</td>
           <td>${{row.printed ? "yes" : "no"}}</td>
         </tr>`).join("")}}</tbody></table>`;

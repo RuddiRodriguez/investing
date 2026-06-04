@@ -78,7 +78,13 @@ def main() -> None:
     parser.add_argument("--security-master-csv", default=None, help="Optional security master CSV with ticker metadata.")
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")
     parser.add_argument("--no-statistical-models", action="store_true", help="Disable optional ARIMA/SARIMA/GARCH/VAR candidates.")
-    parser.add_argument("--include-lstm", action="store_true", help="Enable the optional LSTM candidate. Slower because it trains during validation.")
+    parser.add_argument("--include-lstm", action="store_true", help="Backward-compatible flag to enable the optional LSTM candidate. Slower because it trains during validation.")
+    parser.add_argument(
+        "--deep-learning-profile",
+        choices=("off", "fast", "research"),
+        default="off",
+        help="Chapter 17 optional deep-learning candidate profile. Off by default; research includes the slower LSTM path.",
+    )
     parser.add_argument("--search-level", choices=("fast", "expanded"), default="fast", help="Candidate tuning breadth.")
     parser.add_argument("--tune", choices=("fixed", "optuna"), default="fixed", help="Candidate tuning mode. `optuna` adds nested time-series optimization candidates.")
     parser.add_argument("--optuna-trials", type=int, default=25, help="Optuna trials per tuned candidate fit.")
@@ -86,7 +92,7 @@ def main() -> None:
     parser.add_argument("--optuna-inner-splits", type=int, default=3, help="Inner walk-forward splits used inside each Optuna objective.")
     parser.add_argument(
         "--optuna-families",
-        default="lightgbm,elastic_net,random_forest,gradient_boosting",
+        default="lightgbm,xgboost,elastic_net,random_forest,extra_trees,gradient_boosting",
         help="Comma-separated Optuna model families to tune.",
     )
     parser.add_argument(
@@ -132,6 +138,28 @@ def main() -> None:
         default="lexicon",
         help="News sentiment scoring mode. Hybrid blends deterministic scoring with optional LLM classification.",
     )
+    parser.add_argument(
+        "--alt-news-topic-mode",
+        choices=("none", "llm"),
+        default="llm",
+        help="Chapter 15 topic extraction mode. Defaults to llm; use none to disable controlled financial topic extraction.",
+    )
+    parser.add_argument("--alt-news-topic-max-articles", type=int, default=24)
+    parser.add_argument("--alt-news-topic-max-topics-per-article", type=int, default=3)
+    parser.add_argument(
+        "--alt-news-embedding-mode",
+        choices=("openai", "none"),
+        default="openai",
+        help="Chapter 16 text embedding mode. Defaults to openai; use none to disable semantic embedding features.",
+    )
+    parser.add_argument("--alt-news-embedding-model", default=None, help="Embedding model for Chapter 16 semantic features.")
+    parser.add_argument("--alt-news-embedding-dimensions", type=int, default=256)
+    parser.add_argument("--alt-news-embedding-max-articles", type=int, default=24)
+    parser.add_argument(
+        "--alt-news-embedding-finance-knowledge-json",
+        default=None,
+        help="Optional JSON object of finance-domain prototype labels to text descriptions for Chapter 16 similarity features.",
+    )
     parser.add_argument("--universe-csv", default=None, help="Optional universe CSV with ticker/symbol column for panel metadata.")
     parser.add_argument("--universe-tickers", default=None, help="Optional comma-separated universe tickers for panel metadata.")
     parser.add_argument("--build-panel", action="store_true", help="Fetch and store a date/ticker panel for the supplied universe.")
@@ -154,6 +182,7 @@ def main() -> None:
         include_lightgbm=not args.no_lightgbm,
         include_statistical_models=not args.no_statistical_models,
         include_lstm=args.include_lstm,
+        deep_learning_profile=args.deep_learning_profile,
         search_level=args.search_level,
         tuning_mode=args.tune,
         optuna_trials=args.optuna_trials,
@@ -270,6 +299,14 @@ def main() -> None:
                 llm_reasoning_effort=args.llm_reasoning_effort,
                 llm_env_file=args.llm_env_file,
                 llm_timeout_seconds=args.llm_timeout,
+                topic_mode=args.alt_news_topic_mode,
+                topic_max_articles=args.alt_news_topic_max_articles,
+                topic_max_topics_per_article=args.alt_news_topic_max_topics_per_article,
+                embedding_mode=args.alt_news_embedding_mode,
+                embedding_model=args.alt_news_embedding_model,
+                embedding_dimensions=args.alt_news_embedding_dimensions,
+                embedding_max_articles=args.alt_news_embedding_max_articles,
+                embedding_finance_knowledge_path=args.alt_news_embedding_finance_knowledge_json,
             ),
             target_index=pd.DatetimeIndex(prices.index),
             store=data_store,

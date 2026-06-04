@@ -48,6 +48,7 @@ def main() -> None:
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")
     parser.add_argument("--no-statistical-models", action="store_true", help="Disable optional ARIMA/SARIMA/GARCH/VAR candidates.")
     parser.add_argument("--include-lstm", action="store_true", help="Enable optional LSTM candidate.")
+    parser.add_argument("--deep-learning-profile", choices=("off", "fast", "research"), default="off", help="Optional Chapter 17 deep-learning candidate profile.")
     parser.add_argument("--search-level", choices=("fast", "expanded"), default="fast", help="Candidate tuning breadth.")
     parser.add_argument("--tune", choices=("fixed", "optuna"), default="fixed", help="Candidate tuning mode. `optuna` adds nested time-series optimization candidates.")
     parser.add_argument("--optuna-trials", type=int, default=25, help="Optuna trials per tuned candidate fit.")
@@ -55,7 +56,7 @@ def main() -> None:
     parser.add_argument("--optuna-inner-splits", type=int, default=3, help="Inner walk-forward splits used inside each Optuna objective.")
     parser.add_argument(
         "--optuna-families",
-        default="lightgbm,elastic_net,random_forest,gradient_boosting",
+        default="lightgbm,xgboost,elastic_net,random_forest,extra_trees,gradient_boosting",
         help="Comma-separated Optuna model families to tune.",
     )
     args = parser.parse_args()
@@ -197,6 +198,7 @@ def _run_symbol_forecast(
         include_lightgbm=not args.no_lightgbm,
         include_statistical_models=not args.no_statistical_models,
         include_lstm=args.include_lstm,
+        deep_learning_profile=args.deep_learning_profile,
         search_level=args.search_level,
         tuning_mode=args.tune,
         optuna_trials=args.optuna_trials,

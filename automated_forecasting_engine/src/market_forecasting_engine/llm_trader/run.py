@@ -165,6 +165,7 @@ def run_forecast(args, output_dir):
         include_lightgbm=not args.no_lightgbm,
         include_statistical_models=not args.no_statistical_models,
         include_lstm=args.include_lstm,
+        deep_learning_profile=getattr(args, "deep_learning_profile", "off"),
         llm_env_file=args.llm_env_file,
     )
     provider = (args.provider or ("csv" if args.csv else "yahoo")).lower()

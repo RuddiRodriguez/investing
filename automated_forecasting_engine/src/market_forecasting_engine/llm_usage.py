@@ -21,6 +21,9 @@ DEFAULT_OPENAI_PRICE_PER_1M = {
     "gpt-5.4-pro": {"input_per_1m": 30.00, "output_per_1m": 180.00},
     "gpt-4o-mini": {"input_per_1m": 0.15, "cached_input_per_1m": 0.075, "output_per_1m": 0.60},
     "gpt-4o": {"input_per_1m": 2.50, "cached_input_per_1m": 1.25, "output_per_1m": 10.00},
+    "text-embedding-3-small": {"input_per_1m": 0.02, "output_per_1m": 0.00},
+    "text-embedding-3-large": {"input_per_1m": 0.13, "output_per_1m": 0.00},
+    "text-embedding-ada-002": {"input_per_1m": 0.10, "output_per_1m": 0.00},
 }
 DEFAULT_OPENAI_TOOL_PRICE_PER_1K_CALLS = {
     "web_search": 10.00,
@@ -94,6 +97,50 @@ def log_openai_usage(
         return
 
 
+def log_openai_embedding_usage(
+    *,
+    call_id: str,
+    model: str,
+    payload: dict[str, Any],
+    response_data: dict[str, Any] | None = None,
+    started_ms: float | None = None,
+    status: str = "ok",
+    error: str | None = None,
+    context: dict[str, Any] | None = None,
+    api_key: str | None = None,
+) -> None:
+    routing = _usage_routing(context or {})
+    path = usage_log_path(branch_name=routing["branch"], process_name=routing["process"])
+    usage = _extract_embedding_usage(response_data or {})
+    request = _embedding_request_summary(payload)
+    cost = _estimated_cost_usd(model, usage, request)
+    record = {
+        "logged_at_utc": datetime.now(UTC).isoformat(),
+        "call_id": call_id,
+        "status": status,
+        "model": model,
+        "response_id": (response_data or {}).get("id"),
+        "routing": routing,
+        "api_key": _api_key_report(api_key or os.getenv("OPENAI_API_KEY")),
+        "usage": usage,
+        "estimated_cost_usd": cost["estimated_cost_usd"],
+        "cost_breakdown": cost,
+        "pricing_source": PRICING_SOURCE_URL,
+        "request": request,
+        "duration_ms": round(monotonic_ms() - started_ms, 2) if started_ms is not None else None,
+        "caller": _caller_context(),
+        "context": context or {},
+    }
+    if error:
+        record["error"] = str(error)[:500]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    except Exception:
+        return
+
+
 def _extract_usage(response_data: dict[str, Any]) -> dict[str, Any]:
     usage = response_data.get("usage") or {}
     if not isinstance(usage, dict):
@@ -108,6 +155,20 @@ def _extract_usage(response_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _extract_embedding_usage(response_data: dict[str, Any]) -> dict[str, Any]:
+    usage = response_data.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {}
+    prompt_tokens = usage.get("prompt_tokens")
+    total_tokens = usage.get("total_tokens")
+    return {
+        "input_tokens": prompt_tokens,
+        "output_tokens": 0,
+        "total_tokens": total_tokens if total_tokens is not None else prompt_tokens,
+        "prompt_tokens": prompt_tokens,
+    }
+
+
 def _request_summary(payload: dict[str, Any]) -> dict[str, Any]:
     tools = payload.get("tools") or []
     text = payload.get("text") or {}
@@ -118,6 +179,19 @@ def _request_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "text_format": (text.get("format") or {}).get("name") if isinstance(text, dict) else None,
         "has_reasoning": "reasoning" in payload,
         "store": payload.get("store"),
+    }
+
+
+def _embedding_request_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    inputs = payload.get("input") or []
+    return {
+        "api": "embeddings",
+        "input_count": len(inputs) if isinstance(inputs, list) else 1,
+        "dimensions": payload.get("dimensions"),
+        "encoding_format": payload.get("encoding_format", "float"),
+        "store": False,
+        "tool_count": 0,
+        "tools": [],
     }
 
 

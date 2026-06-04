@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
 from market_forecasting_engine.llm_trader.run import load_env, run_autonomous_trader
@@ -47,12 +48,20 @@ def build_parser():
     parser.add_argument("--no-lightgbm", action="store_true")
     parser.add_argument("--no-statistical-models", action="store_true")
     parser.add_argument("--include-lstm", action="store_true")
+    parser.add_argument(
+        "--deep-learning-profile",
+        choices=("off", "fast", "research"),
+        default="off",
+        help="Optional Chapter 17 deep-learning profile for forecast refresh. Off by default for live watch agents.",
+    )
     parser.add_argument("--trader-name", default="watch_agent_startup_trader")
     parser.add_argument("--entry-price", type=float, default=None)
     parser.add_argument("--quantity", type=float, default=None)
     parser.add_argument("--position-value", type=float, default=None)
     parser.add_argument("--account-equity", type=float, default=None)
     parser.add_argument("--portfolio-notes", default="")
+    parser.add_argument("--portfolio-context-json", default=None, help="JSON object with broker/portfolio context for this ticker.")
+    parser.add_argument("--portfolio-context-file", default=None, help="JSON file with broker/portfolio context for this ticker.")
     parser.add_argument("--write-plots", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--llm-model", default=None, help=f"Defaults to OPENAI_MODEL or {DEFAULT_OPENAI_MODEL}.")
@@ -79,6 +88,8 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     load_env(args.llm_env_file)
+    args.portfolio_context = load_portfolio_context(args)
+    apply_portfolio_context_to_args(args)
     progress(
         args,
         "START",
@@ -241,6 +252,7 @@ def write_memory(state_path, args, decision_path, source):
         "decision_file": str(Path(decision_path)),
         "run_dir": str(Path(decision_path).parent),
         "force_refresh": bool(args.force_refresh),
+        "portfolio_context": getattr(args, "portfolio_context", {}) or {},
     }
     if existing.get("ticker") == memory["ticker"] and existing.get("profile") == memory["profile"] and existing.get("last_check"):
         memory["last_check"] = existing["last_check"]
@@ -285,6 +297,18 @@ def append_decision_log(args, memory, decision, price, action, reason, printed=N
         "stop_loss": entry.get("stop_loss"),
         "take_profit": entry.get("take_profit"),
     }
+    portfolio_context = getattr(args, "portfolio_context", {}) or memory.get("portfolio_context") or {}
+    if portfolio_context:
+        record["portfolio_context"] = portfolio_context
+        position = portfolio_context.get("position", {}) if isinstance(portfolio_context, dict) else {}
+        record["portfolio_name"] = portfolio_context.get("name") or position.get("name")
+        record["portfolio_isin"] = portfolio_context.get("isin") or position.get("isin")
+        record["portfolio_broker"] = portfolio_context.get("broker") or "trade_republic"
+        record["portfolio_quantity"] = position.get("quantity")
+        record["portfolio_entry_price"] = position.get("avg_cost")
+        record["portfolio_position_value"] = position.get("current_value")
+        record["portfolio_unrealized_pl"] = position.get("unrealized_pl")
+        record["portfolio_unrealized_pl_pct"] = position.get("unrealized_pl_pct")
     if market_status:
         record["asset_class"] = market_status.get("asset_class")
         record["market_status"] = market_status.get("market_status")
@@ -455,6 +479,10 @@ def update_last_check_memory(args, memory, price, action, reason, printed, log_p
         "printed": bool(printed),
         "log_file": str(log_path),
     }
+    portfolio_context = getattr(args, "portfolio_context", {}) or memory.get("portfolio_context") or {}
+    if portfolio_context:
+        updated["portfolio_context"] = portfolio_context
+        updated["last_check"]["portfolio_context"] = portfolio_context
     if market_status:
         updated["last_check"]["asset_class"] = market_status.get("asset_class")
         updated["last_check"]["market_status"] = market_status.get("market_status")
@@ -545,13 +573,68 @@ def _stock_market_is_open(calendar="XNYS"):
             return True, f"{calendar} is open."
         return False, f"{calendar} is closed."
     except Exception:
-        weekday = now_utc.weekday()
-        open_time = dt_time(14, 30)
-        close_time = dt_time(21, 0)
-        current = now_utc.time()
-        is_open = weekday < 5 and open_time <= current <= close_time
-        reason = "fallback weekday UTC session is open." if is_open else "fallback weekday UTC session is closed."
+        is_open, reason = _fallback_market_is_open(calendar, now_utc)
         return is_open, reason
+
+
+def _fallback_market_is_open(calendar="XNYS", now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    specs = {
+        "XNYS": ("America/New_York", dt_time(9, 30), dt_time(16, 0)),
+        "XNAS": ("America/New_York", dt_time(9, 30), dt_time(16, 0)),
+        "XAMS": ("Europe/Amsterdam", dt_time(9, 0), dt_time(17, 30)),
+        "XETR": ("Europe/Berlin", dt_time(9, 0), dt_time(17, 30)),
+        "XFRA": ("Europe/Berlin", dt_time(8, 0), dt_time(22, 0)),
+        "XTSE": ("America/Toronto", dt_time(9, 30), dt_time(16, 0)),
+    }
+    timezone_name, open_time, close_time = specs.get(str(calendar or "XNYS").upper(), specs["XNYS"])
+    local_now = now_utc.astimezone(ZoneInfo(timezone_name))
+    is_open = local_now.weekday() < 5 and open_time <= local_now.time() <= close_time
+    reason = (
+        f"fallback {calendar} session is open in {timezone_name}."
+        if is_open
+        else f"fallback {calendar} session is closed in {timezone_name}."
+    )
+    return is_open, reason
+
+
+def load_portfolio_context(args):
+    payload = None
+    if args.portfolio_context_file:
+        payload = Path(args.portfolio_context_file).read_text(encoding="utf-8")
+    elif args.portfolio_context_json:
+        payload = args.portfolio_context_json
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid portfolio context JSON: {exc}") from exc
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def apply_portfolio_context_to_args(args):
+    context = getattr(args, "portfolio_context", {}) or {}
+    position = context.get("position", {}) if isinstance(context, dict) else {}
+    if args.quantity is None and position.get("quantity") is not None:
+        args.quantity = number(position.get("quantity"))
+    if args.entry_price is None and position.get("avg_cost") is not None:
+        args.entry_price = number(position.get("avg_cost"))
+    if args.position_value is None and position.get("current_value") is not None:
+        args.position_value = number(position.get("current_value"))
+    summary = context.get("portfolio_summary", {}) if isinstance(context, dict) else {}
+    if args.account_equity is None and summary.get("total_current_value") is not None:
+        args.account_equity = number(summary.get("total_current_value"))
+    if context and not args.portfolio_notes:
+        compact = {
+            "broker": context.get("broker"),
+            "name": context.get("name"),
+            "isin": context.get("isin"),
+            "ticker": context.get("ticker"),
+            "listing": context.get("listing"),
+            "position": position,
+        }
+        args.portfolio_notes = json.dumps(compact, sort_keys=True)
 
 
 def pd_timestamp_utc(value):

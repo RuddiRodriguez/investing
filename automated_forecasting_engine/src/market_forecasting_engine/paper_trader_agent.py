@@ -80,7 +80,19 @@ def run_once(args: argparse.Namespace, state_dir: Path) -> dict[str, Any]:
     _progress(args, "DATA", "updating Alpaca price cache", symbol=symbol, interval=args.data_interval)
     prices = update_cached_prices(args, state_dir)
     latest_price = float(prices["close"].iloc[-1])
-    _progress(args, "DATA", "price cache updated", rows=len(prices), latest_price=round(latest_price, 6), latest_timestamp=str(prices.index[-1]))
+    price_cache_status = prices.attrs.get("price_cache_status", "updated")
+    if price_cache_status != "updated":
+        _progress(
+            args,
+            "DATA",
+            "using cached prices after provider fetch failed",
+            rows=len(prices),
+            latest_price=round(latest_price, 6),
+            latest_timestamp=str(prices.index[-1]),
+            reason=prices.attrs.get("price_cache_error"),
+        )
+    else:
+        _progress(args, "DATA", "price cache updated", rows=len(prices), latest_price=round(latest_price, 6), latest_timestamp=str(prices.index[-1]))
     state = _read_state(state_dir, args.ticker, args.risk_profile)
     forecast_record = state.get("last_forecast")
     now = datetime.now(UTC)
@@ -139,6 +151,11 @@ def run_once(args: argparse.Namespace, state_dir: Path) -> dict[str, Any]:
         "risk_profile": profile.to_dict(),
         "latest_price": latest_price,
         "cache_rows": int(len(prices)),
+        "price_cache": {
+            "status": price_cache_status,
+            "latest_timestamp": str(prices.index[-1]),
+            "error": prices.attrs.get("price_cache_error"),
+        },
         "forecast": forecast_record,
         "broker_state": _broker_state_for_log(broker_state),
         "decision": decision,
@@ -159,19 +176,31 @@ def update_cached_prices(args: argparse.Namespace, state_dir: Path) -> pd.DataFr
     else:
         last_timestamp = pd.Timestamp(existing.index[-1])
         start = (last_timestamp - pd.Timedelta(minutes=2)).isoformat()
-    result = load_prices_with_provider(
-        "alpaca",
-        DataRequest(ticker=args.ticker, start=start, interval=args.data_interval, target_column="close"),
-        store=None,
-        use_cache=False,
-        refresh_cache=True,
-    )
+    try:
+        result = load_prices_with_provider(
+            "alpaca",
+            DataRequest(ticker=args.ticker, start=start, interval=args.data_interval, target_column="close"),
+            store=None,
+            use_cache=False,
+            refresh_cache=True,
+        )
+    except Exception as exc:
+        if len(existing) >= int(args.minimum_cache_rows):
+            fallback = existing.copy()
+            fallback.attrs["price_cache_status"] = "fallback_cached_after_fetch_error"
+            fallback.attrs["price_cache_error"] = f"{type(exc).__name__}: {exc}"
+            return fallback
+        raise RuntimeError(
+            f"Alpaca price fetch failed and cache has only {len(existing)} rows "
+            f"(< minimum_cache_rows={int(args.minimum_cache_rows)}): {type(exc).__name__}: {exc}"
+        ) from exc
     fetched = normalize_price_frame(result.frame, target_column="close")
     combined = pd.concat([existing, fetched]).sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
     combined = combined.tail(max(int(args.minimum_cache_rows) * 10, 5000))
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(cache_path, index_label="timestamp")
+    combined.attrs["price_cache_status"] = "updated"
     return combined
 
 

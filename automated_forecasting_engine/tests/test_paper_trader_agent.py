@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import argparse
 
-from market_forecasting_engine.paper_trader_agent import _alpaca_symbol, _derivative_intent, build_order_plan, decide_order
+import pytest
+
+import market_forecasting_engine.paper_trader_agent as paper_trader_agent
+from market_forecasting_engine.paper_trader_agent import (
+    _alpaca_symbol,
+    _derivative_intent,
+    build_order_plan,
+    decide_order,
+    update_cached_prices,
+)
 
 
 def _args(**overrides):
@@ -21,6 +30,10 @@ def _args(**overrides):
         "trailing_stop_percent": None,
         "enable_protective_exit": False,
         "enable_llm_decision": False,
+        "ticker": "ETH-USD",
+        "data_interval": "1m",
+        "initial_lookback_hours": 24,
+        "minimum_cache_rows": 2,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -29,6 +42,43 @@ def _args(**overrides):
 def test_alpaca_symbol_converts_crypto_dash_symbol() -> None:
     assert _alpaca_symbol("ETH-USD") == "ETH/USD"
     assert _alpaca_symbol("BTC/USD") == "BTC/USD"
+
+
+def test_update_cached_prices_uses_existing_cache_when_alpaca_fetch_fails(monkeypatch, tmp_path) -> None:
+    cache_path = tmp_path / "cache" / "ETH_USD_1m.csv"
+    cache_path.parent.mkdir()
+    cache_path.write_text(
+        "\n".join(
+            [
+                "timestamp,open,high,low,close,volume",
+                "2026-06-02T10:00:00,2000,2001,1999,2000.5,10",
+                "2026-06-02T10:01:00,2001,2002,2000,2001.5,11",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_fetch(*args, **kwargs):
+        raise RuntimeError("temporary dns failure")
+
+    monkeypatch.setattr(paper_trader_agent, "load_prices_with_provider", fail_fetch)
+
+    frame = update_cached_prices(_args(), tmp_path)
+
+    assert frame["close"].iloc[-1] == 2001.5
+    assert frame.attrs["price_cache_status"] == "fallback_cached_after_fetch_error"
+    assert "temporary dns failure" in frame.attrs["price_cache_error"]
+
+
+def test_update_cached_prices_fails_clearly_without_cache_when_alpaca_fetch_fails(monkeypatch, tmp_path) -> None:
+    def fail_fetch(*args, **kwargs):
+        raise RuntimeError("temporary dns failure")
+
+    monkeypatch.setattr(paper_trader_agent, "load_prices_with_provider", fail_fetch)
+
+    with pytest.raises(RuntimeError, match="Alpaca price fetch failed and cache has only 0 rows"):
+        update_cached_prices(_args(), tmp_path)
 
 
 def test_derivative_intent_maps_edge_to_call_put_or_no_trade() -> None:

@@ -12,16 +12,26 @@ from market_forecasting_engine.data import data_version_hash, enrich_price_frame
 from market_forecasting_engine.data_manifest import build_data_manifest
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
 from market_forecasting_engine import data_providers
+from market_forecasting_engine import chapter_15_llm_topics
+from market_forecasting_engine import chapter_16_text_embeddings
 from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.data_store import MarketDataStore
 from market_forecasting_engine.alternative_data import (
     AlternativeNewsRequest,
     aggregate_news_sentiment_features,
+    aggregate_topic_features,
     alternative_data_registry_entry,
+    collect_alternative_news_features,
     fetch_news_articles,
     fetch_openai_web_news_and_social,
     fetch_yfinance_news,
     score_news_articles,
+)
+from market_forecasting_engine.chapter_15_llm_topics import Chapter15TopicRequest, extract_llm_topics_for_articles
+from market_forecasting_engine.chapter_16_text_embeddings import (
+    Chapter16EmbeddingRequest,
+    aggregate_embedding_features,
+    extract_text_embeddings_for_articles,
 )
 from market_forecasting_engine.feature_registry import build_feature_registry
 from market_forecasting_engine.features import add_forward_return_targets, build_feature_frame
@@ -316,6 +326,218 @@ def test_alternative_news_sentiment_features_are_point_in_time() -> None:
     assert features.loc[pd.Timestamp("2024-01-04"), "alt_news_negative_share_1d"] > 0.0
     assert registry["point_in_time_safe"] is True
     assert registry["collection_method"] == "download_or_scrape"
+
+
+def test_chapter_15_llm_topics_are_controlled_and_aggregated(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    articles = [
+        {
+            "ticker": "ASML",
+            "published_at": "2024-01-02T09:00:00+00:00",
+            "date": "2024-01-02",
+            "title": "ASML faces new export control pressure",
+            "summary": "Dutch export rules may restrict China shipments.",
+            "source": "Example",
+            "source_category": "news",
+            "url": "https://example.com/1",
+        }
+    ]
+
+    def fake_call_response(**kwargs):
+        return {}, {"id": "resp-test"}, {
+            "articles": [
+                {
+                    "id": 0,
+                    "classification_reasoning": "Article is about export restrictions.",
+                    "topics": [
+                        {
+                            "topic": "export controls",
+                            "taxonomy_id": "regulation_policy",
+                            "sentiment_label": "NEGATIVE",
+                            "sentiment_score": -0.7,
+                            "relevance_score": 0.9,
+                            "impact_horizon": "medium_term",
+                            "evidence": "restrict China shipments",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(chapter_15_llm_topics, "call_response", fake_call_response)
+
+    topics, metadata = extract_llm_topics_for_articles(articles, Chapter15TopicRequest(ticker="ASML"))
+    features = aggregate_topic_features(topics, pd.date_range("2024-01-01", periods=4, freq="D"))
+
+    assert metadata["status"] == "executed"
+    assert topics[0]["taxonomy_id"] == "regulation_policy"
+    assert topics[0]["sentiment_label"] == "NEGATIVE"
+    assert features.loc[pd.Timestamp("2024-01-02"), "alt_topic_regulation_policy_1d"] == 0.9
+    assert features.loc[pd.Timestamp("2024-01-02"), "alt_topic_negative_regulation_policy_1d"] == 0.9
+
+
+def test_collect_alternative_news_features_can_add_chapter_15_topic_features(monkeypatch) -> None:
+    def fake_fetch_news_articles(request):
+        return [
+            {
+                "ticker": request.ticker.upper(),
+                "published_at": "2024-01-02T09:00:00+00:00",
+                "date": "2024-01-02",
+                "title": "ASML launches AI lithography upgrade",
+                "summary": "The new product improves chipmaking productivity.",
+                "source": "Example",
+                "source_category": "news",
+                "url": "https://example.com/asml",
+            }
+        ], {"status": "ok", "name": "test"}
+
+    def fake_extract_topics(articles, request):
+        return [
+            {
+                "ticker": "ASML",
+                "published_at": "2024-01-02T09:00:00+00:00",
+                "date": "2024-01-02",
+                "title": "ASML launches AI lithography upgrade",
+                "source": "Example",
+                "source_category": "news",
+                "url": "https://example.com/asml",
+                "topic": "AI lithography upgrade",
+                "taxonomy_id": "product_technology",
+                "sentiment_label": "POSITIVE",
+                "sentiment_score": 0.8,
+                "relevance_score": 1.0,
+                "impact_horizon": "medium_term",
+                "evidence": "improves productivity",
+                "topic_method": "llm_controlled_taxonomy",
+                "prompt_version": "chapter_15_llm_topic_modeling_v1",
+            }
+        ], {"status": "executed", "model": "test-model", "topic_count": 1}
+
+    monkeypatch.setattr("market_forecasting_engine.alternative_data.fetch_news_articles", fake_fetch_news_articles)
+    monkeypatch.setattr("market_forecasting_engine.alternative_data.extract_llm_topics_for_articles", fake_extract_topics)
+
+    features, metadata = collect_alternative_news_features(
+        AlternativeNewsRequest(ticker="ASML", provider="test", topic_mode="llm"),
+        pd.date_range("2024-01-01", periods=3, freq="D"),
+    )
+
+    assert "alt_topic_product_technology_1d" in features.columns
+    assert features.loc[pd.Timestamp("2024-01-02"), "alt_topic_positive_product_technology_1d"] == 1.0
+    assert metadata["topics"]["status"] == "executed"
+    assert metadata["topic_registry"]["name"] == "chapter_15_llm_topic_modeling"
+
+
+def test_alternative_news_request_defaults_to_chapter_15_llm_topics() -> None:
+    assert AlternativeNewsRequest(ticker="ASML").topic_mode == "llm"
+
+
+def test_alternative_news_request_defaults_to_chapter_16_embeddings() -> None:
+    request = AlternativeNewsRequest(ticker="ASML")
+
+    assert request.embedding_mode == "openai"
+    assert request.embedding_dimensions == 256
+
+
+def test_chapter_16_embeddings_are_controlled_and_aggregated(monkeypatch) -> None:
+    articles = [
+        {
+            "date": "2024-01-02",
+            "published_at": "2024-01-02T12:00:00Z",
+            "ticker": "ASML",
+            "source": "test",
+            "title": "ASML raises guidance on stronger EUV demand",
+            "summary": "Margins improve as customers accelerate orders.",
+        },
+        {
+            "date": "2024-01-03",
+            "published_at": "2024-01-03T12:00:00Z",
+            "ticker": "ASML",
+            "source": "test",
+            "title": "Export controls create regulatory uncertainty",
+            "summary": "Investors weigh new licensing risk.",
+        },
+    ]
+
+    class FakeEmbeddings:
+        def create(self, **payload):
+            data = []
+            for index, _ in enumerate(payload["input"]):
+                vector = [0.0] * 8
+                vector[index % 8] = 1.0
+                data.append({"object": "embedding", "index": index, "embedding": vector})
+            return {
+                "id": "emb_test",
+                "object": "list",
+                "data": data,
+                "model": payload["model"],
+                "usage": {"prompt_tokens": 20, "total_tokens": 20},
+            }
+
+    class FakeOpenAI:
+        def __init__(self, api_key, timeout):
+            self.api_key = api_key
+            self.embeddings = FakeEmbeddings()
+
+    fake_module = types.SimpleNamespace(OpenAI=FakeOpenAI)
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(chapter_16_text_embeddings, "log_openai_embedding_usage", lambda **kwargs: None)
+
+    rows, metadata = extract_text_embeddings_for_articles(
+        articles,
+        Chapter16EmbeddingRequest(ticker="ASML", dimensions=8, max_articles=2),
+    )
+    features = aggregate_embedding_features(rows, pd.date_range("2024-01-01", periods=5, freq="D"))
+
+    assert metadata["status"] == "executed"
+    assert rows[0]["chapter_16_method"] == "openai_text_embedding_finance_prototypes"
+    assert "finance_earnings_upside_similarity" in rows[0]
+    assert "alt_embed_component_0_7d" in features.columns
+    assert "alt_embed_earnings_upside_similarity_7d" in features.columns
+    assert features.loc[pd.Timestamp("2024-01-02"), "alt_embed_article_count_1d"] == 1.0
+
+
+def test_collect_alternative_news_features_can_add_chapter_16_embedding_features(monkeypatch) -> None:
+    articles = [
+        {
+            "date": "2024-01-02",
+            "published_at": "2024-01-02T12:00:00Z",
+            "ticker": "ASML",
+            "source": "test",
+            "source_category": "news",
+            "title": "ASML wins new orders",
+            "summary": "Demand improves.",
+            "url": "https://example.com/a",
+        }
+    ]
+
+    monkeypatch.setattr("market_forecasting_engine.alternative_data.fetch_news_articles", lambda request: (articles, {"status": "ok"}))
+    monkeypatch.setattr("market_forecasting_engine.alternative_data.extract_llm_topics_for_articles", lambda articles, request: ([], {"status": "skipped"}))
+
+    def fake_extract_embeddings(articles, request):
+        return [
+            {
+                "date": "2024-01-02",
+                "published_at": "2024-01-02T12:00:00Z",
+                "article_id": "a",
+                "embedding": [1.0, 0.0, 0.0, 0.0],
+                "semantic_novelty": 0.1,
+                "semantic_dispersion": 0.0,
+                "finance_earnings_upside_similarity": 0.8,
+                "chapter_16_method": "openai_text_embedding_finance_prototypes",
+            }
+        ], {"status": "executed", "model": "test-embedding", "dimensions": 4}
+
+    monkeypatch.setattr("market_forecasting_engine.alternative_data.extract_text_embeddings_for_articles", fake_extract_embeddings)
+    features, metadata = collect_alternative_news_features(
+        AlternativeNewsRequest(ticker="ASML", provider="test", topic_mode="none", embedding_mode="openai"),
+        pd.date_range("2024-01-01", periods=4, freq="D"),
+    )
+
+    assert metadata["embeddings"]["status"] == "executed"
+    assert metadata["embedding_registry"]["name"] == "chapter_16_text_embeddings"
+    assert "alt_embed_component_0_7d" in features.columns
+    assert features.loc[pd.Timestamp("2024-01-02"), "alt_embed_earnings_upside_similarity_7d"] == 0.8
 
 
 def test_openai_web_alternative_provider_skips_without_api_key(monkeypatch) -> None:

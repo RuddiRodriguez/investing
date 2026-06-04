@@ -22,6 +22,9 @@ from market_forecasting_engine.schema import CandidateValidation
 LOWER_IS_BETTER = {"rmse", "mae", "mape", "smape", "aic", "bic", "composite"}
 HIGHER_IS_BETTER = {"directional_accuracy", "sharpe_ratio", "hit_rate", "profit_factor"}
 TIME_SERIES_FAMILIES = {"classical_forecasting", "volatility_model", "multivariate_time_series", "state_space_model"}
+TREE_MODEL_FAMILIES = {"tree_model", "tree_ensemble"}
+BOOSTING_MODEL_FAMILIES = {"boosting_model"}
+DEEP_LEARNING_FAMILIES = {"deep_learning"}
 
 
 def make_walk_forward_splits(
@@ -120,6 +123,8 @@ def validate_candidate(
     metrics["purge_window"] = float(purge_window)
     metrics["embargo_window"] = float(embargo_window)
     metrics["final_holdout_rows"] = float(len(holdout_target))
+    metrics["validation_rows"] = float(len(validation_predictions))
+    metrics["parameter_count"] = float(candidate.parameter_count(features.shape[1]))
 
     if len(holdout_target) > 0:
         holdout_model = candidate.clone().fit(cv_features, cv_target)
@@ -235,17 +240,36 @@ def apply_ml4t_selection_adjustments(
         chapter_6_penalty, chapter_6_notes = _chapter_6_process_penalty(metrics)
         chapter_8_penalty, chapter_8_notes = _chapter_8_backtest_penalty(metrics)
         chapter_10_penalty, chapter_10_notes = _chapter_10_bayesian_penalty(metrics, predictions)
+        chapter_11_penalty, chapter_11_notes = _chapter_11_tree_penalty(candidate=candidate, metrics=metrics, predictions=predictions)
+        chapter_12_penalty, chapter_12_notes = _chapter_12_boosting_penalty(candidate=candidate, metrics=metrics, predictions=predictions)
+        chapter_17_penalty, chapter_17_notes = _chapter_17_deep_learning_penalty(
+            candidate=candidate,
+            metrics=metrics,
+            predictions=predictions,
+        )
         chapter_9_penalty, chapter_9_notes = _chapter_9_penalty(
             candidate=candidate,
             predictions=predictions,
             target_diagnostics=target_diagnostics,
         )
-        penalty = min(chapter_6_penalty + chapter_8_penalty + chapter_9_penalty + chapter_10_penalty, 0.75)
+        penalty = min(
+            chapter_6_penalty
+            + chapter_8_penalty
+            + chapter_9_penalty
+            + chapter_10_penalty
+            + chapter_11_penalty
+            + chapter_12_penalty
+            + chapter_17_penalty,
+            0.75,
+        )
         metrics["chapter_9_selection_penalty"] = float(penalty)
         metrics["chapter_6_process_selection_penalty"] = float(chapter_6_penalty)
         metrics["chapter_8_backtest_selection_penalty"] = float(chapter_8_penalty)
         metrics["chapter_9_time_series_selection_penalty"] = float(chapter_9_penalty)
         metrics["chapter_10_bayesian_selection_penalty"] = float(chapter_10_penalty)
+        metrics["chapter_11_tree_selection_penalty"] = float(chapter_11_penalty)
+        metrics["chapter_12_boosting_selection_penalty"] = float(chapter_12_penalty)
+        metrics["chapter_17_deep_learning_selection_penalty"] = float(chapter_17_penalty)
         metrics["chapter_9_residual_autocorrelation"] = _max_abs_autocorrelation(
             pd.to_numeric(predictions["actual"], errors="coerce") - pd.to_numeric(predictions["predicted"], errors="coerce"),
             max_lag=5,
@@ -254,8 +278,10 @@ def apply_ml4t_selection_adjustments(
         metrics["chapter_9_return_autocorrelation_score"] = float(target_diagnostics["return_autocorrelation"])
         metrics["chapter_9_selection_adjustment_applied"] = 1.0
         metrics["chapter_9_selection_note_count"] = float(
-            len(chapter_6_notes) + len(chapter_8_notes) + len(chapter_9_notes) + len(chapter_10_notes)
+            len(chapter_6_notes) + len(chapter_8_notes) + len(chapter_9_notes) + len(chapter_10_notes) + len(chapter_11_notes)
+            + len(chapter_12_notes) + len(chapter_17_notes)
         )
+        metrics["chapter_17_deep_learning_note_count"] = float(len(chapter_17_notes))
         _add_adjusted_selection_metric(metrics, selection_metric.lower(), penalty)
         adjusted += 1
     return {
@@ -420,6 +446,173 @@ def _chapter_10_bayesian_penalty(metrics: dict[str, float], predictions: pd.Data
     metrics["chapter_10_sharpe_credible_interval_width"] = float(width)
     metrics["chapter_10_confidence_multiplier"] = float(max(0.55, min(1.0, prob_positive)))
     return float(min(penalty, 0.20)), notes
+
+
+def _chapter_11_tree_penalty(
+    *,
+    candidate: ForecastCandidate,
+    metrics: dict[str, float],
+    predictions: pd.DataFrame,
+) -> tuple[float, list[str]]:
+    family = str(candidate.family)
+    name = str(candidate.name).lower()
+    is_tree = family in TREE_MODEL_FAMILIES or any(token in name for token in ("tree", "forest"))
+    if not is_tree:
+        return 0.0, []
+
+    penalty = 0.0
+    notes = []
+    mae_value = float(metrics.get("mae", 0.0) or 0.0)
+    holdout_mae = float(metrics.get("holdout_mae", 0.0) or 0.0)
+    if mae_value > 0 and holdout_mae > 0:
+        degradation = (holdout_mae - mae_value) / abs(mae_value)
+        if degradation > 0.75:
+            penalty += 0.18
+            notes.append("tree_large_holdout_degradation")
+        elif degradation > 0.35:
+            penalty += 0.08
+            notes.append("tree_moderate_holdout_degradation")
+
+    predicted = pd.to_numeric(predictions["predicted"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(predicted) >= 20:
+        sign_changes = float((np.sign(predicted).diff().abs() > 0).mean())
+        unique_ratio = float(predicted.round(8).nunique() / max(len(predicted), 1))
+        metrics["chapter_11_tree_prediction_sign_change_rate"] = sign_changes
+        metrics["chapter_11_tree_prediction_unique_ratio"] = unique_ratio
+        if sign_changes > 0.70 and float(metrics.get("directional_accuracy", 0.0) or 0.0) < 0.53:
+            penalty += 0.06
+            notes.append("tree_noisy_direction_changes")
+        if unique_ratio < 0.08 and family == "tree_model":
+            penalty += 0.05
+            notes.append("single_tree_stepwise_underfit")
+
+    if family == "tree_model" and float(metrics.get("directional_accuracy", 0.0) or 0.0) < 0.50:
+        penalty += 0.05
+        notes.append("single_tree_weak_direction")
+    return float(min(penalty, 0.25)), notes
+
+
+def _chapter_12_boosting_penalty(
+    *,
+    candidate: ForecastCandidate,
+    metrics: dict[str, float],
+    predictions: pd.DataFrame,
+) -> tuple[float, list[str]]:
+    family = str(candidate.family)
+    name = str(candidate.name).lower()
+    is_boosting = family in BOOSTING_MODEL_FAMILIES or any(
+        token in name for token in ("boosting", "lightgbm", "xgboost")
+    )
+    if not is_boosting:
+        return 0.0, []
+
+    penalty = 0.0
+    notes = []
+    mae_value = float(metrics.get("mae", 0.0) or 0.0)
+    holdout_mae = float(metrics.get("holdout_mae", 0.0) or 0.0)
+    if mae_value > 0 and holdout_mae > 0:
+        degradation = (holdout_mae - mae_value) / abs(mae_value)
+        metrics["chapter_12_boosting_holdout_degradation"] = float(degradation)
+        if degradation > 0.60:
+            penalty += 0.16
+            notes.append("boosting_large_holdout_degradation")
+        elif degradation > 0.30:
+            penalty += 0.07
+            notes.append("boosting_moderate_holdout_degradation")
+
+    predicted = pd.to_numeric(predictions["predicted"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    actual = pd.to_numeric(predictions["actual"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    aligned = pd.concat([actual.rename("actual"), predicted.rename("predicted")], axis=1).dropna()
+    if len(aligned) >= 20:
+        pred_std = float(aligned["predicted"].std(ddof=1) or 0.0)
+        actual_std = float(aligned["actual"].std(ddof=1) or 0.0)
+        volatility_ratio = pred_std / max(actual_std, 1e-12)
+        metrics["chapter_12_boosting_prediction_volatility_ratio"] = float(volatility_ratio)
+        rolling_ic = (
+            aligned["predicted"]
+            .rolling(20)
+            .corr(aligned["actual"], pairwise=False)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if not rolling_ic.empty:
+            positive_rate = float((rolling_ic > 0).mean())
+            metrics["chapter_12_boosting_rolling_ic_positive_rate"] = positive_rate
+            if positive_rate < 0.40:
+                penalty += 0.06
+                notes.append("boosting_unstable_rolling_ic")
+        if volatility_ratio > 2.5 and float(metrics.get("directional_accuracy", 0.0) or 0.0) < 0.55:
+            penalty += 0.06
+            notes.append("boosting_excess_prediction_volatility")
+
+    return float(min(penalty, 0.25)), notes
+
+
+def _chapter_17_deep_learning_penalty(
+    *,
+    candidate: ForecastCandidate,
+    metrics: dict[str, float],
+    predictions: pd.DataFrame,
+) -> tuple[float, list[str]]:
+    family = str(candidate.family)
+    if family not in DEEP_LEARNING_FAMILIES:
+        return 0.0, []
+
+    penalty = 0.0
+    notes = []
+    mae_value = float(metrics.get("mae", 0.0) or 0.0)
+    holdout_mae = float(metrics.get("holdout_mae", 0.0) or 0.0)
+    if mae_value > 0 and holdout_mae > 0:
+        degradation = (holdout_mae - mae_value) / abs(mae_value)
+        metrics["chapter_17_deep_learning_holdout_degradation"] = float(degradation)
+        if degradation > 0.75:
+            penalty += 0.20
+            notes.append("deep_learning_large_holdout_degradation")
+        elif degradation > 0.35:
+            penalty += 0.10
+            notes.append("deep_learning_moderate_holdout_degradation")
+
+    actual = pd.to_numeric(predictions["actual"], errors="coerce")
+    predicted = pd.to_numeric(predictions["predicted"], errors="coerce")
+    aligned = pd.concat([actual.rename("actual"), predicted.rename("predicted")], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(aligned) >= 20:
+        pred_std = float(aligned["predicted"].std(ddof=1) or 0.0)
+        actual_std = float(aligned["actual"].std(ddof=1) or 0.0)
+        volatility_ratio = pred_std / max(actual_std, 1e-12)
+        metrics["chapter_17_deep_learning_prediction_volatility_ratio"] = float(volatility_ratio)
+        if volatility_ratio > 3.0 and float(metrics.get("directional_accuracy", 0.0) or 0.0) < 0.55:
+            penalty += 0.08
+            notes.append("deep_learning_excess_prediction_volatility")
+        if volatility_ratio < 0.05:
+            penalty += 0.05
+            notes.append("deep_learning_flat_prediction_underfit")
+
+        rolling_ic = (
+            aligned["predicted"]
+            .rolling(20)
+            .corr(aligned["actual"], pairwise=False)
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        if not rolling_ic.empty:
+            positive_rate = float((rolling_ic > 0).mean())
+            metrics["chapter_17_deep_learning_rolling_ic_positive_rate"] = positive_rate
+            if positive_rate < 0.40:
+                penalty += 0.08
+                notes.append("deep_learning_unstable_rolling_ic")
+
+    validation_rows = int(metrics.get("validation_rows", 0) or 0)
+    parameter_count = float(metrics.get("parameter_count", 0.0) or 0.0)
+    if validation_rows > 0 and parameter_count > validation_rows * 2:
+        penalty += 0.05
+        notes.append("deep_learning_parameter_count_large_vs_validation")
+
+    if float(metrics.get("directional_accuracy", 0.0) or 0.0) < 0.50 and float(metrics.get("sharpe_ratio", 0.0) or 0.0) <= 0:
+        penalty += 0.07
+        notes.append("deep_learning_weak_direction_and_sharpe")
+
+    metrics["chapter_17_deep_learning_overfit_ratio"] = float(holdout_mae / max(mae_value, 1e-12)) if mae_value > 0 and holdout_mae > 0 else 0.0
+    return float(min(penalty, 0.30)), notes
 
 
 def _bayesian_sharpe_posterior(strategy_returns: pd.Series, horizon_days: int) -> dict[str, float]:
