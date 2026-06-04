@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from market_forecasting_engine.alpaca_broker import AlpacaPaperBroker
+
 
 DEFAULT_STATE_DIR = Path("automated_forecasting_engine/runs/paper_options_agent")
 DEFAULT_REFRESH_SECONDS = 30
@@ -26,7 +28,7 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
     exit_plan = trade_plan.get("exit_plan") or {}
     position_pl = summarize_position_pl(report.get("option_positions") or [])
     option_type = _option_type_label(trade_plan.get("option_type"), selected.get("symbol") or order.get("symbol"))
-    chart = build_stock_chart_payload(report=report, history=history)
+    chart = build_stock_chart_payload(report=report, history=history, ticker=ticker)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "ticker": ticker.upper(),
@@ -69,21 +71,9 @@ def build_dashboard_state(*, state_dir: Path, ticker: str, max_history: int = 50
     }
 
 
-def build_stock_chart_payload(*, report: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
-    actual_points: list[dict[str, Any]] = []
-    seen_actual: set[str] = set()
-    for row in history:
-        timestamp = row.get("checked_at")
-        price = _to_float((row.get("selected_forecast") or {}).get("spot"))
-        if price is None:
-            price = _to_float((row.get("forecast_plan") or {}).get("latest_price"))
-        if not timestamp or price is None:
-            continue
-        key = str(timestamp)
-        if key in seen_actual:
-            continue
-        seen_actual.add(key)
-        actual_points.append({"timestamp": key, "price": price})
+def build_stock_chart_payload(*, report: dict[str, Any], history: list[dict[str, Any]], ticker: str | None = None) -> dict[str, Any]:
+    broker_points = _recent_stock_bar_points(ticker or str(report.get("ticker") or ""))
+    actual_points = broker_points if broker_points else _history_actual_points(history)
     forecast_plan = report.get("forecast_plan") or {}
     selected_forecast = report.get("selected_forecast") or {}
     as_of = forecast_plan.get("as_of") or report.get("forecast_created_at_utc") or report.get("checked_at")
@@ -111,7 +101,51 @@ def build_stock_chart_payload(*, report: dict[str, Any], history: list[dict[str,
         "forecast_points": forecast_points,
         "as_of": as_of,
         "as_of_price": as_of_price,
+        "source": "alpaca_stock_bars" if broker_points else "agent_history",
     }
+
+
+def _history_actual_points(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    actual_points: list[dict[str, Any]] = []
+    seen_actual: set[str] = set()
+    for row in history:
+        timestamp = row.get("checked_at")
+        price = _to_float((row.get("selected_forecast") or {}).get("spot"))
+        if price is None:
+            price = _to_float((row.get("forecast_plan") or {}).get("latest_price"))
+        if not timestamp or price is None:
+            continue
+        key = str(timestamp)
+        if key in seen_actual:
+            continue
+        seen_actual.add(key)
+        actual_points.append({"timestamp": key, "price": price})
+    return actual_points
+
+
+def _recent_stock_bar_points(ticker: str) -> list[dict[str, Any]]:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol or "/" in symbol or "-" in symbol:
+        return []
+    end = datetime.now(UTC)
+    start = end - pd.Timedelta(hours=8)
+    try:
+        rows = AlpacaPaperBroker().stock_bars(
+            symbol,
+            start=start.isoformat().replace("+00:00", "Z"),
+            end=end.isoformat().replace("+00:00", "Z"),
+            timeframe="1Min",
+            limit=1000,
+        )
+    except Exception:
+        return []
+    points: list[dict[str, Any]] = []
+    for row in rows:
+        timestamp = row.get("t") or row.get("timestamp")
+        close = _to_float(row.get("c") or row.get("close"))
+        if timestamp and close is not None:
+            points.append({"timestamp": str(timestamp), "price": close})
+    return points
 
 
 def summarize_position_pl(positions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -272,7 +306,7 @@ def dashboard_html(refresh_seconds: int) -> str:
     </section>
     <section class="panel chart-panel">
       <div class="chart-head">
-        <strong>Stock Price And Forecast</strong>
+        <div><strong>Stock Price And Forecast</strong><div class="small" id="chartMeta">-</div></div>
         <div class="legend">
           <span class="key"><span class="swatch actual"></span>Stock price</span>
           <span class="key"><span class="swatch forecast"></span>Forecast line</span>
@@ -384,17 +418,26 @@ def dashboard_html(refresh_seconds: int) -> str:
       svg.innerHTML = "";
       const actual = (chart.actual_points || []).map(p => [new Date(p.timestamp).getTime(), Number(p.price)]).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
       const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: new Date(p.timestamp).getTime(), y: Number(p.predicted_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+      set("chartMeta", `actual points ${{actual.length}} | forecast points ${{forecasts.length}} | source ${{chart.source || "-"}}`);
       const asOfTime = chart.as_of ? new Date(chart.as_of).getTime() : null;
       const asOfPrice = Number(chart.as_of_price);
-      const xs = actual.map(p => p[0]).concat(forecasts.map(p => p.x)).concat(Number.isFinite(asOfTime) ? [asOfTime] : []);
-      const ys = actual.map(p => p[1]).concat(forecasts.flatMap(p => [p.y, p.lower_price, p.upper_price]).map(Number).filter(Number.isFinite)).concat(Number.isFinite(asOfPrice) ? [asOfPrice] : []);
+      const focusStart = Number.isFinite(asOfTime) ? asOfTime - 2 * 60 * 60 * 1000 : null;
+      const focusEnd = forecasts.length ? Math.max(...forecasts.map(p => p.x)) + 15 * 60 * 1000 : null;
+      const visibleActual = actual.filter(p => (!Number.isFinite(focusStart) || p[0] >= focusStart) && (!Number.isFinite(focusEnd) || p[0] <= focusEnd));
+      const plotActual = visibleActual.length >= 2 ? visibleActual : actual;
+      const xs = plotActual.map(p => p[0]).concat(forecasts.map(p => p.x)).concat(Number.isFinite(asOfTime) ? [asOfTime] : []);
+      const ys = plotActual.map(p => p[1]).concat(forecasts.flatMap(p => [p.y, p.lower_price, p.upper_price]).map(Number).filter(Number.isFinite)).concat(Number.isFinite(asOfPrice) ? [asOfPrice] : []);
       if (!xs.length || !ys.length) {{
         const text = el("text", {{ x: 20, y: 32, fill: "#637083", "font-size": 14 }});
         text.textContent = "No stock price history available yet.";
         svg.appendChild(text);
         return;
       }}
-      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      let minX = Math.min(...xs), maxX = Math.max(...xs);
+      if (Number.isFinite(asOfTime) && forecasts.length) {{
+        minX = Math.min(minX, asOfTime - 90 * 60 * 1000);
+        maxX = Math.max(maxX, Math.max(...forecasts.map(p => p.x)) + 10 * 60 * 1000);
+      }}
       const minY0 = Math.min(...ys), maxY0 = Math.max(...ys);
       const yPad = Math.max((maxY0 - minY0) * 0.08, 0.5);
       const minY = minY0 - yPad, maxY = maxY0 + yPad;
@@ -411,14 +454,22 @@ def dashboard_html(refresh_seconds: int) -> str:
         t.textContent = price(label);
         svg.appendChild(t);
       }}
-      if (actual.length > 1) {{
-        svg.appendChild(el("path", {{ d: actual.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#111827", "stroke-width": 2 }}));
+      if (plotActual.length > 1) {{
+        svg.appendChild(el("path", {{ d: plotActual.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#111827", "stroke-width": 2 }}));
       }}
       const forecastLine = [];
       if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) forecastLine.push([asOfTime, asOfPrice]);
       forecasts.forEach(p => forecastLine.push([p.x, p.y]));
+      if (forecasts.length && Number.isFinite(asOfTime)) {{
+        const band = forecasts.filter(p => Number.isFinite(Number(p.lower_price)) && Number.isFinite(Number(p.upper_price)));
+        if (band.length) {{
+          const upper = [[asOfTime, asOfPrice]].concat(band.map(p => [p.x, Number(p.upper_price)]));
+          const lower = [[asOfTime, asOfPrice]].concat(band.map(p => [p.x, Number(p.lower_price)])).reverse();
+          svg.appendChild(el("path", {{ d: upper.concat(lower).map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" ") + "Z", fill: "rgba(220,38,38,0.10)", stroke: "none" }}));
+        }}
+      }}
       if (forecastLine.length > 1) {{
-        svg.appendChild(el("path", {{ d: forecastLine.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#dc2626", "stroke-width": 2, "stroke-dasharray": "7 5" }}));
+        svg.appendChild(el("path", {{ d: forecastLine.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#dc2626", "stroke-width": 3, "stroke-dasharray": "7 5" }}));
       }}
       if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) {{
         svg.appendChild(el("circle", {{ cx: x(asOfTime), cy: y(asOfPrice), r: 5, fill: "#2563eb" }}));
@@ -426,7 +477,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       forecasts.forEach(p => {{
         svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5, fill: "#dc2626" }}));
         const t = el("text", {{ x: x(p.x) + 7, y: y(p.y) - 7, fill: "#991b1b", "font-size": 11 }});
-        t.textContent = `${{price(p.horizon_hours)}}h ${{price(p.y)}}`;
+        t.textContent = `${{Number(p.horizon_hours) === 0.25 ? "15m" : price(p.horizon_hours) + "h"}} ${{price(p.y)}}`;
         svg.appendChild(t);
       }});
       const axis = el("line", {{ x1: pad.left, y1: height - pad.bottom, x2: width - pad.right, y2: height - pad.bottom, stroke: "#9ca3af" }});

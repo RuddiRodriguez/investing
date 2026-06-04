@@ -20,12 +20,33 @@ def test_options_dashboard_reads_ticker_specific_report_and_history(tmp_path) ->
             "latest_price": 200.0,
             "forecasts": [
                 {
+                    "horizon_hours": 0.25,
+                    "forecast_timestamp": "2026-06-01T10:15:00+00:00",
+                    "predicted_price": 201.0,
+                    "lower_price": 199.0,
+                    "upper_price": 203.0,
+                },
+                {
+                    "horizon_hours": 0.5,
+                    "forecast_timestamp": "2026-06-01T10:30:00+00:00",
+                    "predicted_price": 202.0,
+                    "lower_price": 198.5,
+                    "upper_price": 204.0,
+                },
+                {
+                    "horizon_hours": 0.75,
+                    "forecast_timestamp": "2026-06-01T10:45:00+00:00",
+                    "predicted_price": 203.0,
+                    "lower_price": 198.0,
+                    "upper_price": 205.0,
+                },
+                {
                     "horizon_hours": 1.0,
                     "forecast_timestamp": "2026-06-01T11:00:00+00:00",
                     "predicted_price": 205.0,
                     "lower_price": 202.0,
                     "upper_price": 208.0,
-                }
+                },
             ],
         },
         "market_clock": {"is_open": True, "next_open": "2026-06-02T09:30:00-04:00"},
@@ -88,7 +109,9 @@ def test_options_dashboard_reads_ticker_specific_report_and_history(tmp_path) ->
     assert payload["chart"]["as_of"] == "2026-06-01T10:00:00+00:00"
     assert payload["chart"]["as_of_price"] == 200.0
     assert payload["chart"]["actual_points"] == [{"timestamp": "2026-06-01T10:00:00+00:00", "price": 200.0}]
-    assert payload["chart"]["forecast_points"][0]["predicted_price"] == 205.0
+    assert payload["chart"]["source"] == "agent_history"
+    assert [row["horizon_hours"] for row in payload["chart"]["forecast_points"]] == [0.25, 0.5, 0.75, 1.0]
+    assert payload["chart"]["forecast_points"][-1]["predicted_price"] == 205.0
 
 
 def test_options_dashboard_missing_ticker_is_empty_not_tsla_specific(tmp_path) -> None:

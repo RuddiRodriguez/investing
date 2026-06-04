@@ -109,15 +109,15 @@ def test_evaluate_ticker_blocks_when_forecast_edge_is_too_small(monkeypatch) -> 
     assert "forecast_edge_below_selector_min" in row["reasons"]
 
 
-def test_auto_options_default_horizon_matches_eth_style_15_minutes() -> None:
+def test_auto_options_default_horizons_match_eth_style_short_path() -> None:
     args = apply_option_profile_defaults(build_parser().parse_args([]))
     config = _selector_config_from_args(args)
 
-    assert args.forecast_hours == "0.25"
+    assert args.forecast_hours == "0.25,0.5,0.75,1"
     assert args.close_before_expiry_hours == 12.0
     assert args.target_delta == 0.45
     assert args.max_delta_distance == 0.30
-    assert config.forecast_hours == (0.25,)
+    assert config.forecast_hours == (0.25, 0.5, 0.75, 1.0)
     assert config.target_delta == 0.45
     assert config.max_delta_distance == 0.30
 

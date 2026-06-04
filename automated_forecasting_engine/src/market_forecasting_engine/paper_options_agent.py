@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", default="alpaca")
     parser.add_argument("--interval", default="1m")
     parser.add_argument("--lookback-days", type=int, default=20)
-    parser.add_argument("--forecast-hours", default="0.25", help="Forecast horizon in hours. Default 0.25 matches the 15-minute ETH paper-trader horizon.")
+    parser.add_argument("--forecast-hours", default="0.25,0.5,0.75,1", help="Forecast horizons in hours. Defaults match the ETH-style 15m/30m/45m/1h dashboard path; trading uses the shortest horizon first.")
     parser.add_argument("--check-interval-seconds", type=int, default=60)
     parser.add_argument("--forecast-refresh-seconds", type=int, default=900)
     parser.add_argument("--max-training-rows", type=int, default=3500)

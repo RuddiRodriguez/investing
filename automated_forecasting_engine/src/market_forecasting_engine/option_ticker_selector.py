@@ -39,7 +39,7 @@ class OptionTickerSelectorConfig:
     provider: str = "alpaca"
     interval: str = "1m"
     lookback_days: int = 20
-    forecast_hours: tuple[float, ...] = (0.25,)
+    forecast_hours: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
     risk_profile: str = "aggressive"
     max_training_rows: int = 3500
     min_dte: int = 1
