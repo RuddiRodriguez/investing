@@ -121,6 +121,12 @@ def dashboard_html(refresh_seconds: int) -> str:
         <div class="card"><div class="label">Protection Decision</div><div class="value" id="spotProtectionDecision">-</div><div class="small" id="spotProtectionDecisionMeta">-</div></div>
         <div class="card"><div class="label">Protection Policy</div><div class="value" id="spotProtectionPolicy">-</div><div class="small">respects previous protection unless risk worsens</div></div>
       </div>
+      <div class="grid" style="margin-top:12px;">
+        <div class="card"><div class="label">Inventory Scope</div><div class="value" id="spotInventoryScope">-</div><div class="small" id="spotInventoryScopeMeta">-</div></div>
+        <div class="card"><div class="label">Managed ETH</div><div class="value" id="spotManagedBase">-</div><div class="small">agent may act on this amount only</div></div>
+        <div class="card"><div class="label">Manual ETH</div><div class="value" id="spotManualBase">-</div><div class="small">report-only unless explicitly allowed</div></div>
+        <div class="card"><div class="label">Policy</div><div class="value" id="spotInventoryPolicy">-</div><div class="small">manual positions are protected from agent liquidation</div></div>
+      </div>
       <div class="chartWrap" id="spotForecastChart" style="height:360px; margin-top:12px;"></div>
       <table style="margin-top:12px;">
         <thead><tr><th>Horizon</th><th>Prediction</th><th>Band</th><th>Direction</th><th>Model</th><th>Validation / Error</th></tr></thead>
@@ -207,6 +213,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       const scaleIn = decision.scale_in_pullback || {{}};
       const existingProtection = decision.existing_protection || {{}};
       const protectionDecision = decision.protection_decision || {{}};
+      const inventoryScope = decision.inventory_scope || {{}};
       set("spotAction", decision.action || "-");
       set("spotReason", decision.reason || "-");
       set("spotMarket", money(market.latest_price));
@@ -233,6 +240,11 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("spotProtectionDecision", protectionDecision.decision || "-");
       set("spotProtectionDecisionMeta", protectionDecision.predicted_below_stop_pct ? `predicted below stop ${{(Number(protectionDecision.predicted_below_stop_pct) * 100).toFixed(2)}}%` : (protectionDecision.current_stop_gap_pct ? `stop gap ${{(Number(protectionDecision.current_stop_gap_pct) * 100).toFixed(2)}}%` : "-"));
       set("spotProtectionPolicy", protectionDecision.policy ? "active" : "-");
+      set("spotInventoryScope", inventoryScope.scope || "-");
+      set("spotManagedBase", inventoryScope.managed_base_balance === undefined ? "-" : `${{fmt(inventoryScope.managed_base_balance)}} ETH`);
+      set("spotManualBase", inventoryScope.manual_base_balance === undefined ? "-" : `${{fmt(inventoryScope.manual_base_balance)}} ETH`);
+      set("spotInventoryScopeMeta", inventoryScope.base_balance === undefined ? "-" : `total ${{fmt(inventoryScope.base_balance)}} ETH`);
+      set("spotInventoryPolicy", inventoryScope.policy ? "active" : "-");
       renderSpotForecastRows(report);
       renderSpotForecastChart(report);
     }}

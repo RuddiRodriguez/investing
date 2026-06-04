@@ -41,6 +41,8 @@ def _args(**overrides):
         "protected_position_coverage_ratio": 0.95,
         "sell_now_min_forecast_beyond_stop_pct": 0.01,
         "tighten_stop_buffer_pct": 0.003,
+        "inventory_scope": "codex_only",
+        "managed_base_balance": None,
     }
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -72,6 +74,7 @@ def test_live_spot_decision_sells_existing_base_on_bearish_forecast() -> None:
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 5.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1740.0, "expected_direction": "Downward"},
@@ -82,11 +85,29 @@ def test_live_spot_decision_sells_existing_base_on_bearish_forecast() -> None:
     assert plan["entry_order"] == {"side": "sell", "type": "limit", "amount": 0.02, "price": 1747.25}
 
 
+def test_manual_existing_base_is_not_sold_by_default() -> None:
+    plan = decide_spot_trade(
+        args=_args(),
+        base_account={"balance": 0.02},
+        quote_account={"available_funds": 5.0},
+        managed_base_balance=0.0,
+        quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
+        latest_price=1750.0,
+        forecast={"predicted_price": 1740.0, "expected_direction": "Downward"},
+        open_orders=[],
+    )
+
+    assert plan["action"] == "hold"
+    assert plan["reason"] == "manual_inventory_not_managed_by_default"
+    assert plan["inventory_scope"]["manual_base_balance"] == 0.02
+
+
 def test_existing_protection_makes_bearish_forecast_hold_instead_of_sell() -> None:
     plan = decide_spot_trade(
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 5.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1740.0, "expected_direction": "Downward"},
@@ -106,6 +127,7 @@ def test_material_break_below_existing_stop_still_sells_now() -> None:
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 5.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1670.0, "expected_direction": "Downward"},
@@ -123,6 +145,7 @@ def test_incomplete_existing_protection_plans_replacement() -> None:
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 5.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1740.0, "expected_direction": "Downward"},
@@ -140,6 +163,7 @@ def test_open_buy_order_does_not_block_bearish_sell_of_existing_base() -> None:
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 5.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1740.0, "expected_direction": "Downward"},
@@ -154,6 +178,7 @@ def test_existing_eth_can_scale_in_on_strict_lower_pullback_setup() -> None:
         args=_args(spot_average_entry_price=1770.0, max_base_position=0.05),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 30.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1735.0, "expected_direction": "Downward"},
@@ -184,6 +209,7 @@ def test_existing_eth_scale_in_requires_average_entry_price_by_default() -> None
         args=_args(),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 30.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1735.0, "expected_direction": "Downward"},
@@ -211,6 +237,7 @@ def test_existing_eth_scale_in_blocks_when_loss_is_too_large() -> None:
         args=_args(spot_average_entry_price=1900.0),
         base_account={"balance": 0.02},
         quote_account={"available_funds": 30.0},
+        managed_base_balance=0.02,
         quote={"bid": 1749.0, "ask": 1751.0, "mid": 1750.0},
         latest_price=1750.0,
         forecast={"predicted_price": 1735.0, "expected_direction": "Downward"},

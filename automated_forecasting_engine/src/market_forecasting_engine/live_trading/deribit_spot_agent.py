@@ -67,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--protected-position-coverage-ratio", type=float, default=0.95)
     parser.add_argument("--sell-now-min-forecast-beyond-stop-pct", type=float, default=0.01)
     parser.add_argument("--tighten-stop-buffer-pct", type=float, default=0.003)
+    parser.add_argument("--inventory-scope", choices=("codex_only", "allow_manual"), default="codex_only", help="Default codex_only means the agent may not sell/protect/scale into manually created spot inventory.")
+    parser.add_argument("--managed-base-balance", type=float, default=None, help="Explicit amount of base currency currently owned by this Codex agent. Overrides saved state.")
     parser.add_argument("--output-dir", default="automated_forecasting_engine/runs/live_deribit_spot_agent")
     parser.add_argument("--execute-live-orders", action="store_true")
     parser.add_argument("--confirm-live-deribit-spot-orders", action="store_true")
@@ -80,6 +82,8 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
     instrument = args.instrument.upper()
     base_currency = args.base_currency.upper()
     quote_currency = args.quote_currency.upper()
+    output_dir = Path(args.output_dir)
+    state = read_spot_agent_state(output_dir, instrument)
     base_account = broker.account_summary(currency=base_currency)
     quote_account = broker.account_summary(currency=quote_currency)
     order_book = broker.order_book(instrument, depth=10)
@@ -98,6 +102,7 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
         args=args,
         base_account=base_account,
         quote_account=quote_account,
+        managed_base_balance=managed_base_balance(args=args, state=state, base_account=base_account),
         quote=quote,
         latest_price=price,
         forecast=forecast,
@@ -108,6 +113,8 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
     if args.execute_live_orders and plan["action"] in {"buy_spot", "place_pullback_buy", "place_scale_in_pullback_buy", "sell_spot", "protect_existing_position"}:
         label_base = f"codex-live-spot-{base_currency}-{now.strftime('%Y%m%d%H%M%S')}"
         order_results = execute_plan(broker=broker, plan=plan, open_orders=open_orders, label_base=label_base, replace_protection=bool(args.replace_protection))
+        update_spot_agent_state_from_results(state=state, instrument=instrument, results=order_results)
+        write_spot_agent_state(output_dir, instrument, state)
     record = {
         "checked_at": now.isoformat(),
         "mode": "live_deribit_spot_agent",
@@ -131,6 +138,7 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
         "open_orders": open_orders,
         "decision": plan,
         "order_results": order_results,
+        "agent_state": state,
     }
     return record
 
@@ -242,6 +250,7 @@ def decide_spot_trade(
     args: argparse.Namespace,
     base_account: dict[str, Any],
     quote_account: dict[str, Any],
+    managed_base_balance: float | None = None,
     quote: dict[str, float | None],
     latest_price: float,
     forecast: dict[str, Any],
@@ -252,6 +261,8 @@ def decide_spot_trade(
     min_edge = float(args.min_edge_pct if args.min_edge_pct is not None else max(profile.minimum_edge_fraction, 0.001))
     spread_pct = spread_fraction(quote)
     base_balance = _float(base_account.get("balance"))
+    managed_balance = base_balance if str(getattr(args, "inventory_scope", "codex_only")) == "allow_manual" else min(base_balance, max(0.0, _float(managed_base_balance)))
+    manual_balance = max(0.0, base_balance - managed_balance)
     quote_available = _float(quote_account.get("available_funds"))
     predicted = _float(forecast.get("predicted_price"))
     if latest_price <= 0 or predicted <= 0:
@@ -265,8 +276,8 @@ def decide_spot_trade(
     if direction == "upward":
         if has_open_spot_entry(open_orders, args.instrument):
             return hold_plan("open_entry_order_exists", args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct)
-        if base_balance >= float(args.max_base_position):
-            return protection_plan(args=args, latest_price=latest_price, base_balance=base_balance, quote_available=quote_available, forecast=forecast, edge_pct=edge_pct, reason="max_base_position_reached")
+        if managed_balance >= float(args.max_base_position):
+            return protection_plan(args=args, latest_price=latest_price, base_balance=base_balance, managed_base_balance=managed_balance, quote_available=quote_available, forecast=forecast, edge_pct=edge_pct, reason="max_base_position_reached")
         max_notional = min(float(args.max_notional_usdc), quote_available)
         amount = round_down(max_notional / float(quote["ask"] or latest_price), 6)
         if amount < float(args.min_order_base_amount):
@@ -280,13 +291,18 @@ def decide_spot_trade(
             "protection": {},
             "post_fill_protection_plan": protection_orders(args=args, amount=amount, entry_reference=entry_price),
         }
-    if base_balance >= float(args.min_order_base_amount):
+    if base_balance >= float(args.min_order_base_amount) and managed_balance < float(args.min_order_base_amount):
+        plan = hold_plan("manual_inventory_not_managed_by_default", args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct)
+        plan["inventory_scope"] = inventory_scope_payload(args=args, base_balance=base_balance, managed_balance=managed_balance, manual_balance=manual_balance)
+        return plan
+    if managed_balance >= float(args.min_order_base_amount):
         scale_in = scale_in_pullback_buy_plan(
             args=args,
             latest_price=latest_price,
             forecast=forecast,
             forecast_bundle=forecast_bundle or {},
             base_balance=base_balance,
+            managed_base_balance=managed_balance,
             quote_available=quote_available,
             spread_pct=spread_pct,
             edge_pct=edge_pct,
@@ -300,6 +316,7 @@ def decide_spot_trade(
             latest_price=latest_price,
             forecast=forecast,
             base_balance=base_balance,
+            managed_base_balance=managed_balance,
             quote_available=quote_available,
             spread_pct=spread_pct,
             edge_pct=edge_pct,
@@ -314,8 +331,9 @@ def decide_spot_trade(
             **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct),
             "action": "sell_spot",
             "reason": "bearish_forecast_sell_existing_base",
-            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(base_balance, float(args.max_base_position)), 6), "price": sell_price},
+            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(managed_balance, float(args.max_base_position)), 6), "price": sell_price},
             "protection": {},
+            "inventory_scope": inventory_scope_payload(args=args, base_balance=base_balance, managed_balance=managed_balance, manual_balance=manual_balance),
         }
         if scale_in is not None:
             plan["scale_in_pullback"] = scale_in.get("scale_in_pullback", {})
@@ -343,6 +361,7 @@ def protection_aware_bearish_plan(
     latest_price: float,
     forecast: dict[str, Any],
     base_balance: float,
+    managed_base_balance: float,
     quote_available: float,
     spread_pct: float | None,
     edge_pct: float,
@@ -350,7 +369,7 @@ def protection_aware_bearish_plan(
 ) -> dict[str, Any] | None:
     if not bool(getattr(args, "respect_existing_protection", True)):
         return None
-    coverage = analyze_existing_protection(open_orders=open_orders, instrument=args.instrument, base_balance=base_balance, latest_price=latest_price)
+    coverage = analyze_existing_protection(open_orders=open_orders, instrument=args.instrument, base_balance=managed_base_balance, latest_price=latest_price)
     if not coverage["has_any_protection"]:
         return None
     predicted = _float(forecast.get("predicted_price"))
@@ -358,7 +377,7 @@ def protection_aware_bearish_plan(
     coverage_ratio = _float(coverage.get("sell_coverage_ratio"))
     required_coverage = float(getattr(args, "protected_position_coverage_ratio", 0.95))
     if coverage_ratio < required_coverage:
-        plan = protection_plan(args=args, latest_price=latest_price, base_balance=base_balance, quote_available=quote_available, forecast=forecast, edge_pct=edge_pct, reason="existing_protection_incomplete_replace_or_add")
+        plan = protection_plan(args=args, latest_price=latest_price, base_balance=base_balance, managed_base_balance=managed_base_balance, quote_available=quote_available, forecast=forecast, edge_pct=edge_pct, reason="existing_protection_incomplete_replace_or_add")
         plan["existing_protection"] = coverage
         return plan
     if stop_price > 0 and predicted > 0:
@@ -371,7 +390,7 @@ def protection_aware_bearish_plan(
             **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct),
             "action": "sell_spot",
             "reason": "bearish_forecast_breaks_materially_below_existing_stop",
-            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(base_balance, float(args.max_base_position)), 6), "price": sell_price},
+            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(managed_base_balance, float(args.max_base_position)), 6), "price": sell_price},
             "protection": {},
             "existing_protection": coverage,
             "protection_decision": {
@@ -462,6 +481,7 @@ def scale_in_pullback_buy_plan(
     forecast: dict[str, Any],
     forecast_bundle: dict[str, Any],
     base_balance: float,
+    managed_base_balance: float,
     quote_available: float,
     spread_pct: float | None,
     edge_pct: float,
@@ -508,8 +528,8 @@ def scale_in_pullback_buy_plan(
     else:
         existing_loss_pct = None
         entry_discount_pct = None
-    remaining_base_capacity = max(0.0, float(args.max_base_position) - base_balance)
-    max_addition_by_fraction = max(0.0, base_balance * float(getattr(args, "scale_in_max_addition_fraction", 0.35)))
+    remaining_base_capacity = max(0.0, float(args.max_base_position) - managed_base_balance)
+    max_addition_by_fraction = max(0.0, managed_base_balance * float(getattr(args, "scale_in_max_addition_fraction", 0.35)))
     max_notional = float(getattr(args, "scale_in_max_notional_usdc", None) or args.max_notional_usdc)
     max_notional = min(max_notional, quote_available)
     if entry_price > 0:
@@ -629,14 +649,16 @@ def pullback_buy_plan(
     }
 
 
-def protection_plan(*, args: argparse.Namespace, latest_price: float, base_balance: float, quote_available: float, forecast: dict[str, Any], edge_pct: float, reason: str) -> dict[str, Any]:
-    amount = round_down(min(base_balance, float(args.max_base_position)), 6)
+def protection_plan(*, args: argparse.Namespace, latest_price: float, base_balance: float, managed_base_balance: float | None = None, quote_available: float, forecast: dict[str, Any], edge_pct: float, reason: str) -> dict[str, Any]:
+    protected_balance = base_balance if managed_base_balance is None else managed_base_balance
+    amount = round_down(min(protected_balance, float(args.max_base_position)), 6)
     return {
         **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=None, edge_pct=edge_pct),
         "action": "protect_existing_position" if amount >= float(args.min_order_base_amount) else "hold",
         "reason": reason if amount >= float(args.min_order_base_amount) else "existing_position_below_min_order",
         "entry_order": None,
         "protection": protection_orders(args=args, amount=amount, entry_reference=latest_price),
+        "inventory_scope": inventory_scope_payload(args=args, base_balance=base_balance, managed_balance=protected_balance, manual_balance=max(0.0, base_balance - protected_balance)),
     }
 
 
@@ -735,6 +757,83 @@ def summary(record: dict[str, Any]) -> dict[str, Any]:
         "execute_live_orders": (record.get("safety") or {}).get("execute_live_orders"),
         "order_result_count": len(record.get("order_results") or []),
     }
+
+
+def inventory_scope_payload(*, args: argparse.Namespace, base_balance: float, managed_balance: float, manual_balance: float) -> dict[str, Any]:
+    return {
+        "scope": str(getattr(args, "inventory_scope", "codex_only")),
+        "base_balance": base_balance,
+        "managed_base_balance": managed_balance,
+        "manual_base_balance": manual_balance,
+        "policy": (
+            "codex_only: the agent may sell/protect/scale only inventory recorded as Codex/API-managed. "
+            "Manual inventory is report-only unless --inventory-scope allow_manual is explicitly used."
+        ),
+    }
+
+
+def managed_base_balance(*, args: argparse.Namespace, state: dict[str, Any], base_account: dict[str, Any]) -> float:
+    base_balance = _float(base_account.get("balance"))
+    if str(getattr(args, "inventory_scope", "codex_only")) == "allow_manual":
+        return base_balance
+    override = getattr(args, "managed_base_balance", None)
+    if override is not None:
+        return min(base_balance, max(0.0, _float(override)))
+    return min(base_balance, max(0.0, _float(state.get("managed_base_balance"))))
+
+
+def read_spot_agent_state(output_dir: Path, instrument: str) -> dict[str, Any]:
+    path = spot_agent_state_path(output_dir, instrument)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"instrument": instrument, "managed_base_balance": 0.0, "fills": []}
+    return parsed if isinstance(parsed, dict) else {"instrument": instrument, "managed_base_balance": 0.0, "fills": []}
+
+
+def write_spot_agent_state(output_dir: Path, instrument: str, state: dict[str, Any]) -> Path:
+    path = spot_agent_state_path(output_dir, instrument)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(strict_json(state), indent=2, default=str, allow_nan=False), encoding="utf-8")
+    return path
+
+
+def spot_agent_state_path(output_dir: Path, instrument: str) -> Path:
+    return output_dir / "state" / f"{instrument.upper()}_spot_agent_state.json"
+
+
+def update_spot_agent_state_from_results(*, state: dict[str, Any], instrument: str, results: list[dict[str, Any]]) -> None:
+    balance = max(0.0, _float(state.get("managed_base_balance")))
+    fills = list(state.get("fills") or [])
+    for result in results:
+        if result.get("action") != "submit_entry_order":
+            continue
+        payload = result.get("payload") or {}
+        response = result.get("result") or {}
+        order = response.get("order") if isinstance(response, dict) else {}
+        if not isinstance(order, dict) or order.get("instrument_name") != instrument:
+            continue
+        filled = _float(order.get("filled_amount"))
+        if filled <= 0:
+            continue
+        side = str(order.get("direction") or payload.get("side") or "").lower()
+        if side == "buy":
+            balance += filled
+        elif side == "sell":
+            balance = max(0.0, balance - filled)
+        fills.append(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "side": side,
+                "filled_amount": filled,
+                "order_id": order.get("order_id"),
+                "average_price": order.get("average_price"),
+                "label": order.get("label"),
+            }
+        )
+    state["instrument"] = instrument
+    state["managed_base_balance"] = round(balance, 10)
+    state["fills"] = fills[-200:]
 
 
 def base_plan(*, args: argparse.Namespace, latest_price: float, forecast: dict[str, Any], base_balance: float, quote_available: float, spread_pct: float | None, edge_pct: float | None) -> dict[str, Any]:

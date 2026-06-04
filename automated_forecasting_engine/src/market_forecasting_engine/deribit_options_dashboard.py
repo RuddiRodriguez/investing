@@ -30,6 +30,10 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
     position_pl = summarize_position_pl(report.get("option_positions") or [], underlying_price_usd=spot)
     fibonacci = trade_plan.get("fibonacci_analysis") or (report.get("selected_forecast") or {}).get("fibonacci_analysis") or {}
     forecast_chart = build_forecast_chart(history=history, latest_report=report)
+    report_age_seconds = _age_seconds(report.get("checked_at"))
+    stop_request = _active_stop_request(state.get("stop_request"))
+    entry_blocks = report.get("execution_blocks") or []
+    management_actions = report.get("management_actions") or []
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "venue": "deribit_testnet",
@@ -42,6 +46,9 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
         "state": state,
         "summary": {
             "checked_at": report.get("checked_at"),
+            "report_age_seconds": report_age_seconds,
+            "report_stale": report_age_seconds is None or report_age_seconds > 180,
+            "agent_stop_request": stop_request,
             "forecast_cache_status": report.get("forecast_cache_status"),
             "forecast_direction": (report.get("selected_forecast") or {}).get("expected_direction"),
             "spot": (report.get("selected_forecast") or {}).get("spot"),
@@ -68,8 +75,10 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
             "estimated_debit_usd": (trade_plan.get("risk") or {}).get("estimated_debit_usd"),
             "estimated_debit_base": (trade_plan.get("risk") or {}).get("estimated_debit_base"),
             "account": report.get("account") or {},
-            "execution_blocks": report.get("execution_blocks") or [],
-            "management_actions": report.get("management_actions") or [],
+            "execution_blocks": entry_blocks,
+            "entry_blocks": entry_blocks,
+            "management_actions": management_actions,
+            "position_management_active": bool(management_actions),
             "open_order_count": len(report.get("open_option_orders") or []),
             "position_count": len(report.get("option_positions") or []),
             "order_submitted": (report.get("order_result") or {}).get("submitted"),
@@ -203,6 +212,24 @@ def summarize_position_pl(positions: list[dict[str, Any]], *, underlying_price_u
     }
 
 
+def _age_seconds(value: Any) -> float | None:
+    parsed = _parse_time(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds())
+
+
+def _active_stop_request(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    path = value.get("path")
+    if path and not Path(path).exists():
+        return None
+    return value
+
+
 def read_latest_report(state_dir: Path, currency: str) -> tuple[dict[str, Any], Path | None]:
     path = state_dir / f"{currency.upper()}_deribit_options_agent_report.json"
     if not path.exists():
@@ -306,6 +333,15 @@ def dashboard_html(refresh_seconds: int) -> str:
       <div class="card"><div class="label">Orders / Positions</div><div class="value" id="exposure">-</div><div class="small" id="orderResult">-</div></div>
     </section>
     <section class="panel">
+      <strong>Agent Health</strong>
+      <div class="cards" style="margin:12px 0 8px;">
+        <div class="card"><div class="label">Report Freshness</div><div class="value" id="reportFreshness">-</div><div class="small" id="reportFreshnessMeta">-</div></div>
+        <div class="card"><div class="label">Stop Request</div><div class="value" id="stopRequest">-</div><div class="small" id="stopRequestMeta">-</div></div>
+        <div class="card"><div class="label">Entry Blocks</div><div class="value" id="entryBlockStatus">-</div><div class="small" id="entryBlockMeta">-</div></div>
+        <div class="card"><div class="label">Position Management</div><div class="value" id="positionManagement">-</div><div class="small" id="positionManagementMeta">-</div></div>
+      </div>
+    </section>
+    <section class="panel">
       <strong>Market Price</strong>
       <div class="small" id="marketMeta" style="margin:6px 0 8px;">Loading...</div>
       <div class="rangeControls" id="marketRangeControls">
@@ -406,10 +442,20 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("source", `${{data.currency}} options / ${{data.venue}} / ${{data.state_dir}}`);
       currentCurrency = data.currency || currentCurrency;
       set("updated", `Updated ${{time(data.generated_at)}}`);
+      const age = s.report_age_seconds;
+      set("reportFreshness", s.report_stale ? "STALE" : "Fresh");
+      set("reportFreshnessMeta", age === null || age === undefined ? "no checked_at in report" : `last broker check ${{num(age)}} seconds ago at ${{time(s.checked_at)}}`);
+      const stop = s.agent_stop_request || null;
+      set("stopRequest", stop ? "ACTIVE" : "Clear");
+      set("stopRequestMeta", stop ? `${{stop.reason || "stop requested"}} at ${{time(stop.requested_at)}}` : "agent is allowed to continue");
       const badge = document.getElementById("actionBadge");
       badge.textContent = blocked ? "blocked" : (s.action || "-");
       badge.className = `badge ${{blocked ? "blocked" : s.action || ""}}`;
       set("blocks", (s.execution_blocks || []).join(", ") || "no execution blocks");
+      set("entryBlockStatus", (s.entry_blocks || []).length ? "New entry blocked" : "Entry free");
+      set("entryBlockMeta", (s.entry_blocks || []).join(", ") || "no entry blocks");
+      set("positionManagement", s.position_management_active ? "Active" : "No action");
+      set("positionManagementMeta", (s.management_actions || []).map(a => a.action).join(", ") || "no position management action in latest check");
       set("forecast", `${{s.forecast_direction || "-"}} → ${{money(s.predicted_price)}}`);
       set("forecastMeta", `spot ${{money(s.spot)}} | cache ${{s.forecast_cache_status || "-"}}`);
       set("contract", s.contract || "-");
@@ -438,7 +484,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("account", `${{num((s.account || {{}}).equity)}} ${{data.currency}}`);
       set("accountMeta", `available ${{num((s.account || {{}}).available_funds)}} | balance ${{num((s.account || {{}}).balance)}}`);
       set("exposure", `${{s.open_order_count || 0}} / ${{s.position_count || 0}}`);
-      set("orderResult", s.order_submitted ? "order submitted" : "no order submitted");
+      set("orderResult", s.order_submitted ? "order submitted" : ((s.entry_blocks || []).length ? "new entry blocked; management still checked" : "no order submitted"));
       set("plGuardMeta", `total win/loss ${{money(rc.max_total_unrealized_profit_usd)}} / ${{money(rc.max_total_unrealized_loss_usd)}} | position win/loss ${{money(rc.max_position_unrealized_profit_usd)}} / ${{money(rc.max_position_unrealized_loss_usd)}}`);
       set("feedbackStatus", feedback.enabled === false ? "Off" : ((feedback.blocks || []).length ? "Blocking" : "Active"));
       set("feedbackBlocks", (feedback.blocks || []).join(", ") || "no feedback blocks");
