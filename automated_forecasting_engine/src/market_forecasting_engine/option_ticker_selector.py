@@ -59,6 +59,20 @@ class OptionTickerSelectorConfig:
     max_theta_edge_ratio: float = 0.75
     max_theta_premium_pct_per_day: float = 0.35
     min_open_interest: int = 0
+    enable_market_regime_filter: bool = True
+    allow_range_edge_reversal_entry: bool = False
+    market_regime_lookback_rows: int = 120
+    market_regime_breakout_buffer_pct: float = 0.001
+    market_regime_middle_zone_width: float = 0.30
+    min_trend_strength_pct: float = 0.003
+    enable_impulse_entry: bool = True
+    impulse_lookback_bars: int = 12
+    min_impulse_move_pct: float = 0.006
+    min_impulse_directional_bars: int = 7
+    enable_late_entry_filter: bool = True
+    max_late_entry_move_pct: float = 0.018
+    max_ema_extension_pct: float = 0.010
+    exhaustion_reversal_bars: int = 2
     limit_price_offset_pct: float = 0.03
     stop_loss_pct: float = 0.10
     take_profit_pct: float = 0.55
@@ -163,6 +177,7 @@ def evaluate_option_ticker(
                 underlying_price=float(plan["latest_price"] if plan else forecast.get("spot")),
                 forecast=forecast,
                 config=_option_execution_config(ticker=ticker, config=config),
+                prices=prices,
                 now=now,
             )
         except Exception as exc:
@@ -367,6 +382,20 @@ def _option_execution_config(*, ticker: str, config: OptionTickerSelectorConfig)
         max_theta_edge_ratio=config.max_theta_edge_ratio,
         max_theta_premium_pct_per_day=config.max_theta_premium_pct_per_day,
         min_open_interest=config.min_open_interest,
+        enable_market_regime_filter=config.enable_market_regime_filter,
+        allow_range_edge_reversal_entry=config.allow_range_edge_reversal_entry,
+        market_regime_lookback_rows=config.market_regime_lookback_rows,
+        market_regime_breakout_buffer_pct=config.market_regime_breakout_buffer_pct,
+        market_regime_middle_zone_width=config.market_regime_middle_zone_width,
+        min_trend_strength_pct=config.min_trend_strength_pct,
+        enable_impulse_entry=config.enable_impulse_entry,
+        impulse_lookback_bars=config.impulse_lookback_bars,
+        min_impulse_move_pct=config.min_impulse_move_pct,
+        min_impulse_directional_bars=config.min_impulse_directional_bars,
+        enable_late_entry_filter=config.enable_late_entry_filter,
+        max_late_entry_move_pct=config.max_late_entry_move_pct,
+        max_ema_extension_pct=config.max_ema_extension_pct,
+        exhaustion_reversal_bars=config.exhaustion_reversal_bars,
         limit_price_offset_pct=config.limit_price_offset_pct,
         stop_loss_pct=config.stop_loss_pct,
         take_profit_pct=config.take_profit_pct,
@@ -418,6 +447,7 @@ def _hard_blocking_reasons(reasons: list[str]) -> list[str]:
         "forecast_edge_below_selector_min",
         "no_executable_option_plan",
         "no_tradable_option_contracts",
+        "market_regime_blocks_directional_entry",
         "no_contract_passed_execution_gates",
         "position_size_below_one_contract",
     }
@@ -448,6 +478,7 @@ def _trade_plan_summary(trade_plan: dict[str, Any]) -> dict[str, Any]:
         "action": trade_plan.get("action"),
         "reason": trade_plan.get("reason"),
         "option_type": trade_plan.get("option_type"),
+        "market_regime": trade_plan.get("market_regime"),
         "accepted_count": trade_plan.get("accepted_count"),
         "candidate_count": trade_plan.get("candidate_count"),
         "selected_contract": {

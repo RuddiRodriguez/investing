@@ -72,6 +72,7 @@ def test_selector_picks_best_executable_liquid_ticker(monkeypatch) -> None:
             max_spread_pct=0.20,
             min_abs_forecast_return=0.001,
             min_open_interest=0,
+            min_trend_strength_pct=0.001,
         ),
         now=datetime(2026, 6, 4, 15, 0, tzinfo=UTC),
     )
@@ -120,6 +121,9 @@ def test_auto_options_default_horizons_match_eth_style_short_path() -> None:
     assert args.max_delta_distance == 0.30
     assert config.forecast_hours == (0.25, 0.5, 0.75, 1.0)
     assert config.alpaca_data_feed == "iex"
+    assert config.enable_market_regime_filter is True
+    assert config.enable_impulse_entry is True
+    assert config.enable_late_entry_filter is True
     assert config.target_delta == 0.45
     assert config.max_delta_distance == 0.30
 

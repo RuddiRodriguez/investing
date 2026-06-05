@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+import pandas as pd
 
 from market_forecasting_engine.alpaca_options_trader import (
     OptionExecutionConfig,
@@ -144,6 +145,62 @@ def test_build_real_option_trade_plan_returns_limit_order_with_whole_contract_qt
     assert "notional" not in plan["order"]
     assert plan["exit_plan"]["primary_exit"]["type"] == "stop_limit"
     assert plan["exit_plan"]["take_profit"]["type"] == "limit"
+
+
+def test_build_real_option_trade_plan_blocks_oscillating_range_middle_entry() -> None:
+    broker = FakeBroker()
+    prices = pd.DataFrame({"close": [100, 101, 99, 100.5, 99.5, 100.2, 99.8, 100.1, 99.9, 100.0] * 12})
+
+    plan = build_real_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        underlying="TSLA",
+        underlying_price=100.0,
+        forecast={"predicted_price": 104.0, "expected_return": 0.02, "expected_direction": "Upward", "account_equity": 100_000.0, "horizon_hours": 0.25},
+        config=OptionExecutionConfig(
+            underlying="TSLA",
+            enable_market_regime_filter=True,
+            market_regime_lookback_rows=60,
+            min_trend_strength_pct=0.003,
+        ),
+        prices=prices,
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "hold"
+    assert plan["reason"] == "market_regime_blocks_directional_entry"
+    assert plan["market_regime"]["regime"] == "range_bound"
+    assert plan["market_regime"]["reason"] == "price_in_middle_of_range"
+
+
+def test_build_real_option_trade_plan_blocks_late_trend_after_reversal() -> None:
+    broker = FakeBroker()
+    prices = pd.DataFrame({"close": [1660, 1658, 1662, 1659, 1661, 1657, 1660, 1658, 1662, 1660] * 3 + [1655, 1648, 1640, 1632, 1624, 1616, 1608, 1610, 1612]})
+
+    plan = build_real_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        underlying="TSLA",
+        underlying_price=1612.0,
+        forecast={"predicted_price": 1580.0, "expected_return": -0.02, "expected_direction": "Downward", "account_equity": 100_000.0, "horizon_hours": 0.25},
+        config=OptionExecutionConfig(
+            underlying="TSLA",
+            enable_market_regime_filter=True,
+            market_regime_lookback_rows=20,
+            min_trend_strength_pct=0.001,
+            impulse_lookback_bars=8,
+            min_impulse_move_pct=0.004,
+            min_impulse_directional_bars=5,
+            max_late_entry_move_pct=0.01,
+            max_ema_extension_pct=0.004,
+            exhaustion_reversal_bars=2,
+        ),
+        prices=prices,
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "hold"
+    assert plan["reason"] == "market_regime_blocks_directional_entry"
+    assert plan["market_regime"]["regime"] == "late_trend"
+    assert plan["market_regime"]["exhaustion"]["late_entry_block"] is True
 
 
 def test_submit_option_order_rejects_notional_and_market_orders() -> None:

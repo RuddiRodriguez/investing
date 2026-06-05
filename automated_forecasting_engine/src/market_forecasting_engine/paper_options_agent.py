@@ -153,6 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-theta-edge-ratio", type=float, default=None, help="Profile default: reject contracts when expected theta decay over the forecast horizon is too large versus delta-adjusted forecast edge.")
     parser.add_argument("--max-theta-premium-pct-per-day", type=float, default=None, help="Profile default: reject contracts when daily theta decay is too large versus option premium.")
     parser.add_argument("--min-open-interest", type=int, default=0)
+    parser.add_argument("--enable-market-regime-filter", action=argparse.BooleanOptionalAction, default=True, help="Block option entries in oscillating/range-middle regimes and late exhausted trends.")
+    parser.add_argument("--allow-range-edge-reversal-entry", action="store_true", help="Allow countertrend entries only at range edges when the short-term reversal confirms the forecast.")
+    parser.add_argument("--market-regime-lookback-rows", type=int, default=120)
+    parser.add_argument("--market-regime-breakout-buffer-pct", type=float, default=0.001)
+    parser.add_argument("--market-regime-middle-zone-width", type=float, default=0.30)
+    parser.add_argument("--min-trend-strength-pct", type=float, default=0.003)
+    parser.add_argument("--enable-impulse-entry", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--impulse-lookback-bars", type=int, default=12)
+    parser.add_argument("--min-impulse-move-pct", type=float, default=0.006)
+    parser.add_argument("--min-impulse-directional-bars", type=int, default=7)
+    parser.add_argument("--enable-late-entry-filter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-late-entry-move-pct", type=float, default=0.018)
+    parser.add_argument("--max-ema-extension-pct", type=float, default=0.010)
+    parser.add_argument("--exhaustion-reversal-bars", type=int, default=2)
     parser.add_argument("--limit-price-offset-pct", type=float, default=0.03)
     parser.add_argument("--entry-order-policy", choices=("auto", "limit"), default="auto")
     parser.add_argument("--exit-order-policy", choices=("auto", "stop_limit", "trailing_stop", "take_profit"), default="auto")
@@ -258,6 +272,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     asset = broker._request("GET", f"/v2/assets/{args.ticker.upper()}")
     forecast_bundle = state.get("last_forecast")
     now = datetime.now(UTC)
+    prices: pd.DataFrame | None = None
     if forecast_bundle is None or _forecast_is_stale(forecast_bundle, now, int(args.forecast_refresh_seconds)):
         prices = _load_prices(args)
         plan = build_daily_trade_plan(
@@ -282,6 +297,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         plan = forecast_bundle["forecast_plan"]
         forecast = forecast_bundle["selected_forecast"]
         forecast["account_equity"] = _float_or_none(account.get("equity"))
+        if bool(getattr(args, "enable_market_regime_filter", True)):
+            prices = _load_prices(args)
     profile = risk_profile_for_name(args.risk_profile)
     config = OptionExecutionConfig(
         underlying=args.ticker.upper(),
@@ -301,6 +318,20 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         max_theta_edge_ratio=float(args.max_theta_edge_ratio),
         max_theta_premium_pct_per_day=float(args.max_theta_premium_pct_per_day),
         min_open_interest=int(args.min_open_interest),
+        enable_market_regime_filter=bool(args.enable_market_regime_filter),
+        allow_range_edge_reversal_entry=bool(args.allow_range_edge_reversal_entry),
+        market_regime_lookback_rows=int(args.market_regime_lookback_rows),
+        market_regime_breakout_buffer_pct=float(args.market_regime_breakout_buffer_pct),
+        market_regime_middle_zone_width=float(args.market_regime_middle_zone_width),
+        min_trend_strength_pct=float(args.min_trend_strength_pct),
+        enable_impulse_entry=bool(args.enable_impulse_entry),
+        impulse_lookback_bars=int(args.impulse_lookback_bars),
+        min_impulse_move_pct=float(args.min_impulse_move_pct),
+        min_impulse_directional_bars=int(args.min_impulse_directional_bars),
+        enable_late_entry_filter=bool(args.enable_late_entry_filter),
+        max_late_entry_move_pct=float(args.max_late_entry_move_pct),
+        max_ema_extension_pct=float(args.max_ema_extension_pct),
+        exhaustion_reversal_bars=int(args.exhaustion_reversal_bars),
         limit_price_offset_pct=float(args.limit_price_offset_pct),
         stop_loss_pct=float(args.stop_loss_pct),
         take_profit_pct=float(args.take_profit_pct),
@@ -315,6 +346,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         underlying_price=float(plan["latest_price"]),
         forecast=forecast,
         config=config,
+        prices=prices,
     )
     raw_open_orders = broker.orders(status="open", limit=50)
     open_orders = _open_option_orders(raw_open_orders, args.ticker.upper())
@@ -683,6 +715,20 @@ def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
         "take_profit_position_pl": float(args.take_profit_position_pl),
         "profit_retrace_from_peak_pct": float(args.profit_retrace_from_peak_pct),
         "profit_close_limit_offset_pct": float(args.profit_close_limit_offset_pct),
+        "enable_market_regime_filter": bool(args.enable_market_regime_filter),
+        "allow_range_edge_reversal_entry": bool(args.allow_range_edge_reversal_entry),
+        "market_regime_lookback_rows": int(args.market_regime_lookback_rows),
+        "market_regime_breakout_buffer_pct": float(args.market_regime_breakout_buffer_pct),
+        "market_regime_middle_zone_width": float(args.market_regime_middle_zone_width),
+        "min_trend_strength_pct": float(args.min_trend_strength_pct),
+        "enable_impulse_entry": bool(args.enable_impulse_entry),
+        "impulse_lookback_bars": int(args.impulse_lookback_bars),
+        "min_impulse_move_pct": float(args.min_impulse_move_pct),
+        "min_impulse_directional_bars": int(args.min_impulse_directional_bars),
+        "enable_late_entry_filter": bool(args.enable_late_entry_filter),
+        "max_late_entry_move_pct": float(args.max_late_entry_move_pct),
+        "max_ema_extension_pct": float(args.max_ema_extension_pct),
+        "exhaustion_reversal_bars": int(args.exhaustion_reversal_bars),
         "max_spread_pct": args.max_spread_pct,
         "entry_cooldown_minutes": float(args.entry_cooldown_minutes),
         "loss_cooldown_minutes": float(args.loss_cooldown_minutes),

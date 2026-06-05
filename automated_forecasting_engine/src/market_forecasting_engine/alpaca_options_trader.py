@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from market_forecasting_engine.alpaca_broker import AlpacaPaperBroker
+from market_forecasting_engine.options_market_regime import build_options_market_regime
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,20 @@ class OptionExecutionConfig:
     max_theta_edge_ratio: float = 0.75
     max_theta_premium_pct_per_day: float = 0.35
     min_open_interest: int = 0
+    enable_market_regime_filter: bool = False
+    allow_range_edge_reversal_entry: bool = False
+    market_regime_lookback_rows: int = 120
+    market_regime_breakout_buffer_pct: float = 0.001
+    market_regime_middle_zone_width: float = 0.30
+    min_trend_strength_pct: float = 0.003
+    enable_impulse_entry: bool = True
+    impulse_lookback_bars: int = 12
+    min_impulse_move_pct: float = 0.006
+    min_impulse_directional_bars: int = 7
+    enable_late_entry_filter: bool = True
+    max_late_entry_move_pct: float = 0.018
+    max_ema_extension_pct: float = 0.010
+    exhaustion_reversal_bars: int = 2
     limit_price_offset_pct: float = 0.03
     stop_loss_pct: float = 0.35
     take_profit_pct: float = 0.55
@@ -45,12 +60,44 @@ def build_real_option_trade_plan(
     underlying_price: float,
     forecast: dict[str, Any],
     config: OptionExecutionConfig,
+    prices: pd.DataFrame | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     option_type = _option_type_from_forecast(forecast)
     if option_type is None:
         return {"action": "hold", "reason": "forecast_has_no_directional_edge", "forecast": forecast}
+    market_regime = (
+        build_options_market_regime(
+            prices if prices is not None else pd.DataFrame(),
+            current_price=float(underlying_price),
+            forecast=forecast,
+            lookback_rows=int(config.market_regime_lookback_rows),
+            breakout_buffer_pct=float(config.market_regime_breakout_buffer_pct),
+            middle_zone_width=float(config.market_regime_middle_zone_width),
+            min_trend_strength_pct=float(config.min_trend_strength_pct),
+            allow_range_edge_reversal_entry=bool(config.allow_range_edge_reversal_entry),
+            enable_impulse_entry=bool(config.enable_impulse_entry),
+            impulse_lookback_bars=int(config.impulse_lookback_bars),
+            min_impulse_move_pct=float(config.min_impulse_move_pct),
+            min_impulse_directional_bars=int(config.min_impulse_directional_bars),
+            enable_late_entry_filter=bool(config.enable_late_entry_filter),
+            max_late_entry_move_pct=float(config.max_late_entry_move_pct),
+            max_ema_extension_pct=float(config.max_ema_extension_pct),
+            exhaustion_reversal_bars=int(config.exhaustion_reversal_bars),
+        )
+        if config.enable_market_regime_filter
+        else {"enabled": False}
+    )
+    if config.enable_market_regime_filter and market_regime.get("allow_directional_entry") is False:
+        return {
+            "action": "hold",
+            "reason": "market_regime_blocks_directional_entry",
+            "underlying": underlying.upper(),
+            "option_type": option_type,
+            "market_regime": market_regime,
+            "forecast": forecast,
+        }
     start_date, end_date = _expiration_window(now, config)
     contracts = broker.option_contracts(
         underlying_symbols=underlying,
@@ -126,6 +173,7 @@ def build_real_option_trade_plan(
         "action": "buy_option",
         "underlying": underlying.upper(),
         "option_type": option_type,
+        "market_regime": market_regime,
         "selected_contract": selected,
         "order": entry_order,
         "risk": {
