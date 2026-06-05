@@ -406,6 +406,95 @@ class DeribitLiveSpotBroker(DeribitReadOnlyBroker):
         return result if isinstance(result, dict) else {"result": result}
 
 
+class DeribitOptionsBroker(DeribitReadOnlyBroker):
+    """Deribit options execution client for explicit testnet or live mode."""
+
+    def instruments(self, *, currency: str = "ETH", kind: str = "option", expired: bool = False) -> list[dict[str, Any]]:
+        result = self.public_get("get_instruments", {"currency": currency.upper(), "kind": kind, "expired": str(expired).lower()})
+        return result if isinstance(result, list) else []
+
+    def order_book(self, instrument_name: str, *, depth: int = 10) -> dict[str, Any]:
+        result = self.public_get("get_order_book", {"instrument_name": instrument_name, "depth": int(depth)})
+        return result if isinstance(result, dict) else {}
+
+    def ticker(self, instrument_name: str) -> dict[str, Any]:
+        result = self.public_get("ticker", {"instrument_name": instrument_name})
+        return result if isinstance(result, dict) else {}
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        result = self.private_get("cancel", {"order_id": order_id})
+        return result if isinstance(result, dict) else {"result": result}
+
+    def buy_limit(
+        self,
+        *,
+        instrument_name: str,
+        amount: float,
+        price: float,
+        label: str | None = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+    ) -> dict[str, Any]:
+        return self._submit_limit_order(
+            side="buy",
+            instrument_name=instrument_name,
+            amount=amount,
+            price=price,
+            label=label,
+            post_only=post_only,
+            reduce_only=reduce_only,
+        )
+
+    def sell_limit(
+        self,
+        *,
+        instrument_name: str,
+        amount: float,
+        price: float,
+        label: str | None = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+    ) -> dict[str, Any]:
+        return self._submit_limit_order(
+            side="sell",
+            instrument_name=instrument_name,
+            amount=amount,
+            price=price,
+            label=label,
+            post_only=post_only,
+            reduce_only=reduce_only,
+        )
+
+    def _submit_limit_order(
+        self,
+        *,
+        side: str,
+        instrument_name: str,
+        amount: float,
+        price: float,
+        label: str | None,
+        post_only: bool,
+        reduce_only: bool,
+    ) -> dict[str, Any]:
+        if amount <= 0:
+            raise ValueError("Deribit option orders require positive amount.")
+        if price <= 0:
+            raise ValueError("Deribit option limit orders require positive price.")
+        params: dict[str, Any] = {
+            "instrument_name": instrument_name,
+            "amount": amount,
+            "type": "limit",
+            "price": price,
+            "time_in_force": "good_til_cancelled",
+            "post_only": str(bool(post_only)).lower(),
+            "reduce_only": str(bool(reduce_only)).lower(),
+        }
+        if label:
+            params["label"] = label[:64]
+        result = self.private_get(side, params)
+        return result if isinstance(result, dict) else {"result": result}
+
+
 def _env_search_paths() -> list[Path]:
     cwd = Path.cwd()
     return [cwd / ".env", *[parent / ".env" for parent in cwd.parents[:4]]]

@@ -7,6 +7,7 @@ import pytest
 from market_forecasting_engine.deribit_options_trader import (
     DeribitOptionExecutionConfig,
     build_fibonacci_analysis,
+    build_options_market_regime,
     build_deribit_option_trade_plan,
     score_deribit_option_contracts,
     size_deribit_option_position,
@@ -172,6 +173,107 @@ def test_fibonacci_analysis_detects_supportive_bullish_confluence() -> None:
     assert fib["confirmation"] == "supportive"
     assert fib["nearest_support"] == 130.9
     assert fib["nearest_target_price"] > 130.9
+
+
+def test_options_market_regime_blocks_range_middle_directional_entry() -> None:
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [100, 101, 99, 100.5, 99.5, 100.2, 99.8, 100.1, 99.9, 100.0] * 12})
+
+    regime = build_options_market_regime(
+        prices,
+        current_price=100.0,
+        forecast={"expected_return": 0.02},
+        lookback_rows=60,
+        min_trend_strength_pct=0.003,
+    )
+
+    assert regime["regime"] == "range_bound"
+    assert regime["reason"] == "price_in_middle_of_range"
+    assert regime["allow_directional_entry"] is False
+
+
+def test_deribit_trade_plan_holds_when_regime_blocks_directional_entry() -> None:
+    broker = FakeDeribitBroker()
+
+    plan = build_deribit_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        currency="ETH",
+        underlying_price_usd=2000.0,
+        forecast={
+            "predicted_price": 2050.0,
+            "expected_return": 0.02,
+            "expected_direction": "Upward",
+            "market_regime": {"status": "ok", "regime": "range_bound", "allow_directional_entry": False, "reason": "price_in_middle_of_range"},
+        },
+        account={"equity": 10.0, "balance": 10.0},
+        config=DeribitOptionExecutionConfig(currency="ETH", max_spread_pct=0.2),
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "hold"
+    assert plan["reason"] == "market_regime_blocks_directional_entry"
+    assert plan["market_regime"]["reason"] == "price_in_middle_of_range"
+
+
+def test_options_market_regime_allows_confirmed_breakout() -> None:
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [100 + i * 0.1 for i in range(80)] + [109, 110, 111, 113]})
+
+    regime = build_options_market_regime(
+        prices,
+        current_price=113.0,
+        forecast={"expected_return": 0.03},
+        lookback_rows=60,
+        min_trend_strength_pct=0.003,
+    )
+
+    assert regime["regime"] == "trend_up"
+    assert regime["allow_directional_entry"] is True
+
+
+def test_options_market_regime_allows_forecast_aligned_up_impulse_before_breakout() -> None:
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [1660, 1658, 1662, 1659, 1661, 1657, 1660, 1658, 1662, 1660] * 3 + [1678, 1640, 1643, 1646, 1650, 1654, 1658, 1662, 1666, 1670, 1674, 1676]})
+
+    regime = build_options_market_regime(
+        prices,
+        current_price=1676.0,
+        forecast={"expected_return": 0.02},
+        lookback_rows=20,
+        min_trend_strength_pct=0.02,
+        impulse_lookback_bars=10,
+        min_impulse_move_pct=0.006,
+        min_impulse_directional_bars=7,
+    )
+
+    assert regime["regime"] == "trend_up"
+    assert regime["breakout_status"] == "impulse_up"
+    assert regime["impulse"]["allow_entry"] is True
+    assert regime["allow_directional_entry"] is True
+
+
+def test_options_market_regime_blocks_impulse_opposite_forecast() -> None:
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [1660, 1658, 1662, 1659, 1661, 1657, 1660, 1658, 1662, 1660] * 3 + [1678, 1640, 1643, 1646, 1650, 1654, 1658, 1662, 1666, 1670, 1674, 1676]})
+
+    regime = build_options_market_regime(
+        prices,
+        current_price=1676.0,
+        forecast={"expected_return": -0.02},
+        lookback_rows=20,
+        min_trend_strength_pct=0.02,
+        impulse_lookback_bars=10,
+        min_impulse_move_pct=0.006,
+        min_impulse_directional_bars=7,
+    )
+
+    assert regime["impulse"]["direction"] == "up"
+    assert regime["impulse"]["allow_entry"] is False
+    assert regime["allow_directional_entry"] is False
 
 
 def test_score_deribit_contracts_blocks_entries_too_close_to_forecast_horizon_and_expiry_close_window() -> None:
@@ -569,8 +671,8 @@ def test_deribit_total_unrealized_profit_closes_positions_in_usd() -> None:
     assert actions[0]["action"] == "max_total_unrealized_profit_usd_triggered"
     assert actions[0]["total_unrealized_pl_usd"] == 60
     assert len([action for action in actions if action["action"] == "total_profit_position_close_triggered"]) == 2
-    assert broker.sell_orders[1]["price"] == 0.019
-    assert broker.sell_orders[3]["price"] == 0.0284
+    assert broker.sell_orders[1]["price"] == 0.0198
+    assert broker.sell_orders[3]["price"] == 0.0296
 
 
 def test_deribit_total_profit_winning_only_filters_losers() -> None:
@@ -597,6 +699,7 @@ def test_deribit_per_position_loss_guard_closes_only_losing_position() -> None:
             liquidation_limit_offset_pct=0.05,
         ),
         open_orders=[],
+        state={},
         positions=[
             {"instrument_name": "ETH-3JUN26-2000-P", "size": 1, "mark_price": 0.02, "floating_profit_loss": -0.003},
             {"instrument_name": "ETH-4JUN26-2100-P", "size": 1, "mark_price": 0.03, "floating_profit_loss": 0.001},
@@ -626,6 +729,7 @@ def test_deribit_negative_per_position_loss_value_is_treated_as_absolute_cutoff(
             liquidation_limit_offset_pct=0.05,
         ),
         open_orders=[],
+        state={},
         positions=[{"instrument_name": "ETH-3JUN26-2000-P", "size": 1, "mark_price": 0.02, "floating_profit_loss": -0.003}],
         now=datetime(2026, 6, 1, tzinfo=UTC),
         underlying_price_usd=2000.0,
@@ -650,6 +754,7 @@ def test_deribit_per_position_profit_guard_closes_only_winning_position() -> Non
             liquidation_limit_offset_pct=0.05,
         ),
         open_orders=[],
+        state={},
         positions=[
             {"instrument_name": "ETH-3JUN26-2000-P", "size": 1, "mark_price": 0.02, "floating_profit_loss": -0.001},
             {"instrument_name": "ETH-4JUN26-2100-P", "size": 1, "mark_price": 0.03, "floating_profit_loss": 0.004},
@@ -662,6 +767,50 @@ def test_deribit_per_position_profit_guard_closes_only_winning_position() -> Non
     assert actions[1]["position_unrealized_pl_usd"] == 8
     assert broker.sell_orders[0]["instrument_name"] == "ETH-4JUN26-2100-P"
     assert broker.sell_orders[0]["reduce_only"] is True
+
+
+def test_deribit_profit_retrace_closes_after_peak_giveback_for_usdc_option() -> None:
+    from argparse import Namespace
+
+    broker = FakeExitBroker()
+    state = {
+        "option_position_profit_peaks": {
+            "ETH_USDC-8JUN26-1650-P": {
+                "instrument_name": "ETH_USDC-8JUN26-1650-P",
+                "peak_unrealized_pl_base": 5.0,
+                "peak_unrealized_pl_usd": 5.0,
+                "peak_mark_price": 42.0,
+                "updated_at_utc": "2026-06-01T13:55:00+00:00",
+            }
+        }
+    }
+
+    actions = _manage_position_unrealized_guards(
+        broker=broker,  # type: ignore[arg-type]
+        args=Namespace(
+            currency="ETH",
+            execute_live_orders=True,
+            max_position_unrealized_loss_usd=None,
+            max_position_unrealized_profit_usd=None,
+            take_profit_position_pl_usd=3,
+            profit_retrace_from_peak_pct=0.20,
+            profit_close_limit_offset_pct=0.01,
+            liquidation_limit_offset_pct=0.05,
+        ),
+        open_orders=[{"order_id": "old-profit", "instrument_name": "ETH_USDC-8JUN26-1650-P", "side": "sell"}],
+        state=state,
+        positions=[{"instrument_name": "ETH_USDC-8JUN26-1650-P", "size": 0.3, "mark_price": 34.5, "floating_profit_loss": 3.8}],
+        now=datetime(2026, 6, 1, 14, 0, tzinfo=UTC),
+        underlying_price_usd=1665.0,
+    )
+
+    assert actions[0]["action"] == "position_profit_retrace_close_triggered"
+    assert actions[0]["peak_unrealized_pl_usd"] == 5
+    assert actions[0]["protected_profit_usd"] == 4
+    assert actions[0]["close_limit_offset_pct"] == 0.01
+    assert broker.cancelled == ["old-profit"]
+    assert broker.sell_orders[-1]["instrument_name"] == "ETH_USDC-8JUN26-1650-P"
+    assert broker.sell_orders[-1]["price"] == 34.155
 
 
 def test_protective_close_triggers_wait_until_next_forecast() -> None:

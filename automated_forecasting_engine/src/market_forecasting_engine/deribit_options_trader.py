@@ -7,12 +7,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from market_forecasting_engine.deribit_broker import DeribitTestnetBroker
+from market_forecasting_engine.deribit_broker import DeribitOptionsBroker, DeribitTestnetBroker
 
 
 @dataclass(frozen=True)
 class DeribitOptionExecutionConfig:
     currency: str
+    underlying_currency: str | None = None
     risk_profile: str = "aggressive"
     min_dte: int = 1
     max_dte: int = 14
@@ -32,6 +33,16 @@ class DeribitOptionExecutionConfig:
     enable_fibonacci: bool = True
     require_fibonacci_confluence: bool = False
     max_fibonacci_distance_pct: float = 0.006
+    enable_market_regime_filter: bool = True
+    allow_range_edge_reversal_entry: bool = False
+    market_regime_lookback_rows: int = 120
+    market_regime_breakout_buffer_pct: float = 0.001
+    market_regime_middle_zone_width: float = 0.30
+    min_trend_strength_pct: float = 0.003
+    enable_impulse_entry: bool = True
+    impulse_lookback_bars: int = 12
+    min_impulse_move_pct: float = 0.006
+    min_impulse_directional_bars: int = 7
     min_hours_to_expiry_for_entry: float = 18.0
     close_before_expiry_hours: float = 12.0
     entry_expiry_buffer_hours: float = 4.0
@@ -69,10 +80,23 @@ def build_deribit_option_trade_plan(
             "fibonacci_analysis": fibonacci,
             "forecast": forecast,
         }
+    regime = forecast.get("market_regime") if isinstance(forecast.get("market_regime"), dict) else {}
+    if config.enable_market_regime_filter and regime and regime.get("allow_directional_entry") is False:
+        return {
+            "action": "hold",
+            "reason": "market_regime_blocks_directional_entry",
+            "currency": currency.upper(),
+            "option_type": option_type,
+            "market_regime": regime,
+            "fibonacci_analysis": fibonacci if config.enable_fibonacci else {"enabled": False},
+            "forecast": forecast,
+        }
     instruments = broker.instruments(currency=currency, kind="option", expired=False)
+    underlying_prefix = _option_instrument_prefix(currency=currency, underlying_currency=config.underlying_currency)
     candidates = score_deribit_option_contracts(
         broker=broker,
         instruments=instruments,
+        instrument_prefix=underlying_prefix,
         underlying_price_usd=underlying_price_usd,
         forecast=forecast,
         option_type=option_type,
@@ -97,6 +121,7 @@ def build_deribit_option_trade_plan(
             underlying_price_usd=underlying_price_usd,
             account=account,
             config=config,
+            premium_usd_per_contract=_float_or_none(candidate.get("estimated_premium_usd_per_contract")),
             min_trade_amount=_float_or_none(candidate.get("min_trade_amount")),
         )
         candidate["sizing"] = candidate_sizing
@@ -111,6 +136,7 @@ def build_deribit_option_trade_plan(
             underlying_price_usd=underlying_price_usd,
             account=account,
             config=config,
+            premium_usd_per_contract=_float_or_none(best.get("estimated_premium_usd_per_contract")),
             min_trade_amount=_float_or_none(best.get("min_trade_amount")),
         )
         return {
@@ -134,6 +160,7 @@ def build_deribit_option_trade_plan(
         "currency": currency.upper(),
         "option_type": option_type,
         "fibonacci_analysis": fibonacci if config.enable_fibonacci else {"enabled": False},
+        "market_regime": regime if config.enable_market_regime_filter else {"enabled": False},
         "selected_contract": selected,
         "order": entry_order,
         "risk": {
@@ -168,6 +195,7 @@ def score_deribit_option_contracts(
     *,
     broker: DeribitTestnetBroker,
     instruments: list[dict[str, Any]],
+    instrument_prefix: str | None = None,
     underlying_price_usd: float,
     forecast: dict[str, Any],
     option_type: str,
@@ -178,9 +206,11 @@ def score_deribit_option_contracts(
     scored: list[dict[str, Any]] = []
     forecast_price = _float_or_none(forecast.get("predicted_price"))
     for instrument in instruments:
+        name = str(instrument.get("instrument_name") or "")
+        if instrument_prefix and not name.upper().startswith(instrument_prefix.upper()):
+            continue
         if str(instrument.get("option_type") or "").lower() != option_type:
             continue
-        name = str(instrument.get("instrument_name") or "")
         expiry = _expiry_from_ms(instrument.get("expiration_timestamp"))
         dte = None if expiry is None else max(0, (expiry.date() - now.date()).days)
         hours_to_expiry = None if expiry is None else (expiry - now).total_seconds() / 3600.0
@@ -234,7 +264,8 @@ def score_deribit_option_contracts(
         vega = _float_or_none(greeks.get("vega"))
         rho = _float_or_none(greeks.get("rho"))
         volume = _float_or_none(stats.get("volume"))
-        premium_usd = None if ask is None else ask * underlying_price_usd
+        premium_multiplier_usd = _premium_multiplier_usd(instrument=instrument, underlying_price_usd=underlying_price_usd)
+        premium_usd = None if ask is None else ask * premium_multiplier_usd
         forecast_edge_usd = None
         theta_decay_usd_for_horizon = None
         theta_premium_pct_per_day = None
@@ -300,6 +331,8 @@ def score_deribit_option_contracts(
                 "spread_pct": spread_pct,
                 "underlying_price_usd": underlying_price_usd,
                 "estimated_premium_usd_per_contract": premium_usd,
+                "premium_currency": _premium_currency(instrument),
+                "premium_multiplier_usd": premium_multiplier_usd,
                 "greeks": {
                     "mode": str(config.greeks_mode).lower(),
                     "delta": delta,
@@ -340,11 +373,13 @@ def size_deribit_option_position(
     underlying_price_usd: float,
     account: dict[str, Any],
     config: DeribitOptionExecutionConfig,
+    premium_usd_per_contract: float | None = None,
     min_trade_amount: float | None,
 ) -> dict[str, Any]:
-    premium_usd = max(float(entry_limit_price_base), 1e-12) * max(float(underlying_price_usd), 1e-12)
+    premium_usd = max(float(premium_usd_per_contract) if premium_usd_per_contract is not None else float(entry_limit_price_base) * max(float(underlying_price_usd), 1e-12), 1e-12)
     equity_base = _float_or_none(account.get("equity")) or _float_or_none(account.get("balance")) or 0.0
-    equity_usd = max(equity_base, 0.0) * max(float(underlying_price_usd), 0.0)
+    account_currency = str(account.get("currency") or config.currency or "").upper()
+    equity_usd = max(equity_base, 0.0) if account_currency in {"USD", "USDC", "USDT", "USDE"} else max(equity_base, 0.0) * max(float(underlying_price_usd), 0.0)
     risk_budget = equity_usd * float(config.risk_budget_pct) if equity_usd > 0 else premium_usd
     exposure_budget = equity_usd * float(config.max_position_equity_pct) if equity_usd > 0 else float(config.max_total_debit_usd)
     budget = max(0.0, min(float(config.max_total_debit_usd), exposure_budget, max(risk_budget, premium_usd)))
@@ -427,7 +462,7 @@ def build_deribit_exit_plan(
 
 
 def submit_deribit_limit_order(
-    broker: DeribitTestnetBroker,
+    broker: DeribitTestnetBroker | DeribitOptionsBroker,
     order: dict[str, Any],
     *,
     label: str | None = None,
@@ -543,6 +578,168 @@ def build_fibonacci_analysis(
     }
 
 
+def build_options_market_regime(
+    prices: pd.DataFrame,
+    *,
+    current_price: float,
+    forecast: dict[str, Any],
+    lookback_rows: int = 120,
+    breakout_buffer_pct: float = 0.001,
+    middle_zone_width: float = 0.30,
+    min_trend_strength_pct: float = 0.003,
+    allow_range_edge_reversal_entry: bool = False,
+    enable_impulse_entry: bool = True,
+    impulse_lookback_bars: int = 12,
+    min_impulse_move_pct: float = 0.006,
+    min_impulse_directional_bars: int = 7,
+) -> dict[str, Any]:
+    if prices is None or prices.empty:
+        return {"enabled": True, "status": "unavailable", "reason": "missing_price_history", "allow_directional_entry": False}
+    close = _price_series(prices).dropna()
+    if len(close) < 30:
+        return {"enabled": True, "status": "unavailable", "reason": "not_enough_price_history", "rows": len(close), "allow_directional_entry": False}
+    window = close.tail(max(30, int(lookback_rows)))
+    prior = window.iloc[:-1] if len(window) > 1 else window
+    support = float(prior.min())
+    resistance = float(prior.max())
+    latest = float(current_price)
+    price_range = max(resistance - support, 0.0)
+    range_width_pct = price_range / max(abs(latest), 1e-9)
+    range_position = 0.5 if price_range <= 0 else max(0.0, min(1.0, (latest - support) / price_range))
+    fast = window.ewm(span=min(9, len(window)), adjust=False).mean()
+    slow = window.ewm(span=min(21, len(window)), adjust=False).mean()
+    ema_spread_pct = float(fast.iloc[-1] / max(float(slow.iloc[-1]), 1e-9) - 1.0)
+    slope_window = min(15, max(3, len(window) // 4))
+    slope_pct = float(window.iloc[-1] / max(float(window.iloc[-slope_window]), 1e-9) - 1.0)
+    trend_strength_pct = abs(ema_spread_pct) + abs(slope_pct)
+    forecast_return = _float_or_none(forecast.get("expected_return")) or 0.0
+    forecast_direction = "up" if forecast_return > 0 else "down" if forecast_return < 0 else "flat"
+    breakout_up = latest > resistance * (1.0 + max(0.0, float(breakout_buffer_pct)))
+    breakout_down = latest < support * (1.0 - max(0.0, float(breakout_buffer_pct)))
+    aligned_up = forecast_direction == "up" and (breakout_up or (ema_spread_pct > 0 and slope_pct > 0 and range_position >= 0.60))
+    aligned_down = forecast_direction == "down" and (breakout_down or (ema_spread_pct < 0 and slope_pct < 0 and range_position <= 0.40))
+    strong_trend = trend_strength_pct >= max(0.0, float(min_trend_strength_pct))
+    middle_half_width = max(0.0, min(1.0, float(middle_zone_width))) / 2.0
+    middle_low = 0.5 - middle_half_width
+    middle_high = 0.5 + middle_half_width
+    in_middle = middle_low <= range_position <= middle_high
+    near_support = range_position <= 0.20
+    near_resistance = range_position >= 0.80
+    impulse = _options_impulse_signal(
+        window,
+        forecast_direction=forecast_direction,
+        lookback_bars=int(impulse_lookback_bars),
+        min_move_pct=float(min_impulse_move_pct),
+        min_directional_bars=int(min_impulse_directional_bars),
+    ) if enable_impulse_entry else {"enabled": False, "allow_entry": False}
+    range_edge_reversal = bool(
+        allow_range_edge_reversal_entry
+        and (
+            (forecast_direction == "up" and near_support and slope_pct > 0)
+            or (forecast_direction == "down" and near_resistance and slope_pct < 0)
+        )
+    )
+    if breakout_up:
+        regime = "trend_up"
+        breakout_status = "confirmed_breakout"
+    elif breakout_down:
+        regime = "trend_down"
+        breakout_status = "confirmed_breakdown"
+    elif strong_trend and aligned_up:
+        regime = "trend_up"
+        breakout_status = "trend_continuation"
+    elif strong_trend and aligned_down:
+        regime = "trend_down"
+        breakout_status = "trend_continuation"
+    elif bool(impulse.get("allow_entry")) and forecast_direction == "up":
+        regime = "trend_up"
+        breakout_status = "impulse_up"
+    elif bool(impulse.get("allow_entry")) and forecast_direction == "down":
+        regime = "trend_down"
+        breakout_status = "impulse_down"
+    elif in_middle:
+        regime = "range_bound"
+        breakout_status = "inside_range_middle"
+    else:
+        regime = "range_edge"
+        breakout_status = "inside_range_edge"
+    allow_entry = bool(
+        (forecast_direction == "up" and regime == "trend_up" and strong_trend)
+        or (forecast_direction == "down" and regime == "trend_down" and strong_trend)
+        or bool(impulse.get("allow_entry"))
+        or range_edge_reversal
+    )
+    reason = "directional_trend_confirmed" if allow_entry and not range_edge_reversal and not bool(impulse.get("allow_entry")) else "impulse_entry_confirmed" if bool(impulse.get("allow_entry")) else "range_edge_reversal_allowed" if allow_entry else "range_or_noise_without_confirmed_direction"
+    if in_middle and not allow_entry:
+        reason = "price_in_middle_of_range"
+    return {
+        "enabled": True,
+        "status": "ok",
+        "regime": regime,
+        "reason": reason,
+        "allow_directional_entry": allow_entry,
+        "forecast_direction": forecast_direction,
+        "support_level": support,
+        "resistance_level": resistance,
+        "range_position": round(float(range_position), 4),
+        "range_width_pct": round(float(range_width_pct), 6),
+        "breakout_status": breakout_status,
+        "breakout_up": breakout_up,
+        "breakout_down": breakout_down,
+        "ema_spread_pct": round(float(ema_spread_pct), 6),
+        "slope_pct": round(float(slope_pct), 6),
+        "trend_strength_pct": round(float(trend_strength_pct), 6),
+        "min_trend_strength_pct": float(min_trend_strength_pct),
+        "middle_zone": [round(float(middle_low), 4), round(float(middle_high), 4)],
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "range_edge_reversal_allowed": range_edge_reversal,
+        "impulse": impulse,
+        "lookback_rows": len(window),
+    }
+
+
+def _options_impulse_signal(
+    close: pd.Series,
+    *,
+    forecast_direction: str,
+    lookback_bars: int,
+    min_move_pct: float,
+    min_directional_bars: int,
+) -> dict[str, Any]:
+    if len(close) < max(4, int(lookback_bars) + 1):
+        return {"enabled": True, "status": "insufficient_history", "allow_entry": False}
+    lookback = max(3, int(lookback_bars))
+    segment = close.tail(lookback + 1)
+    start = float(segment.iloc[0])
+    end = float(segment.iloc[-1])
+    move_pct = end / max(abs(start), 1e-9) - 1.0
+    diffs = segment.diff().dropna()
+    up_bars = int((diffs > 0).sum())
+    down_bars = int((diffs < 0).sum())
+    required_bars = max(1, min(int(min_directional_bars), lookback))
+    if move_pct >= float(min_move_pct) and up_bars >= required_bars:
+        direction = "up"
+    elif move_pct <= -float(min_move_pct) and down_bars >= required_bars:
+        direction = "down"
+    else:
+        direction = "none"
+    allow_entry = bool(direction != "none" and direction == forecast_direction)
+    return {
+        "enabled": True,
+        "status": "ok",
+        "direction": direction,
+        "allow_entry": allow_entry,
+        "move_pct": round(float(move_pct), 6),
+        "min_move_pct": float(min_move_pct),
+        "lookback_bars": lookback,
+        "up_bars": up_bars,
+        "down_bars": down_bars,
+        "min_directional_bars": required_bars,
+        "forecast_direction": forecast_direction,
+    }
+
+
 def _option_type_from_forecast(forecast: dict[str, Any]) -> str | None:
     direction = str(forecast.get("expected_direction") or "").lower()
     expected_return = _float_or_none(forecast.get("expected_return"))
@@ -556,6 +753,25 @@ def _option_type_from_forecast(forecast: dict[str, Any]) -> str | None:
     if direction.startswith("down"):
         return "put"
     return None
+
+
+def _option_instrument_prefix(*, currency: str, underlying_currency: str | None) -> str | None:
+    currency = str(currency or "").upper()
+    underlying = str(underlying_currency or "").upper()
+    if currency in {"USDC", "USDT", "USDE"} and underlying:
+        return f"{underlying}_{currency}-"
+    return f"{currency}-" if currency else None
+
+
+def _premium_currency(instrument: dict[str, Any]) -> str:
+    return str(instrument.get("settlement_currency") or instrument.get("quote_currency") or instrument.get("counter_currency") or "").upper()
+
+
+def _premium_multiplier_usd(*, instrument: dict[str, Any], underlying_price_usd: float) -> float:
+    premium_currency = _premium_currency(instrument)
+    if premium_currency in {"USD", "USDC", "USDT", "USDE"}:
+        return 1.0
+    return max(float(underlying_price_usd), 1e-12)
 
 
 def _price_series(prices: pd.DataFrame) -> pd.Series:

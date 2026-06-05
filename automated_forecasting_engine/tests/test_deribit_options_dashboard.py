@@ -106,6 +106,29 @@ def test_summarize_deribit_position_pl_splits_winners_and_losers() -> None:
     assert payload["total_value_usd"] == 76
 
 
+def test_summarize_usdc_settled_position_pl_does_not_multiply_by_underlying() -> None:
+    payload = summarize_position_pl(
+        [
+            {
+                "instrument_name": "ETH_USDC-8JUN26-1650-P",
+                "size": 0.3,
+                "average_price": 35.2,
+                "mark_price": 34.5,
+                "floating_profit_loss": -0.21,
+            }
+        ],
+        underlying_price_usd=1665.0,
+    )
+
+    assert payload["display_currency"] == "USDC"
+    assert payload["total_cost_base"] == 10.56
+    assert payload["total_value_base"] == 10.35
+    assert payload["total_cost_usd"] == 10.56
+    assert payload["total_value_usd"] == 10.35
+    assert payload["total_unrealized_pl_usd"] == -0.21
+    assert payload["rows"][0]["value_currency"] == "USDC"
+
+
 def test_build_forecast_chart_uses_latest_forecast_path() -> None:
     first = {
         "checked_at": "2026-06-01T09:00:00+00:00",

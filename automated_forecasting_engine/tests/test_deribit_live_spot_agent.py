@@ -199,7 +199,7 @@ def test_existing_eth_can_scale_in_on_strict_lower_pullback_setup() -> None:
     )
 
     assert plan["action"] == "place_scale_in_pullback_buy"
-    assert plan["entry_order"] == {"side": "buy", "type": "limit", "amount": 0.006999, "price": 1715.0}
+    assert plan["entry_order"] == {"side": "buy", "type": "limit", "amount": 0.007, "price": 1715.0}
     assert plan["scale_in_pullback"]["average_entry_price"] == 1770.0
     assert plan["post_fill_protection_plan"]["stop_loss"]["trigger_price"] == 1690.0
 

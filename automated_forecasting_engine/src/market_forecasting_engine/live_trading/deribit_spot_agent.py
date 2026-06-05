@@ -89,6 +89,10 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
     order_book = broker.order_book(instrument, depth=10)
     quote = book_quote(order_book)
     ticker = broker.ticker(instrument)
+    instrument_details = broker.public_get("get_instrument", {"instrument_name": instrument})
+    args.price_tick_size = _float((instrument_details or {}).get("tick_size")) or 0.01
+    args.base_amount_step = _float((instrument_details or {}).get("contract_size")) or 0.000001
+    args.min_order_base_amount = max(float(args.min_order_base_amount), _float((instrument_details or {}).get("min_trade_amount")) or 0.0)
     open_orders = dedupe_orders(
         [
             *broker.open_orders(currency=base_currency, kind="spot"),
@@ -132,7 +136,7 @@ def run_once(args: argparse.Namespace, broker: DeribitLiveSpotBroker | None = No
             base_currency: account_subset(base_account),
             quote_currency: account_subset(quote_account),
         },
-        "market": {"order_book": order_book, "ticker": ticker, "quote": quote, "latest_price": price},
+        "market": {"order_book": order_book, "ticker": ticker, "instrument": instrument_details, "quote": quote, "latest_price": price},
         "forecast": forecast,
         "forecast_bundle": forecast_bundle,
         "open_orders": open_orders,
@@ -279,10 +283,10 @@ def decide_spot_trade(
         if managed_balance >= float(args.max_base_position):
             return protection_plan(args=args, latest_price=latest_price, base_balance=base_balance, managed_base_balance=managed_balance, quote_available=quote_available, forecast=forecast, edge_pct=edge_pct, reason="max_base_position_reached")
         max_notional = min(float(args.max_notional_usdc), quote_available)
-        amount = round_down(max_notional / float(quote["ask"] or latest_price), 6)
+        amount = agent_round_amount(args, max_notional / float(quote["ask"] or latest_price))
         if amount < float(args.min_order_base_amount):
             return hold_plan("not_enough_quote_available_for_min_order", args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct)
-        entry_price = round_price(float(quote["ask"] or latest_price) * 1.001)
+        entry_price = agent_round_price(args, float(quote["ask"] or latest_price) * 1.001)
         return {
             **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct),
             "action": "buy_spot",
@@ -326,12 +330,12 @@ def decide_spot_trade(
             if scale_in is not None:
                 protection_decision["scale_in_pullback"] = scale_in.get("scale_in_pullback", {})
             return protection_decision
-        sell_price = round_price(float(quote["bid"] or latest_price) * 0.999)
+        sell_price = agent_round_price(args, float(quote["bid"] or latest_price) * 0.999)
         plan = {
             **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct),
             "action": "sell_spot",
             "reason": "bearish_forecast_sell_existing_base",
-            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(managed_balance, float(args.max_base_position)), 6), "price": sell_price},
+            "entry_order": {"side": "sell", "type": "limit", "amount": agent_round_amount(args, min(managed_balance, float(args.max_base_position))), "price": sell_price},
             "protection": {},
             "inventory_scope": inventory_scope_payload(args=args, base_balance=base_balance, managed_balance=managed_balance, manual_balance=manual_balance),
         }
@@ -385,12 +389,12 @@ def protection_aware_bearish_plan(
     else:
         beyond_stop_pct = 0.0
     if stop_price > 0 and predicted < stop_price and beyond_stop_pct >= float(getattr(args, "sell_now_min_forecast_beyond_stop_pct", 0.01)):
-        sell_price = round_price(latest_price * 0.999)
+        sell_price = agent_round_price(args, latest_price * 0.999)
         return {
             **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct),
             "action": "sell_spot",
             "reason": "bearish_forecast_breaks_materially_below_existing_stop",
-            "entry_order": {"side": "sell", "type": "limit", "amount": round_down(min(managed_base_balance, float(args.max_base_position)), 6), "price": sell_price},
+            "entry_order": {"side": "sell", "type": "limit", "amount": agent_round_amount(args, min(managed_base_balance, float(args.max_base_position))), "price": sell_price},
             "protection": {},
             "existing_protection": coverage,
             "protection_decision": {
@@ -533,7 +537,7 @@ def scale_in_pullback_buy_plan(
     max_notional = float(getattr(args, "scale_in_max_notional_usdc", None) or args.max_notional_usdc)
     max_notional = min(max_notional, quote_available)
     if entry_price > 0:
-        amount = round_down(min(remaining_base_capacity, max_addition_by_fraction, max_notional / entry_price), 6)
+        amount = agent_round_amount(args, min(remaining_base_capacity, max_addition_by_fraction, max_notional / entry_price))
     else:
         amount = 0.0
     if remaining_base_capacity <= 0:
@@ -551,7 +555,7 @@ def scale_in_pullback_buy_plan(
             "policy": "Scale-in is blocked unless the existing position loss, entry discount, exposure, and pullback reversal gates all pass.",
         }
         return plan
-    entry_price = round_price(entry_price)
+    entry_price = agent_round_price(args, entry_price)
     stop_pct = max(0.0, (entry_price - stop_price) / entry_price)
     take_profit_pct = max(0.0, (target_price - entry_price) / entry_price)
     protection_args = argparse.Namespace(**vars(args))
@@ -624,10 +628,10 @@ def pullback_buy_plan(
         plan["pullback_buy"] = {"setup": setup, "distance_pct": distance_pct, "blocking_reasons": reasons}
         return plan
     max_notional = min(float(args.max_notional_usdc), quote_available)
-    amount = round_down(max_notional / entry_price, 6)
+    amount = agent_round_amount(args, max_notional / entry_price)
     if amount < float(args.min_order_base_amount):
         return hold_plan("not_enough_quote_available_for_pullback_order", args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=spread_pct, edge_pct=edge_pct)
-    entry_price = round_price(entry_price)
+    entry_price = agent_round_price(args, entry_price)
     stop_pct = max(0.0, (entry_price - stop_price) / entry_price)
     take_profit_pct = max(0.0, (target_price - entry_price) / entry_price)
     protection_args = argparse.Namespace(**vars(args))
@@ -651,7 +655,7 @@ def pullback_buy_plan(
 
 def protection_plan(*, args: argparse.Namespace, latest_price: float, base_balance: float, managed_base_balance: float | None = None, quote_available: float, forecast: dict[str, Any], edge_pct: float, reason: str) -> dict[str, Any]:
     protected_balance = base_balance if managed_base_balance is None else managed_base_balance
-    amount = round_down(min(protected_balance, float(args.max_base_position)), 6)
+    amount = agent_round_amount(args, min(protected_balance, float(args.max_base_position)))
     return {
         **base_plan(args=args, latest_price=latest_price, forecast=forecast, base_balance=base_balance, quote_available=quote_available, spread_pct=None, edge_pct=edge_pct),
         "action": "protect_existing_position" if amount >= float(args.min_order_base_amount) else "hold",
@@ -668,14 +672,14 @@ def protection_orders(*, args: argparse.Namespace, amount: float, entry_referenc
             "side": "sell",
             "type": "limit",
             "amount": amount,
-            "price": round_price(entry_reference * (1.0 + float(args.take_profit_pct))),
+            "price": agent_round_price(args, entry_reference * (1.0 + float(args.take_profit_pct))),
             "meaning": "Take profit if ETH_USDC rises to the limit price.",
         },
         "stop_loss": {
             "side": "sell",
             "type": "stop_market",
             "amount": amount,
-            "trigger_price": round_price(entry_reference * (1.0 - float(args.stop_loss_pct))),
+            "trigger_price": agent_round_price(args, entry_reference * (1.0 - float(args.stop_loss_pct))),
             "trigger": "index_price",
             "meaning": "Protective stop if ETH_USDC falls to the trigger price.",
         },
@@ -960,9 +964,34 @@ def round_price(value: float) -> float:
     return round(float(value), 2)
 
 
+def agent_round_price(args: argparse.Namespace, value: float) -> float:
+    return round_to_tick(value, _float(getattr(args, "price_tick_size", None)) or 0.01)
+
+
+def round_to_tick(value: float, tick_size: float) -> float:
+    tick = _float(tick_size) or 0.01
+    if tick <= 0:
+        tick = 0.01
+    decimals = max(0, len(f"{tick:.12f}".rstrip("0").split(".")[-1]) if "." in f"{tick:.12f}".rstrip("0") else 0)
+    return round(round(float(value) / tick) * tick, decimals)
+
+
 def round_down(value: float, decimals: int) -> float:
     factor = 10**decimals
     return math_floor(float(value) * factor) / factor
+
+
+def agent_round_amount(args: argparse.Namespace, value: float) -> float:
+    step = _float(getattr(args, "base_amount_step", None)) or 0.000001
+    return round_down_to_step(value, step)
+
+
+def round_down_to_step(value: float, step: float) -> float:
+    step = _float(step) or 0.000001
+    if step <= 0:
+        step = 0.000001
+    decimals = max(0, len(f"{step:.12f}".rstrip("0").split(".")[-1]) if "." in f"{step:.12f}".rstrip("0") else 0)
+    return round(math_floor(float(value) / step) * step, decimals)
 
 
 def math_floor(value: float) -> int:

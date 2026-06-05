@@ -29,6 +29,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
     spot = _to_float((report.get("selected_forecast") or {}).get("spot"))
     position_pl = summarize_position_pl(report.get("option_positions") or [], underlying_price_usd=spot)
     fibonacci = trade_plan.get("fibonacci_analysis") or (report.get("selected_forecast") or {}).get("fibonacci_analysis") or {}
+    market_regime = trade_plan.get("market_regime") or (report.get("selected_forecast") or {}).get("market_regime") or {}
     forecast_chart = build_forecast_chart(history=history, latest_report=report)
     report_age_seconds = _age_seconds(report.get("checked_at"))
     stop_request = _active_stop_request(state.get("stop_request"))
@@ -36,7 +37,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
     management_actions = report.get("management_actions") or []
     return {
         "generated_at": datetime.now(UTC).isoformat(),
-        "venue": "deribit_testnet",
+        "venue": report.get("venue") or "deribit_testnet",
         "currency": currency.upper(),
         "state_dir": str(state_dir),
         "report_path": str(report_path) if report_path else None,
@@ -67,6 +68,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
             "spread_pct": selected.get("spread_pct"),
             "greeks": selected.get("greeks") or {},
             "fibonacci": fibonacci,
+            "market_regime": market_regime,
             "liquidity": selected.get("liquidity") or {},
             "entry_price_base": order.get("price"),
             "amount": order.get("amount"),
@@ -159,6 +161,7 @@ def summarize_position_pl(positions: list[dict[str, Any]], *, underlying_price_u
         instrument = str(position.get("instrument_name") or "")
         if not instrument:
             continue
+        value_currency = "USDC" if _is_usd_settled_instrument(instrument) else str(instrument.split("-", 1)[0] or "").upper()
         size = abs(_to_float(position.get("size")) or _to_float(position.get("amount")) or 0.0)
         avg_entry = _to_float(position.get("average_price"))
         mark = _to_float(position.get("mark_price"))
@@ -169,6 +172,12 @@ def summarize_position_pl(positions: list[dict[str, Any]], *, underlying_price_u
         value_base = size * mark if mark is not None else None
         if pl_base is None and cost_base is not None and value_base is not None:
             pl_base = value_base - cost_base
+        multiplier = 1.0 if _is_usd_settled_instrument(instrument) else (underlying_price_usd or 0.0)
+        row_pl_usd = _to_float(position.get("floating_profit_loss_usd"))
+        if row_pl_usd is None:
+            row_pl_usd = _to_float(position.get("total_profit_loss_usd"))
+        if row_pl_usd is None and pl_base is not None and multiplier > 0:
+            row_pl_usd = pl_base * multiplier
         total_cost_base += cost_base or 0.0
         total_value_base += value_base or 0.0
         total_pl_base += pl_base or 0.0
@@ -184,8 +193,9 @@ def summarize_position_pl(positions: list[dict[str, Any]], *, underlying_price_u
                 "mark_price": mark,
                 "cost_base": cost_base,
                 "value_base": value_base,
+                "value_currency": value_currency,
                 "floating_profit_loss_base": pl_base,
-                "floating_profit_loss_usd": None if pl_base is None or underlying_price_usd is None else pl_base * underlying_price_usd,
+                "floating_profit_loss_usd": row_pl_usd,
                 "expiration_utc": position.get("expiration_utc"),
                 "status": "winning" if (pl_base or 0.0) > 0 else "losing" if (pl_base or 0.0) < 0 else "flat",
             }
@@ -203,13 +213,42 @@ def summarize_position_pl(positions: list[dict[str, Any]], *, underlying_price_u
         "total_cost_base": round(total_cost_base, 8),
         "total_value_base": round(total_value_base, 8),
         "total_unrealized_pl_base": round(total_pl_base, 8),
-        "total_cost_usd": None if underlying_price_usd is None else round(total_cost_base * underlying_price_usd, 2),
-        "total_value_usd": None if underlying_price_usd is None else round(total_value_base * underlying_price_usd, 2),
-        "total_unrealized_pl_usd": None if underlying_price_usd is None else round(total_pl_base * underlying_price_usd, 2),
+        "total_cost_usd": _mixed_total_usd(rows, "cost_base", underlying_price_usd),
+        "total_value_usd": _mixed_total_usd(rows, "value_base", underlying_price_usd),
+        "total_unrealized_pl_usd": round(sum(_to_float(row.get("floating_profit_loss_usd")) or 0.0 for row in rows), 2),
+        "display_currency": _position_display_currency(rows),
         "underlying_price_usd": underlying_price_usd,
         "rows": rows,
-        "note": "Temporary open P/L view. These are unrealized marks for open Deribit testnet option positions, not final closed-trade results.",
+        "note": "Temporary open P/L view. These are unrealized marks for open Deribit option positions, not final closed-trade results.",
     }
+
+
+def _mixed_total_usd(rows: list[dict[str, Any]], field: str, underlying_price_usd: float | None) -> float | None:
+    if not rows:
+        return 0.0
+    total = 0.0
+    for row in rows:
+        value = _to_float(row.get(field))
+        if value is None:
+            continue
+        multiplier = 1.0 if _is_usd_settled_instrument(str(row.get("instrument_name") or "")) else (underlying_price_usd or 0.0)
+        if multiplier <= 0:
+            return None
+        total += value * multiplier
+    return round(total, 2)
+
+
+def _position_display_currency(rows: list[dict[str, Any]]) -> str | None:
+    currencies = {str(row.get("value_currency") or "").upper() for row in rows if row.get("value_currency")}
+    if len(currencies) == 1:
+        return next(iter(currencies))
+    if not currencies:
+        return None
+    return "mixed"
+
+
+def _is_usd_settled_instrument(instrument_name: str) -> bool:
+    return "_" in str(instrument_name or "").split("-", 1)[0]
 
 
 def _age_seconds(value: Any) -> float | None:
@@ -439,6 +478,8 @@ def dashboard_html(refresh_seconds: int) -> str:
       const s = data.summary || {{}};
       const rc = s.risk_controls || {{}};
       const blocked = (s.execution_blocks || []).length > 0;
+      const account = s.account || {{}};
+      const accountCurrency = account.currency || data.instrument_currency || data.currency || currentCurrency;
       set("source", `${{data.currency}} options / ${{data.venue}} / ${{data.state_dir}}`);
       currentCurrency = data.currency || currentCurrency;
       set("updated", `Updated ${{time(data.generated_at)}}`);
@@ -481,8 +522,8 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("fibTrend", `${{fib.trend || "-"}} | rows ${{fib.lookback_rows || "-"}}`);
       set("fibLevels", `${{money(fib.nearest_support)}} / ${{money(fib.nearest_resistance)}}`);
       set("fibTarget", money(fib.nearest_target_price));
-      set("account", `${{num((s.account || {{}}).equity)}} ${{data.currency}}`);
-      set("accountMeta", `available ${{num((s.account || {{}}).available_funds)}} | balance ${{num((s.account || {{}}).balance)}}`);
+      set("account", `${{num(account.equity)}} ${{accountCurrency}}`);
+      set("accountMeta", `available ${{num(account.available_funds)}} ${{accountCurrency}} | balance ${{num(account.balance)}} ${{accountCurrency}}`);
       set("exposure", `${{s.open_order_count || 0}} / ${{s.position_count || 0}}`);
       set("orderResult", s.order_submitted ? "order submitted" : ((s.entry_blocks || []).length ? "new entry blocked; management still checked" : "no order submitted"));
       set("plGuardMeta", `total win/loss ${{money(rc.max_total_unrealized_profit_usd)}} / ${{money(rc.max_total_unrealized_loss_usd)}} | position win/loss ${{money(rc.max_position_unrealized_profit_usd)}} / ${{money(rc.max_position_unrealized_loss_usd)}}`);
@@ -494,7 +535,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("feedbackLedger", `${{feedbackMetrics.submitted_decision_count || 0}} submitted`);
       set("feedbackLedgerPath", feedback.ledger_path || "-");
       renderForecastChart(data.forecast_chart || {{}});
-      renderPositionPl(s.position_pl || {{}}, data.currency);
+      renderPositionPl(s.position_pl || {{}}, accountCurrency);
       renderHistory(data.history || []);
       renderOrders(data.open_option_orders || []);
       renderPositions(data.option_positions || []);
@@ -715,6 +756,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       }});
     }}
     function renderPositionPl(pl, currency) {{
+      const displayCurrency = pl.display_currency || currency;
       const totalUsd = Number(pl.total_unrealized_pl_usd || 0);
       const totalBase = Number(pl.total_unrealized_pl_base || 0);
       const status = pl.status || "flat";
@@ -724,7 +766,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       const totalEl = document.getElementById("plTotal");
       totalEl.textContent = money(totalUsd);
       totalEl.className = `value ${{totalUsd > 0 ? "win" : totalUsd < 0 ? "loss" : ""}}`;
-      set("plTotalBase", `${{num(totalBase)}} ${{currency}}`);
+      set("plTotalBase", `${{num(totalBase)}} ${{displayCurrency}}`);
       set("plCounts", `${{pl.winning_positions || 0}} / ${{pl.losing_positions || 0}}`);
       set("plCostValue", `${{money(pl.total_cost_usd)}} / ${{money(pl.total_value_usd)}}`);
       const rows = document.getElementById("plRows");
@@ -732,9 +774,10 @@ def dashboard_html(refresh_seconds: int) -> str:
       (pl.rows || []).forEach(row => {{
         const rowUsd = Number(row.floating_profit_loss_usd || 0);
         const rowBase = Number(row.floating_profit_loss_base || 0);
+        const rowCurrency = row.value_currency || displayCurrency;
         const statusClass = row.status === "winning" ? "win" : row.status === "losing" ? "loss" : "";
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${{row.instrument_name || "-"}}</td><td>${{num(row.size)}}</td><td>${{num(row.average_price)}}</td><td>${{num(row.mark_price)}}</td><td>${{time(row.expiration_utc)}}</td><td>${{num(row.cost_base)}} ${{currency}}</td><td>${{num(row.value_base)}} ${{currency}}</td><td class="${{statusClass}}">${{money(rowUsd)}}<br><span class="small">${{num(rowBase)}} ${{currency}}</span></td><td class="${{statusClass}}">${{row.status || "flat"}}</td>`;
+        tr.innerHTML = `<td>${{row.instrument_name || "-"}}</td><td>${{num(row.size)}}</td><td>${{num(row.average_price)}}</td><td>${{num(row.mark_price)}}</td><td>${{time(row.expiration_utc)}}</td><td>${{num(row.cost_base)}} ${{rowCurrency}}</td><td>${{num(row.value_base)}} ${{rowCurrency}}</td><td class="${{statusClass}}">${{money(rowUsd)}}<br><span class="small">${{num(rowBase)}} ${{rowCurrency}}</span></td><td class="${{statusClass}}">${{row.status || "flat"}}</td>`;
         rows.appendChild(tr);
       }});
       if (!(pl.rows || []).length) {{

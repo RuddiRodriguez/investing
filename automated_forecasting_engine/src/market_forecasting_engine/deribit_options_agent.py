@@ -13,13 +13,14 @@ import pandas as pd
 from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
-from market_forecasting_engine.deribit_broker import DeribitTestnetBroker
+from market_forecasting_engine.deribit_broker import DeribitOptionsBroker, DeribitTestnetBroker
 from market_forecasting_engine.deribit_options_feedback import append_decision_to_ledger, update_feedback_loop
 from market_forecasting_engine.deribit_options_trader import (
     DeribitOptionExecutionConfig,
     build_fibonacci_analysis,
     build_deribit_exit_plan,
     build_deribit_option_trade_plan,
+    build_options_market_regime,
     submit_deribit_limit_order,
 )
 from market_forecasting_engine.risk_profiles import risk_profile_for_name
@@ -27,6 +28,13 @@ from market_forecasting_engine.risk_profiles import risk_profile_for_name
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.account_mode == "live":
+        if args.execute_paper_orders:
+            raise SystemExit("Use --execute-live-orders for live Deribit options, not --execute-paper-orders.")
+        if args.execute_live_orders and not args.confirm_live_deribit_options_orders:
+            raise SystemExit("Live Deribit options execution requires --confirm-live-deribit-options-orders.")
+    if args.account_mode == "testnet" and args.execute_live_orders:
+        raise SystemExit("--execute-live-orders is only valid with --account-mode live.")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.liquidate_and_stop:
@@ -56,8 +64,10 @@ def main() -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run an autonomous Deribit testnet crypto-options trading agent.")
+    parser = argparse.ArgumentParser(description="Run an autonomous Deribit crypto-options trading agent.")
+    parser.add_argument("--account-mode", choices=("testnet", "live"), default="testnet")
     parser.add_argument("--currency", choices=("BTC", "ETH"), default="ETH")
+    parser.add_argument("--instrument-currency", choices=("BTC", "ETH", "USDC"), default=None, help="Deribit option instrument universe/account currency. Use USDC for live ETH_USDC options.")
     parser.add_argument("--risk-profile", choices=("conservative", "medium", "aggressive"), default="aggressive")
     parser.add_argument("--data-provider", default="alpaca")
     parser.add_argument("--data-interval", default="1m")
@@ -85,6 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-fibonacci-confluence", action="store_true", help="Block entries when Fibonacci analysis conflicts with the forecast direction.")
     parser.add_argument("--fibonacci-lookback-rows", type=int, default=720)
     parser.add_argument("--max-fibonacci-distance-pct", type=float, default=0.006)
+    parser.add_argument("--enable-market-regime-filter", action=argparse.BooleanOptionalAction, default=True, help="Block directional option entries unless the market is trending or breaking out.")
+    parser.add_argument("--allow-range-edge-reversal-entry", action="store_true", help="Allow optional contrarian entries near support/resistance in range-bound markets. Default is to wait.")
+    parser.add_argument("--market-regime-lookback-rows", type=int, default=120)
+    parser.add_argument("--market-regime-breakout-buffer-pct", type=float, default=0.001)
+    parser.add_argument("--market-regime-middle-zone-width", type=float, default=0.30)
+    parser.add_argument("--min-trend-strength-pct", type=float, default=0.003)
+    parser.add_argument("--enable-impulse-entry", action=argparse.BooleanOptionalAction, default=True, help="Allow early option entries when recent bars show a strong forecast-aligned impulse.")
+    parser.add_argument("--impulse-lookback-bars", type=int, default=12)
+    parser.add_argument("--min-impulse-move-pct", type=float, default=0.006)
+    parser.add_argument("--min-impulse-directional-bars", type=int, default=7)
     parser.add_argument("--close-before-expiry-hours", type=float, default=12.0, help="Automatically close open option positions this many hours before expiry.")
     parser.add_argument("--expiry-warning-hours", type=float, default=24.0, help="Log and display a warning when open positions are this close to expiry.")
     parser.add_argument("--entry-expiry-buffer-hours", type=float, default=4.0, help="Extra buffer added to forecast horizon and close window when screening new option entries.")
@@ -101,6 +121,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-profit-close-mode", choices=("all", "winning_only"), default="all", help="When max total unrealized profit is reached, close all positions or only positions currently winning.")
     parser.add_argument("--max-position-unrealized-loss-usd", type=float, default=None, help="Optional per-position USD loss cutoff. 0 closes any losing option position; negative values are treated as their absolute value; omit to disable.")
     parser.add_argument("--max-position-unrealized-profit-usd", type=float, default=None, help="Optional per-position USD profit target. 0 closes any winning option position; negative disables.")
+    parser.add_argument("--take-profit-position-pl-usd", type=float, default=None, help="Per-position open-profit target used for profit taking and retrace protection. Defaults to max-position-unrealized-profit-usd when omitted.")
+    parser.add_argument("--profit-retrace-from-peak-pct", type=float, default=0.20, help="After a position reaches the per-position profit target, close if it gives back this fraction of peak open profit.")
+    parser.add_argument("--profit-close-limit-offset-pct", type=float, default=0.01, help="Normal profit-close sell limit below current option mark. Separate from emergency liquidation offset.")
     parser.add_argument("--enable-forecast-reversal-exit", action=argparse.BooleanOptionalAction, default=True, help="Close open calls when the refreshed forecast turns bearish, and close open puts when it turns bullish.")
     parser.add_argument("--min-reversal-edge-pct", type=float, default=0.001, help="Minimum absolute forecast move versus spot required before closing an opposite option position.")
     parser.add_argument("--abandon-entry-after-seconds", type=int, default=300)
@@ -120,6 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear-stop-request", action="store_true", help="Clear a prior stop request so the agent can run again.")
     parser.add_argument("--liquidation-limit-offset-pct", type=float, default=0.05, help="Emergency liquidation sell limit below current option mark. Example 0.05 means current mark minus 5%.")
     parser.add_argument("--execute-paper-orders", action="store_true")
+    parser.add_argument("--execute-live-orders", action="store_true")
+    parser.add_argument("--confirm-live-deribit-options-orders", action="store_true")
     parser.add_argument("--output-dir", default="automated_forecasting_engine/runs/deribit_options_agent")
     parser.add_argument("--once", action="store_true")
     return parser
@@ -128,11 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
 def run_once(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     state = read_state(output_dir, args.currency)
-    broker = DeribitTestnetBroker()
+    broker = _broker_for_args(args)
     now = datetime.now(UTC)
-    account = broker.account_summary(currency=args.currency)
-    open_orders = _option_open_orders(broker.open_orders(currency=args.currency, kind="option"), args.currency)
-    positions = _option_positions(broker.positions(currency=args.currency, kind="option"), args.currency)
+    instrument_currency = _instrument_currency(args)
+    account = broker.account_summary(currency=instrument_currency)
+    open_orders = _option_open_orders(broker.open_orders(currency=instrument_currency, kind="option"), args.currency, instrument_currency=instrument_currency)
+    positions = _option_positions(broker.positions(currency=instrument_currency, kind="option"), args.currency, instrument_currency=instrument_currency)
     forecast_bundle = state.get("last_forecast")
     if forecast_bundle is None or _forecast_is_stale(forecast_bundle, now, int(args.forecast_refresh_seconds)):
         prices = _load_prices(args)
@@ -158,6 +184,24 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
             if bool(args.enable_fibonacci)
             else {"enabled": False}
         )
+        forecast["market_regime"] = (
+            build_options_market_regime(
+                prices,
+                current_price=float(plan["latest_price"]),
+                forecast=forecast,
+                lookback_rows=int(args.market_regime_lookback_rows),
+                breakout_buffer_pct=float(args.market_regime_breakout_buffer_pct),
+                middle_zone_width=float(args.market_regime_middle_zone_width),
+                min_trend_strength_pct=float(args.min_trend_strength_pct),
+                allow_range_edge_reversal_entry=bool(args.allow_range_edge_reversal_entry),
+                enable_impulse_entry=bool(args.enable_impulse_entry),
+                impulse_lookback_bars=int(args.impulse_lookback_bars),
+                min_impulse_move_pct=float(args.min_impulse_move_pct),
+                min_impulse_directional_bars=int(args.min_impulse_directional_bars),
+            )
+            if bool(args.enable_market_regime_filter)
+            else {"enabled": False}
+        )
         forecast_bundle = {
             "created_at_utc": now.isoformat(),
             "price_rows": len(prices),
@@ -171,9 +215,12 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         forecast["account_equity"] = _float_or_none(account.get("equity"))
         if "fibonacci_analysis" not in forecast:
             forecast["fibonacci_analysis"] = {"enabled": False, "status": "missing_from_cached_forecast"}
+        if "market_regime" not in forecast:
+            forecast["market_regime"] = {"enabled": False, "status": "missing_from_cached_forecast"}
     profile = risk_profile_for_name(args.risk_profile)
     config = DeribitOptionExecutionConfig(
-        currency=args.currency.upper(),
+        currency=instrument_currency,
+        underlying_currency=args.currency.upper(),
         risk_profile=args.risk_profile,
         min_dte=args.min_dte,
         max_dte=args.max_dte,
@@ -193,6 +240,16 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         enable_fibonacci=bool(args.enable_fibonacci),
         require_fibonacci_confluence=bool(args.require_fibonacci_confluence),
         max_fibonacci_distance_pct=float(args.max_fibonacci_distance_pct),
+        enable_market_regime_filter=bool(args.enable_market_regime_filter),
+        allow_range_edge_reversal_entry=bool(args.allow_range_edge_reversal_entry),
+        market_regime_lookback_rows=int(args.market_regime_lookback_rows),
+        market_regime_breakout_buffer_pct=float(args.market_regime_breakout_buffer_pct),
+        market_regime_middle_zone_width=float(args.market_regime_middle_zone_width),
+        min_trend_strength_pct=float(args.min_trend_strength_pct),
+        enable_impulse_entry=bool(args.enable_impulse_entry),
+        impulse_lookback_bars=int(args.impulse_lookback_bars),
+        min_impulse_move_pct=float(args.min_impulse_move_pct),
+        min_impulse_directional_bars=int(args.min_impulse_directional_bars),
         close_before_expiry_hours=float(args.close_before_expiry_hours),
         entry_expiry_buffer_hours=float(args.entry_expiry_buffer_hours),
         target_moneyness=float(args.target_moneyness),
@@ -221,7 +278,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     )
     trade_plan = build_deribit_option_trade_plan(
         broker=broker,
-        currency=args.currency.upper(),
+        currency=instrument_currency,
         underlying_price_usd=underlying_price,
         forecast=forecast,
         account=account,
@@ -255,8 +312,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     else:
         state.pop("wait_until_next_forecast_after_close", None)
     execution_blocks = execution_block_reasons(args=args, trade_plan=trade_plan, open_orders=open_orders, positions=positions, underlying_price_usd=underlying_price)
-    order_result = {"submitted": False, "reason": "execution_disabled" if not args.execute_paper_orders else "execution_blocked", "blocks": execution_blocks}
-    if args.execute_paper_orders and trade_plan.get("action") == "buy_option" and not execution_blocks:
+    order_result = {"submitted": False, "reason": "execution_disabled" if not _orders_enabled(args) else "execution_blocked", "blocks": execution_blocks}
+    if _orders_enabled(args) and trade_plan.get("action") == "buy_option" and not execution_blocks:
         label = f"codex-{args.currency.upper()}-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
         try:
             order_result = {
@@ -267,8 +324,10 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
             order_result = {"submitted": False, "reason": "broker_rejected_deribit_order", "error": str(exc)}
     record = {
         "checked_at": datetime.now(UTC).isoformat(),
-        "venue": "deribit_testnet",
+        "venue": f"deribit_{args.account_mode}",
+        "account_mode": args.account_mode,
         "currency": args.currency.upper(),
+        "instrument_currency": instrument_currency,
         "ticker": f"{args.currency.upper()}-USD",
         "risk_profile": profile.to_dict(),
         "account": _safe_account(account),
@@ -286,6 +345,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         "management_actions": management_actions,
         "execution_blocks": execution_blocks,
         "execute_paper_orders": bool(args.execute_paper_orders),
+        "execute_live_orders": bool(args.execute_live_orders),
         "order_result": order_result,
     }
     if order_result.get("submitted") and trade_plan.get("action") == "buy_option":
@@ -345,7 +405,7 @@ def execution_block_reasons(
 def _open_option_premium_usd(positions: list[dict[str, Any]], underlying_price_usd: float | None) -> float | None:
     if underlying_price_usd is None or underlying_price_usd <= 0:
         return None
-    total_base = 0.0
+    total_usd = 0.0
     for position in positions:
         amount = abs(_float_or_none(position.get("size")) or _float_or_none(position.get("amount")) or 0.0)
         mark = _float_or_none(position.get("mark_price"))
@@ -353,8 +413,9 @@ def _open_option_premium_usd(positions: list[dict[str, Any]], underlying_price_u
         price = mark if mark is not None else average
         if amount <= 0 or price is None:
             continue
-        total_base += amount * price
-    return total_base * float(underlying_price_usd)
+        multiplier = 1.0 if _is_usdc_settled_instrument(str(position.get("instrument_name") or "")) else float(underlying_price_usd)
+        total_usd += amount * price * multiplier
+    return total_usd
 
 
 def _option_type_from_instrument_name(instrument_name: str) -> str | None:
@@ -378,13 +439,14 @@ def manage_existing_orders_and_positions(
     forecast: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     actions = _abandon_stale_entry_orders(broker=broker, args=args, open_orders=open_orders, state=state, now=now)
-    if not args.execute_paper_orders:
+    if not _orders_enabled(args):
         actions.extend(
             _manage_position_unrealized_guards(
                 broker=broker,
                 args=args,
                 open_orders=open_orders,
                 positions=positions,
+                state=state,
                 now=now,
                 underlying_price_usd=underlying_price_usd,
             )
@@ -418,6 +480,7 @@ def manage_existing_orders_and_positions(
         args=args,
         open_orders=open_orders,
         positions=positions,
+        state=state,
         now=now,
         underlying_price_usd=underlying_price_usd,
     )
@@ -532,7 +595,7 @@ def _manage_expiry_risk(
         return []
     close_before_hours = max(0.0, float(getattr(args, "close_before_expiry_hours", 12.0)))
     warning_hours = max(close_before_hours, float(getattr(args, "expiry_warning_hours", 24.0)))
-    instruments = _instrument_metadata_by_name(broker=broker, currency=str(args.currency).upper())
+    instruments = _instrument_metadata_by_name(broker=broker, currency=_instrument_currency(args))
     actions: list[dict[str, Any]] = []
     for position in active_positions:
         instrument = str(position.get("instrument_name") or "")
@@ -567,7 +630,7 @@ def _manage_expiry_risk(
                 "reduce_only": True,
             }
             sell_orders = _sell_orders_for_instrument(open_orders, instrument)
-            if not args.execute_paper_orders:
+            if not _orders_enabled(args):
                 actions.append({"action": "would_close_position_before_expiry", "amount": amount, "mark_price": round(float(mark), 8), "close_limit_price": close_limit, **expiry_payload})
                 continue
             actions.extend(
@@ -722,7 +785,7 @@ def _cancel_open_option_orders(
 ) -> list[dict[str, Any]]:
     if not open_orders:
         return []
-    if not args.execute_paper_orders:
+    if not _orders_enabled(args):
         return [{"action": f"would_{cancel_action}", "currency": args.currency.upper(), "order_count": len(open_orders)}]
     actions: list[dict[str, Any]] = []
     for order in open_orders:
@@ -772,8 +835,8 @@ def _manage_total_unrealized_loss(
     open_positions = [position for position in positions if abs(_float_or_none(position.get("size")) or 0.0) > 0.0]
     if not open_positions:
         return []
-    total_pl_base = sum(_float_or_none(position.get("floating_profit_loss")) or _float_or_none(position.get("total_profit_loss")) or 0.0 for position in open_positions)
-    total_pl_usd = total_pl_base * float(underlying_price_usd)
+    total_pl_base = sum(_position_pl_value(position) or 0.0 for position in open_positions)
+    total_pl_usd = sum(_position_pl_usd(position, underlying_price_usd) or 0.0 for position in open_positions)
     loss_cutoff = -float(threshold)
     if float(threshold) == 0:
         if total_pl_usd >= 0:
@@ -828,9 +891,7 @@ def _manage_total_unrealized_loss(
                     "mark_price": round(mark, 8),
                     "close_limit_price": close_limit,
                     "position_unrealized_pl_base": _float_or_none(position.get("floating_profit_loss")),
-                    "position_unrealized_pl_usd": None
-                    if _float_or_none(position.get("floating_profit_loss")) is None
-                    else round(float(_float_or_none(position.get("floating_profit_loss"))) * float(underlying_price_usd), 2),
+                    "position_unrealized_pl_usd": None if _position_pl_usd(position, underlying_price_usd) is None else round(float(_position_pl_usd(position, underlying_price_usd)), 2),
                 },
             )
         )
@@ -854,8 +915,8 @@ def _manage_total_unrealized_profit(
     open_positions = [position for position in positions if abs(_float_or_none(position.get("size")) or 0.0) > 0.0]
     if not open_positions:
         return []
-    total_pl_base = sum(_float_or_none(position.get("floating_profit_loss")) or _float_or_none(position.get("total_profit_loss")) or 0.0 for position in open_positions)
-    total_pl_usd = total_pl_base * float(underlying_price_usd)
+    total_pl_base = sum(_position_pl_value(position) or 0.0 for position in open_positions)
+    total_pl_usd = sum(_position_pl_usd(position, underlying_price_usd) or 0.0 for position in open_positions)
     if total_pl_usd < float(threshold):
         return []
     close_mode = str(getattr(args, "total_profit_close_mode", "all"))
@@ -883,7 +944,7 @@ def _manage_total_unrealized_profit(
             continue
         sell_orders = _sell_orders_for_instrument(open_orders, instrument)
         tick_size = _instrument_tick_size(broker=broker, instrument_name=instrument, price=mark)
-        close_limit = _deribit_liquidation_limit_price(mark, float(args.liquidation_limit_offset_pct), tick_size=tick_size)
+        close_limit = _deribit_liquidation_limit_price(mark, float(getattr(args, "profit_close_limit_offset_pct", 0.01)), tick_size=tick_size)
         selected_exit = {
             "instrument_name": instrument,
             "side": "sell",
@@ -892,7 +953,7 @@ def _manage_total_unrealized_profit(
             "price": close_limit,
             "reduce_only": True,
         }
-        pl_base = _float_or_none(position.get("floating_profit_loss")) or _float_or_none(position.get("total_profit_loss"))
+        pl_base = _position_pl_value(position)
         actions.extend(
             _replace_sell_orders_with_exit(
                 broker=broker,
@@ -906,8 +967,9 @@ def _manage_total_unrealized_profit(
                 extra={
                     "mark_price": round(mark, 8),
                     "close_limit_price": close_limit,
+                    "profit_close_limit_offset_pct": float(getattr(args, "profit_close_limit_offset_pct", 0.01)),
                     "position_unrealized_pl_base": pl_base,
-                    "position_unrealized_pl_usd": None if pl_base is None else round(float(pl_base) * float(underlying_price_usd), 2),
+                    "position_unrealized_pl_usd": None if _position_pl_usd(position, underlying_price_usd) is None else round(float(_position_pl_usd(position, underlying_price_usd)), 2),
                 },
             )
         )
@@ -920,6 +982,7 @@ def _manage_position_unrealized_guards(
     args: argparse.Namespace,
     open_orders: list[dict[str, Any]],
     positions: list[dict[str, Any]],
+    state: dict[str, Any],
     now: datetime,
     underlying_price_usd: float | None,
 ) -> list[dict[str, Any]]:
@@ -931,17 +994,25 @@ def _manage_position_unrealized_guards(
         loss_threshold = abs(float(loss_threshold))
     loss_enabled = loss_threshold is not None
     profit_enabled = profit_threshold is not None and profit_threshold >= 0
-    if not loss_enabled and not profit_enabled:
+    profit_peak_target = _float_or_none(getattr(args, "take_profit_position_pl_usd", None))
+    if profit_peak_target is None:
+        profit_peak_target = profit_threshold
+    retrace_pct = max(0.0, min(1.0, float(getattr(args, "profit_retrace_from_peak_pct", 0.20))))
+    retrace_enabled = profit_peak_target is not None and profit_peak_target > 0 and retrace_pct > 0
+    if not loss_enabled and not profit_enabled and not retrace_enabled:
         return []
     actions: list[dict[str, Any]] = []
     open_positions = [position for position in positions if abs(_float_or_none(position.get("size")) or 0.0) > 0.0]
+    _prune_position_profit_peaks(state, open_positions)
     for position in open_positions:
-        pl_base = _float_or_none(position.get("floating_profit_loss"))
-        if pl_base is None:
-            pl_base = _float_or_none(position.get("total_profit_loss"))
+        pl_base = _position_pl_value(position)
         if pl_base is None:
             continue
-        pl_usd = float(pl_base) * float(underlying_price_usd)
+        pl_usd = _position_pl_usd(position, underlying_price_usd)
+        if pl_usd is None:
+            continue
+        profit_peak = _update_position_profit_peak(state, position=position, underlying_price_usd=underlying_price_usd, now=now)
+        peak_profit_usd = _float_or_none((profit_peak or {}).get("peak_unrealized_pl_usd"))
         trigger_reason = None
         threshold_payload: dict[str, Any] = {}
         if loss_enabled:
@@ -953,6 +1024,16 @@ def _manage_position_unrealized_guards(
             if (float(profit_threshold) == 0 and pl_usd > 0) or (float(profit_threshold) > 0 and pl_usd >= float(profit_threshold)):
                 trigger_reason = "position_profit_position_close_triggered"
                 threshold_payload = {"position_profit_target_usd": round(float(profit_threshold), 2)}
+        if trigger_reason is None and retrace_enabled and peak_profit_usd is not None and peak_profit_usd >= float(profit_peak_target):
+            protected_profit_usd = peak_profit_usd * (1.0 - retrace_pct)
+            if pl_usd <= protected_profit_usd:
+                trigger_reason = "position_profit_retrace_close_triggered"
+                threshold_payload = {
+                    "take_profit_position_pl_usd": round(float(profit_peak_target), 2),
+                    "peak_unrealized_pl_usd": round(float(peak_profit_usd), 2),
+                    "protected_profit_usd": round(float(protected_profit_usd), 2),
+                    "profit_retrace_from_peak_pct": round(float(retrace_pct), 4),
+                }
         if trigger_reason is None:
             actions.append(
                 {
@@ -962,9 +1043,13 @@ def _manage_position_unrealized_guards(
                     "position_unrealized_pl_usd": round(float(pl_usd), 2),
                     "loss_guard_usd": loss_threshold,
                     "profit_guard_usd": profit_threshold,
+                    "take_profit_position_pl_usd": profit_peak_target,
+                    "peak_unrealized_pl_usd": None if peak_profit_usd is None else round(float(peak_profit_usd), 2),
+                    "profit_retrace_from_peak_pct": retrace_pct,
                 }
             )
             continue
+        is_profit_close = trigger_reason in {"position_profit_position_close_triggered", "position_profit_retrace_close_triggered"}
         actions.extend(
             _close_position_with_limit(
                 broker=broker,
@@ -973,6 +1058,7 @@ def _manage_position_unrealized_guards(
                 position=position,
                 now=now,
                 reason=trigger_reason,
+                limit_offset_pct=float(getattr(args, "profit_close_limit_offset_pct", 0.01)) if is_profit_close else None,
                 extra={
                     "position_unrealized_pl_base": round(float(pl_base), 8),
                     "position_unrealized_pl_usd": round(float(pl_usd), 2),
@@ -1069,6 +1155,7 @@ def _close_position_with_limit(
     position: dict[str, Any],
     now: datetime,
     reason: str,
+    limit_offset_pct: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     instrument = str(position.get("instrument_name") or "")
@@ -1078,7 +1165,8 @@ def _close_position_with_limit(
         return [{"action": f"{reason}_skipped_missing_mark_or_amount", "instrument_name": instrument, "amount": amount}]
     sell_orders = _sell_orders_for_instrument(open_orders, instrument)
     tick_size = _instrument_tick_size(broker=broker, instrument_name=instrument, price=mark)
-    close_limit = _deribit_liquidation_limit_price(mark, float(getattr(args, "liquidation_limit_offset_pct", 0.05)), tick_size=tick_size)
+    close_offset = float(limit_offset_pct) if limit_offset_pct is not None else float(getattr(args, "liquidation_limit_offset_pct", 0.05))
+    close_limit = _deribit_liquidation_limit_price(mark, close_offset, tick_size=tick_size)
     selected_exit = {
         "instrument_name": instrument,
         "side": "sell",
@@ -1087,7 +1175,7 @@ def _close_position_with_limit(
         "price": close_limit,
         "reduce_only": True,
     }
-    if not args.execute_paper_orders:
+    if not _orders_enabled(args):
         return [
             {
                 "action": f"would_{reason}",
@@ -1095,6 +1183,7 @@ def _close_position_with_limit(
                 "amount": amount,
                 "mark_price": round(mark, 8),
                 "close_limit_price": close_limit,
+                "close_limit_offset_pct": close_offset,
                 **(extra or {}),
             }
         ]
@@ -1107,7 +1196,7 @@ def _close_position_with_limit(
         selected_exit=selected_exit,
         reason=reason,
         now=now,
-        extra={"mark_price": round(mark, 8), "close_limit_price": close_limit, **(extra or {})},
+        extra={"mark_price": round(mark, 8), "close_limit_price": close_limit, "close_limit_offset_pct": close_offset, **(extra or {})},
     )
 
 
@@ -1167,14 +1256,84 @@ def _liquidate_option_positions(
 
 def _positions_for_total_loss_close(positions: list[dict[str, Any]], close_mode: str) -> list[dict[str, Any]]:
     if close_mode == "losing_only":
-        return [position for position in positions if (_float_or_none(position.get("floating_profit_loss")) or _float_or_none(position.get("total_profit_loss")) or 0.0) < 0.0]
+        return [position for position in positions if (_position_pl_value(position) or 0.0) < 0.0]
     return positions
 
 
 def _positions_for_total_profit_close(positions: list[dict[str, Any]], close_mode: str) -> list[dict[str, Any]]:
     if close_mode == "winning_only":
-        return [position for position in positions if (_float_or_none(position.get("floating_profit_loss")) or _float_or_none(position.get("total_profit_loss")) or 0.0) > 0.0]
+        return [position for position in positions if (_position_pl_value(position) or 0.0) > 0.0]
     return positions
+
+
+def _update_position_profit_peak(
+    state: dict[str, Any],
+    *,
+    position: dict[str, Any],
+    underlying_price_usd: float | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    instrument = str(position.get("instrument_name") or "")
+    pl_base = _position_pl_value(position)
+    pl_usd = _position_pl_usd(position, underlying_price_usd)
+    mark = _float_or_none(position.get("mark_price"))
+    if not instrument or pl_base is None or pl_usd is None:
+        return None
+    peaks = state.setdefault("option_position_profit_peaks", {})
+    if not isinstance(peaks, dict):
+        peaks = {}
+        state["option_position_profit_peaks"] = peaks
+    existing = peaks.get(instrument) if isinstance(peaks.get(instrument), dict) else {}
+    existing_peak_usd = _float_or_none(existing.get("peak_unrealized_pl_usd"))
+    if existing_peak_usd is None or float(pl_usd) > existing_peak_usd:
+        existing = {
+            "instrument_name": instrument,
+            "peak_unrealized_pl_base": round(float(pl_base), 8),
+            "peak_unrealized_pl_usd": round(float(pl_usd), 2),
+            "peak_mark_price": None if mark is None else round(float(mark), 8),
+            "updated_at_utc": now.isoformat(),
+        }
+        peaks[instrument] = existing
+    return existing
+
+
+def _prune_position_profit_peaks(state: dict[str, Any], positions: list[dict[str, Any]]) -> None:
+    peaks = state.get("option_position_profit_peaks")
+    if not isinstance(peaks, dict):
+        return
+    open_instruments = {
+        str(position.get("instrument_name") or "")
+        for position in positions
+        if abs(_float_or_none(position.get("size")) or _float_or_none(position.get("amount")) or 0.0) > 0.0 and position.get("instrument_name")
+    }
+    for instrument in list(peaks):
+        if instrument not in open_instruments:
+            peaks.pop(instrument, None)
+
+
+def _position_pl_value(position: dict[str, Any]) -> float | None:
+    return _float_or_none(position.get("floating_profit_loss")) if _float_or_none(position.get("floating_profit_loss")) is not None else _float_or_none(position.get("total_profit_loss"))
+
+
+def _position_pl_usd(position: dict[str, Any], underlying_price_usd: float | None) -> float | None:
+    explicit = _float_or_none(position.get("floating_profit_loss_usd"))
+    if explicit is not None:
+        return explicit
+    explicit = _float_or_none(position.get("total_profit_loss_usd"))
+    if explicit is not None:
+        return explicit
+    raw = _position_pl_value(position)
+    if raw is None:
+        return None
+    if _is_usdc_settled_instrument(str(position.get("instrument_name") or "")):
+        return raw
+    if underlying_price_usd is None or underlying_price_usd <= 0:
+        return None
+    return raw * float(underlying_price_usd)
+
+
+def _is_usdc_settled_instrument(instrument_name: str) -> bool:
+    return "_" in str(instrument_name or "").split("-", 1)[0]
 
 
 def _deribit_liquidation_limit_price(mark_price: float, offset_pct: float, *, tick_size: float | None = None) -> float:
@@ -1184,7 +1343,7 @@ def _deribit_liquidation_limit_price(mark_price: float, offset_pct: float, *, ti
 
 
 def _instrument_tick_size(*, broker: DeribitTestnetBroker, instrument_name: str, price: float | None = None) -> float | None:
-    currency = instrument_name.split("-", 1)[0].upper()
+    currency = _instrument_currency_from_name(instrument_name)
     try:
         instruments = broker.instruments(currency=currency, kind="option", expired=False)
     except (RuntimeError, AttributeError):
@@ -1266,7 +1425,7 @@ def _abandon_stale_entry_orders(
         return []
     if not any(str(order.get("order_id") or order.get("id")) == str(order_id) for order in open_orders):
         return []
-    if not args.execute_paper_orders:
+    if not _orders_enabled(args):
         return [{"action": "would_cancel_stale_entry", "order_id": order_id, "age_seconds": age}]
     try:
         result = broker.cancel_order(str(order_id))
@@ -1309,11 +1468,12 @@ def append_log(output_dir: Path, currency: str, record: dict[str, Any]) -> None:
 def liquidate_and_stop(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     stop_request = write_stop_request(output_dir, args.currency, reason="liquidate_and_stop")
-    broker = DeribitTestnetBroker()
+    broker = _broker_for_args(args)
     now = datetime.now(UTC)
-    account = broker.account_summary(currency=args.currency)
-    open_orders = _option_open_orders(broker.open_orders(currency=args.currency, kind="option"), args.currency)
-    positions = _option_positions(broker.positions(currency=args.currency, kind="option"), args.currency)
+    instrument_currency = _instrument_currency(args)
+    account = broker.account_summary(currency=instrument_currency)
+    open_orders = _option_open_orders(broker.open_orders(currency=instrument_currency, kind="option"), args.currency, instrument_currency=instrument_currency)
+    positions = _option_positions(broker.positions(currency=instrument_currency, kind="option"), args.currency, instrument_currency=instrument_currency)
     actions = _cancel_open_option_orders(
         broker=broker,
         args=args,
@@ -1331,8 +1491,10 @@ def liquidate_and_stop(args: argparse.Namespace) -> dict[str, Any]:
     )
     record = {
         "checked_at": datetime.now(UTC).isoformat(),
-        "venue": "deribit_testnet",
+        "venue": f"deribit_{args.account_mode}",
+        "account_mode": args.account_mode,
         "currency": args.currency.upper(),
+        "instrument_currency": instrument_currency,
         "ticker": f"{args.currency.upper()}-USD",
         "command": "liquidate_and_stop",
         "account": _safe_account(account),
@@ -1342,6 +1504,7 @@ def liquidate_and_stop(args: argparse.Namespace) -> dict[str, Any]:
         "management_actions": actions,
         "execution_blocks": [],
         "execute_paper_orders": bool(args.execute_paper_orders),
+        "execute_live_orders": bool(args.execute_live_orders),
         "order_result": {"submitted": bool(actions), "reason": "liquidate_and_stop"},
     }
     write_state(output_dir, args.currency, {"stop_request": stop_request, "last_record_summary": _summary(record)})
@@ -1403,7 +1566,8 @@ def _load_prices(args: argparse.Namespace) -> pd.DataFrame:
     return prices
 
 
-def _option_open_orders(orders: list[dict[str, Any]], currency: str) -> list[dict[str, Any]]:
+def _option_open_orders(orders: list[dict[str, Any]], currency: str, *, instrument_currency: str | None = None) -> list[dict[str, Any]]:
+    prefix = _instrument_prefix(currency, instrument_currency)
     return [
         {
             "order_id": order.get("order_id"),
@@ -1416,17 +1580,19 @@ def _option_open_orders(orders: list[dict[str, Any]], currency: str) -> list[dic
             "label": order.get("label"),
         }
         for order in orders
-        if str(order.get("instrument_name") or "").upper().startswith(currency.upper() + "-")
+        if str(order.get("instrument_name") or "").upper().startswith(prefix)
     ]
 
 
-def _option_positions(positions: list[dict[str, Any]], currency: str) -> list[dict[str, Any]]:
+def _option_positions(positions: list[dict[str, Any]], currency: str, *, instrument_currency: str | None = None) -> list[dict[str, Any]]:
+    prefix = _instrument_prefix(currency, instrument_currency)
     rows = []
     for position in positions:
         instrument_name = str(position.get("instrument_name") or "")
-        if not instrument_name.upper().startswith(currency.upper() + "-"):
+        if not instrument_name.upper().startswith(prefix):
             continue
-        if abs(_float_or_none(position.get("size")) or 0.0) <= 0:
+        size = _float_or_none(position.get("size"))
+        if str(position.get("direction") or "").lower() == "zero" or size is None or abs(size) <= 1e-12:
             continue
         expiry = _position_expiry_utc(position, {})
         rows.append(
@@ -1435,8 +1601,11 @@ def _option_positions(positions: list[dict[str, Any]], currency: str) -> list[di
                 "size": position.get("size"),
                 "average_price": position.get("average_price"),
                 "floating_profit_loss": position.get("floating_profit_loss"),
+                "floating_profit_loss_usd": position.get("floating_profit_loss_usd"),
                 "total_profit_loss": position.get("total_profit_loss"),
+                "total_profit_loss_usd": position.get("total_profit_loss_usd"),
                 "mark_price": position.get("mark_price"),
+                "average_price_usd": position.get("average_price_usd"),
                 "expiration_timestamp": position.get("expiration_timestamp"),
                 "expiration_utc": expiry.isoformat() if expiry else position.get("expiration_utc"),
                 "delta": position.get("delta"),
@@ -1451,6 +1620,35 @@ def _option_positions(positions: list[dict[str, Any]], currency: str) -> list[di
 def _safe_account(account: dict[str, Any]) -> dict[str, Any]:
     allowed = ["currency", "balance", "equity", "available_funds", "available_withdrawal_funds", "margin_balance", "options_session_rpl", "options_session_upl"]
     return {key: account.get(key) for key in allowed if key in account}
+
+
+def _broker_for_args(args: argparse.Namespace) -> DeribitTestnetBroker | DeribitOptionsBroker:
+    if str(getattr(args, "account_mode", "testnet")) == "testnet":
+        return DeribitTestnetBroker()
+    return DeribitOptionsBroker(account_mode="live")
+
+
+def _orders_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "execute_paper_orders", False) or getattr(args, "execute_live_orders", False))
+
+
+def _instrument_currency(args: argparse.Namespace) -> str:
+    return str(getattr(args, "instrument_currency", None) or getattr(args, "currency", "ETH")).upper()
+
+
+def _instrument_prefix(currency: str, instrument_currency: str | None = None) -> str:
+    underlying = str(currency or "").upper()
+    instrument_ccy = str(instrument_currency or currency or "").upper()
+    if instrument_ccy in {"USDC", "USDT", "USDE"}:
+        return f"{underlying}_{instrument_ccy}-"
+    return f"{instrument_ccy}-"
+
+
+def _instrument_currency_from_name(instrument_name: str) -> str:
+    prefix = str(instrument_name or "").split("-", 1)[0].upper()
+    if "_" in prefix:
+        return prefix.rsplit("_", 1)[-1]
+    return prefix
 
 
 def _primary_forecast(plan: dict[str, Any]) -> dict[str, Any]:
@@ -1514,6 +1712,9 @@ def _risk_control_config(args: argparse.Namespace) -> dict[str, Any]:
         "total_profit_close_mode": getattr(args, "total_profit_close_mode", None),
         "max_position_unrealized_loss_usd": _abs_or_none(getattr(args, "max_position_unrealized_loss_usd", None)),
         "max_position_unrealized_profit_usd": getattr(args, "max_position_unrealized_profit_usd", None),
+        "take_profit_position_pl_usd": getattr(args, "take_profit_position_pl_usd", None),
+        "profit_retrace_from_peak_pct": getattr(args, "profit_retrace_from_peak_pct", None),
+        "profit_close_limit_offset_pct": getattr(args, "profit_close_limit_offset_pct", None),
         "enable_forecast_reversal_exit": getattr(args, "enable_forecast_reversal_exit", None),
         "min_reversal_edge_pct": getattr(args, "min_reversal_edge_pct", None),
         "close_before_expiry_hours": getattr(args, "close_before_expiry_hours", None),
@@ -1523,6 +1724,16 @@ def _risk_control_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_open_option_contracts": getattr(args, "max_open_option_contracts", None),
         "max_open_option_premium_usd": getattr(args, "max_open_option_premium_usd", None),
         "allow_mixed_option_direction": getattr(args, "allow_mixed_option_direction", None),
+        "enable_market_regime_filter": getattr(args, "enable_market_regime_filter", None),
+        "allow_range_edge_reversal_entry": getattr(args, "allow_range_edge_reversal_entry", None),
+        "market_regime_lookback_rows": getattr(args, "market_regime_lookback_rows", None),
+        "market_regime_breakout_buffer_pct": getattr(args, "market_regime_breakout_buffer_pct", None),
+        "market_regime_middle_zone_width": getattr(args, "market_regime_middle_zone_width", None),
+        "min_trend_strength_pct": getattr(args, "min_trend_strength_pct", None),
+        "enable_impulse_entry": getattr(args, "enable_impulse_entry", None),
+        "impulse_lookback_bars": getattr(args, "impulse_lookback_bars", None),
+        "min_impulse_move_pct": getattr(args, "min_impulse_move_pct", None),
+        "min_impulse_directional_bars": getattr(args, "min_impulse_directional_bars", None),
         "enable_feedback_loop": getattr(args, "enable_feedback_loop", None),
         "feedback_min_matured": getattr(args, "feedback_min_matured", None),
         "feedback_min_direction_accuracy": getattr(args, "feedback_min_direction_accuracy", None),
