@@ -1,6 +1,7 @@
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import response_payload
-from market_forecasting_engine.llm_trader.run import build_currency_context, build_technical_packet
+from market_forecasting_engine.llm_trader.run import build_currency_context, build_technical_packet, resolve_llm_model, resolve_llm_provider
+from market_forecasting_engine.openai_models import DEFAULT_BEDROCK_OPENAI_MODEL
 from market_forecasting_engine.llm_trader.prompts import autonomous_trader
 from market_forecasting_engine.llm_trader.prompts import nontechnical_summary
 
@@ -90,6 +91,14 @@ def test_currency_context_accepts_manual_usd_to_eur_rate() -> None:
     assert context["status"] == "available"
     assert context["usd_to_eur"] == 0.92
     assert context["source"] == "manual_cli_override"
+
+
+def test_bedrock_openai_provider_resolves_utils_model_ids(monkeypatch) -> None:
+    monkeypatch.delenv("BEDROCK_MODEL", raising=False)
+    monkeypatch.delenv("BEDROCK_OPENAI_MODEL", raising=False)
+
+    assert resolve_llm_provider("bedrock-openai") == "bedrock"
+    assert resolve_llm_model(None, provider="bedrock") == DEFAULT_BEDROCK_OPENAI_MODEL
 
 
 def test_trader_profiles_cover_required_risk_styles() -> None:
