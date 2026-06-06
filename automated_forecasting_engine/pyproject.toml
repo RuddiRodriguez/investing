@@ -22,6 +22,7 @@ dependencies = [
 lightgbm = ["lightgbm>=4.5"]
 optimization = ["optuna>=3.6,<5.0"]
 deep-learning = ["torch>=2.2,<3.0"]
+hf-forecasting = ["chronos-forecasting>=1.5,<2.0", "transformers>=4.40,<5.0", "huggingface-hub>=0.23,<1.0"]
 llm = ["openai>=1.0,<2.0", "aws-bedrock-token-generator>=1.1,<2.0"]
 bayesian = ["pymc>=5,<6"]
 traderepublic = [

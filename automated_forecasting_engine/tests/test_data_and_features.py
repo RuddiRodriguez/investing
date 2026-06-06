@@ -193,6 +193,43 @@ def test_alpaca_provider_routes_crypto_symbols_to_crypto_bars(monkeypatch) -> No
     assert result.metadata["capabilities"]["continuous_24_7_market"] is True
 
 
+def test_deribit_provider_normalizes_tradingview_chart_data(monkeypatch) -> None:
+    monkeypatch.setenv("DERIBIT_LIVE_BASE_URL", "https://www.deribit.com/api/v2")
+
+    def fake_get_json(url: str, headers=None):
+        assert "/public/get_tradingview_chart_data?" in url
+        assert "instrument_name=ETH_USDC" in url
+        assert "resolution=5" in url
+        return {
+            "jsonrpc": "2.0",
+            "result": {
+                "status": "ok",
+                "ticks": [1_780_000_000_000, 1_780_000_300_000],
+                "open": [1550.0, 1552.0],
+                "high": [1555.0, 1558.0],
+                "low": [1548.0, 1551.0],
+                "close": [1552.0, 1557.0],
+                "volume": [10.0, 12.0],
+            },
+        }
+
+    monkeypatch.setattr(data_providers, "_get_json", fake_get_json)
+
+    result = load_prices_with_provider(
+        "deribit",
+        DataRequest(ticker="ETH-USD", start="2026-06-01T00:00:00Z", end="2026-06-01T01:00:00Z", interval="5m"),
+        store=None,
+        use_cache=False,
+        refresh_cache=True,
+    )
+
+    assert result.frame.index[0] == pd.Timestamp("2026-05-28 20:26:40")
+    assert result.frame["close"].iloc[-1] == 1557.0
+    assert result.metadata["provider"] == "deribit"
+    assert result.metadata["instrument_name"] == "ETH_USDC"
+    assert result.metadata["capabilities"]["continuous_24_7_market"] is True
+
+
 def test_data_version_hash_is_stable_for_same_data() -> None:
     normalized = normalize_price_frame(_prices())
 

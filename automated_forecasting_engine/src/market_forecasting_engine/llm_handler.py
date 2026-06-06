@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from market_forecasting_engine.llm_usage import log_llm_usage, log_openai_usage, monotonic_ms, new_llm_call_id
+from market_forecasting_engine.llm_model_catalog import DEFAULT_LLM_STUDIO_BASE_URL
 from market_forecasting_engine.openai_models import BEDROCK_OPENAI_BASE_URL
 
 
@@ -123,12 +124,14 @@ class HuggingFaceChatProvider:
         if payload.get("tools"):
             raise LLMProviderNotConfigured("Hugging Face chat provider does not support Responses API tools in this framework yet.")
         messages = responses_payload_to_chat_messages(payload)
+        if _is_huggingface_structured_output_unsupported(request.model):
+            messages = _messages_with_json_instruction(messages, payload.get("text"))
         create_payload: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
             "temperature": payload.get("temperature"),
         }
-        response_format = _chat_response_format(payload.get("text"))
+        response_format = None if _is_huggingface_structured_output_unsupported(request.model) else _chat_response_format(payload.get("text"))
         if response_format is not None:
             create_payload["response_format"] = response_format
         create_payload = {key: value for key, value in create_payload.items() if value is not None}
@@ -154,6 +157,58 @@ class HuggingFaceChatProvider:
         except ImportError as exc:
             raise LLMProviderNotConfigured("Install the openai package to use the Hugging Face router provider.") from exc
         return OpenAI(api_key=api_key, base_url=self.base_url)
+
+
+class OpenAICompatibleChatProvider:
+    name = "llm_studio"
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        provider_name: str = "llm_studio",
+    ):
+        self.client = client
+        self.api_key = api_key
+        self.base_url = base_url or os.getenv("LLM_STUDIO_BASE_URL") or os.getenv("LOCAL_LLM_BASE_URL") or DEFAULT_LLM_STUDIO_BASE_URL
+        self.name = normalize_provider_name(provider_name)
+
+    def generate(self, request: LLMRequest) -> LLMResult:
+        client = self.client or self._client()
+        payload = payload_with_model(request.payload, request.model)
+        if payload.get("tools"):
+            raise LLMProviderNotConfigured(f"{self.name} provider does not support Responses API tools in this framework yet.")
+        messages = responses_payload_to_chat_messages(payload)
+        create_payload: dict[str, Any] = {
+            "model": request.model,
+            "messages": messages,
+            "temperature": payload.get("temperature"),
+        }
+        response_format = _chat_response_format(payload.get("text"))
+        if response_format is not None:
+            create_payload["response_format"] = response_format
+        create_payload = {key: value for key, value in create_payload.items() if value is not None}
+        response = client.chat.completions.create(**create_payload)
+        response_data = response_json(response)
+        output_text = _chat_output_text(response, response_data)
+        return LLMResult(
+            provider=self.name,
+            model=request.model,
+            payload=create_payload,
+            response_data=response_data,
+            parsed=parse_json_object(output_text),
+            output_text=output_text,
+            api_key=getattr(client, "api_key", None) or self.api_key or os.getenv("LLM_STUDIO_API_KEY") or "local",
+        )
+
+    def _client(self) -> Any:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise LLMProviderNotConfigured("Install the openai package to use the OpenAI-compatible local provider.") from exc
+        return OpenAI(api_key=self.api_key or os.getenv("LLM_STUDIO_API_KEY") or os.getenv("LOCAL_LLM_API_KEY") or "local", base_url=self.base_url)
 
 
 class NotConfiguredProvider:
@@ -242,7 +297,7 @@ def default_provider_registry(
     providers: dict[str, LLMProvider] = {
         "bedrock": BedrockOpenAIResponsesProvider(client=bedrock_client),
         "huggingface": HuggingFaceChatProvider(client=huggingface_client),
-        "llm_studio": NotConfiguredProvider("llm_studio", "Add an OpenAI-compatible local endpoint provider for LLM Studio."),
+        "llm_studio": OpenAICompatibleChatProvider(),
     }
     if openai_client is not None:
         providers["openai"] = OpenAIResponsesProvider(openai_client)
@@ -337,7 +392,15 @@ def responses_payload_to_chat_messages(payload: dict[str, Any]) -> list[dict[str
 
 
 def parse_json_object(output_text: str) -> dict[str, Any]:
-    parsed = json.loads(str(output_text or "{}").strip() or "{}")
+    text = str(output_text or "{}").strip() or "{}"
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(text[start : end + 1])
     if not isinstance(parsed, dict):
         raise ValueError("LLM structured output JSON must be an object.")
     return parsed
@@ -352,6 +415,25 @@ def _chat_response_format(text_config: Any) -> dict[str, Any] | None:
     chat_schema = dict(json_schema)
     chat_schema.pop("type", None)
     return {"type": "json_schema", "json_schema": chat_schema}
+
+
+def _is_huggingface_structured_output_unsupported(model: str) -> bool:
+    normalized = str(model or "").lower()
+    return "kimi" in normalized
+
+
+def _messages_with_json_instruction(messages: list[dict[str, str]], text_config: Any) -> list[dict[str, str]]:
+    schema = None
+    if isinstance(text_config, dict) and isinstance(text_config.get("format"), dict):
+        schema = text_config.get("format", {}).get("schema")
+    instruction = "Return exactly one valid JSON object. Do not include markdown, prose, or code fences."
+    if schema:
+        instruction += f"\nThe JSON object must follow this schema intent: {json.dumps(schema, sort_keys=True, default=str)}"
+    if not messages:
+        return [{"role": "system", "content": instruction}]
+    updated = [dict(item) for item in messages]
+    updated[0]["content"] = f"{updated[0].get('content', '')}\n\n{instruction}".strip()
+    return updated
 
 
 def _chat_output_text(response: Any, response_data: dict[str, Any]) -> str:

@@ -307,6 +307,67 @@ class AlpacaProvider:
         )
 
 
+class DeribitProvider:
+    name = "deribit"
+    base_url = "https://www.deribit.com/api/v2"
+
+    def __init__(self, base_url: str | None = None) -> None:
+        _load_env_file()
+        self.base_url = (base_url or os.getenv("DERIBIT_LIVE_BASE_URL") or os.getenv("DERIBIT_BASE_URL_LIVE") or self.base_url).rstrip("/")
+
+    def fetch_prices(self, request: DataRequest) -> ProviderResult:
+        instrument = _deribit_price_instrument(request.ticker)
+        start = _timestamp_ms(request.start or "2000-01-01")
+        end = _timestamp_ms(request.end) if request.end else _timestamp_ms(pd.Timestamp.utcnow().isoformat())
+        params = {
+            "instrument_name": instrument,
+            "start_timestamp": start,
+            "end_timestamp": end,
+            "resolution": _deribit_resolution(request.interval),
+        }
+        url = f"{self.base_url}/public/get_tradingview_chart_data?" + urlencode(params)
+        payload = _get_json(url)
+        result = payload.get("result") if isinstance(payload, dict) and "result" in payload else payload
+        if not isinstance(result, dict):
+            raise ValueError(f"Deribit returned invalid chart data for {instrument}.")
+        status = str(result.get("status") or "").lower()
+        ticks = result.get("ticks") or []
+        if status not in {"ok", ""} or not ticks:
+            raise ValueError(f"Deribit returned no chart bars for {instrument}: status={status or 'unknown'}.")
+        raw = pd.DataFrame(
+            {
+                "t": ticks,
+                "o": result.get("open") or [],
+                "h": result.get("high") or [],
+                "l": result.get("low") or [],
+                "c": result.get("close") or [],
+                "v": result.get("volume") or [],
+            }
+        )
+        normalized = _normalize_deribit_chart_bars(raw, target_column=request.target_column)
+        return ProviderResult(
+            frame=normalized,
+            raw_frame=raw,
+            metadata={
+                "provider": self.name,
+                "ticker": instrument,
+                "request": request.to_dict(),
+                "instrument_name": instrument,
+                "raw_data_hash": frame_sha256(raw),
+                "normalized_data_hash": frame_sha256(normalized),
+                "cache_hit": False,
+                "capabilities": {
+                    "intraday": True,
+                    "production_sla": True,
+                    "explicit_regular_session_flags": False,
+                    "continuous_24_7_market": True,
+                    "extended_intraday_history": True,
+                    "notes": "Deribit TradingView chart data keeps the underlying price source on the same venue as Deribit crypto options.",
+                },
+            },
+        )
+
+
 class NotConfiguredProvider:
     def __init__(self, name: str, setup_hint: str) -> None:
         self.name = name
@@ -328,6 +389,8 @@ def provider_for_name(name: str) -> MarketDataProvider:
         return PolygonProvider()
     if normalized == "alpaca":
         return AlpacaProvider()
+    if normalized == "deribit":
+        return DeribitProvider()
     if normalized == "iex":
         return NotConfiguredProvider("iex", "Add an IEX Cloud or IEX-compatible API-key-backed provider implementation.")
     if normalized in {"alpha-vantage", "alphavantage"}:
@@ -427,6 +490,39 @@ def _alpaca_timeframe(interval: str) -> str:
     raise ValueError(f"Unsupported Alpaca interval `{interval}`.")
 
 
+def _deribit_resolution(interval: str) -> str:
+    value = interval.strip().lower()
+    if value.endswith("m"):
+        return str(int(float(value[:-1])))
+    if value.endswith("h"):
+        return str(int(float(value[:-1]) * 60))
+    if value.endswith("d"):
+        return f"{int(float(value[:-1]))}D"
+    raise ValueError(f"Unsupported Deribit interval `{interval}`.")
+
+
+def _deribit_price_instrument(ticker: str) -> str:
+    normalized = ticker.strip().upper().replace("/", "-").replace("_", "-")
+    if normalized in {"ETH-USD", "ETH-USDC", "ETHUSD", "ETHUSDC"}:
+        return "ETH_USDC"
+    if normalized in {"BTC-USD", "BTC-USDC", "BTCUSD", "BTCUSDC"}:
+        return "BTC_USDC"
+    if "-" in normalized:
+        base, quote = normalized.split("-", 1)
+        if quote in {"USD", "USDC"}:
+            return f"{base}_USDC"
+    raise ValueError(f"Unsupported Deribit chart ticker `{ticker}`.")
+
+
+def _timestamp_ms(value: str | pd.Timestamp) -> int:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    else:
+        timestamp = timestamp.tz_convert("UTC")
+    return int(timestamp.timestamp() * 1000)
+
+
 def _is_crypto_symbol(ticker: str) -> bool:
     normalized = ticker.strip().upper()
     if "/" in normalized:
@@ -488,6 +584,20 @@ def _normalize_alpaca_bars(raw: pd.DataFrame, target_column: str) -> pd.DataFram
             "volume": raw["v"].to_numpy(),
         },
         index=pd.to_datetime(raw["t"], utc=True).dt.tz_convert(None),
+    )
+    return normalize_price_frame(frame, target_column=target_column)
+
+
+def _normalize_deribit_chart_bars(raw: pd.DataFrame, target_column: str) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            "open": raw["o"].to_numpy(),
+            "high": raw["h"].to_numpy(),
+            "low": raw["l"].to_numpy(),
+            "close": raw["c"].to_numpy(),
+            "volume": raw["v"].to_numpy(),
+        },
+        index=pd.to_datetime(raw["t"], unit="ms", utc=True).dt.tz_convert(None),
     )
     return normalize_price_frame(frame, target_column=target_column)
 

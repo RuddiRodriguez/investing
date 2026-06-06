@@ -1,6 +1,7 @@
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import response_payload
 from market_forecasting_engine.llm_trader.run import build_currency_context, build_technical_packet, resolve_llm_model, resolve_llm_provider
+from market_forecasting_engine.llm_model_catalog import DEFAULT_HUGGINGFACE_TRADER_MODEL, DEFAULT_LOCAL_TRADER_MODEL
 from market_forecasting_engine.openai_models import DEFAULT_BEDROCK_OPENAI_MODEL
 from market_forecasting_engine.llm_trader.prompts import autonomous_trader
 from market_forecasting_engine.llm_trader.prompts import nontechnical_summary
@@ -99,6 +100,18 @@ def test_bedrock_openai_provider_resolves_utils_model_ids(monkeypatch) -> None:
 
     assert resolve_llm_provider("bedrock-openai") == "bedrock"
     assert resolve_llm_model(None, provider="bedrock") == DEFAULT_BEDROCK_OPENAI_MODEL
+
+
+def test_alternative_llm_provider_defaults_are_project_local(monkeypatch) -> None:
+    monkeypatch.delenv("HUGGINGFACE_MODEL", raising=False)
+    monkeypatch.delenv("HF_MODEL", raising=False)
+    monkeypatch.delenv("LLM_STUDIO_MODEL", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_MODEL", raising=False)
+
+    assert resolve_llm_provider("hf") == "huggingface"
+    assert resolve_llm_provider("local-llm-studio") == "llm_studio"
+    assert resolve_llm_model(None, provider="huggingface") == DEFAULT_HUGGINGFACE_TRADER_MODEL
+    assert resolve_llm_model(None, provider="llm_studio") == DEFAULT_LOCAL_TRADER_MODEL
 
 
 def test_trader_profiles_cover_required_risk_styles() -> None:

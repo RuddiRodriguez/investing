@@ -23,6 +23,9 @@ class ModelName(str, Enum):
     GPT_5_MINI_2025_08_07 = "gpt-5-mini-2025-08-07"
     GPT_5_2025_08_07 = "gpt-5-2025-08-07"
     GPT_5_2_2025_12_11 = "gpt-5.2-2025-12-11"
+    GPT_5_4 = "gpt-5.4"
+    GPT_5_4_MINI = "gpt-5.4-mini"
+    GPT_5_4_NANO = "gpt-5.4-nano"
     GPT_5_4_2026_03_05 = "gpt-5.4-2026-03-05"
     GPT_5_4_MINI_2026_03_17 = "gpt-5.4-mini-2026-03-17"
     GPT_5_4_NANO_2026_03_17 = "gpt-5.4-nano-2026-03-17"
@@ -37,6 +40,9 @@ REASONING_MODELS = {
     ModelName.GPT_5_NANO_2025_08_07,
     ModelName.GPT_5_MINI_2025_08_07,
     ModelName.GPT_5_2_2025_12_11,
+    ModelName.GPT_5_4,
+    ModelName.GPT_5_4_MINI,
+    ModelName.GPT_5_4_NANO,
     ModelName.GPT_5_4_2026_03_05,
     ModelName.GPT_5_4_MINI_2026_03_17,
     ModelName.GPT_5_4_NANO_2026_03_17,

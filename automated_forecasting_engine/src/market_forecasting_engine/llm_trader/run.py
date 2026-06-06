@@ -13,6 +13,7 @@ from market_forecasting_engine.governance import write_audit_bundle
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import call_response
 from market_forecasting_engine.llm_handler import normalize_provider_name
+from market_forecasting_engine.llm_model_catalog import DEFAULT_HUGGINGFACE_TRADER_MODEL, DEFAULT_LOCAL_TRADER_MODEL
 from market_forecasting_engine.openai_models import DEFAULT_BEDROCK_OPENAI_MODEL, DEFAULT_OPENAI_MODEL
 from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.plots import write_plot_artifacts
@@ -165,11 +166,11 @@ def resolve_llm_model(model: str | None, *, provider: str | None = None) -> str:
     if model:
         return model
     if selected_provider == "huggingface":
-        return os.environ.get("HUGGINGFACE_MODEL") or os.environ.get("HF_MODEL") or "openai/gpt-oss-20b:cerebras"
+        return os.environ.get("HUGGINGFACE_MODEL") or os.environ.get("HF_MODEL") or DEFAULT_HUGGINGFACE_TRADER_MODEL
     if selected_provider == "bedrock":
         return os.environ.get("BEDROCK_OPENAI_MODEL") or os.environ.get("BEDROCK_MODEL") or DEFAULT_BEDROCK_OPENAI_MODEL
     if selected_provider == "llm_studio":
-        return os.environ.get("LLM_STUDIO_MODEL") or "local-model"
+        return os.environ.get("LLM_STUDIO_MODEL") or os.environ.get("LOCAL_LLM_MODEL") or DEFAULT_LOCAL_TRADER_MODEL
     return os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
 
 

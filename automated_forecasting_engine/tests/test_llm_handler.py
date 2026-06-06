@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from market_forecasting_engine.llm_handler import (
     BedrockOpenAIResponsesProvider,
     HuggingFaceChatProvider,
@@ -11,6 +9,7 @@ from market_forecasting_engine.llm_handler import (
     LLMProviderNotConfigured,
     LLMRequest,
     OpenAIResponsesProvider,
+    OpenAICompatibleChatProvider,
     default_provider_registry,
     normalize_provider_name,
 )
@@ -146,5 +145,20 @@ def test_default_registry_has_future_provider_slots() -> None:
     assert {"openai", "huggingface", "bedrock", "llm_studio"}.issubset(set(providers))
     assert normalize_provider_name("HF") == "huggingface"
     assert normalize_provider_name("bedrock-openai") == "bedrock"
-    with pytest.raises(LLMProviderNotConfigured):
-        providers["llm_studio"].generate(LLMRequest(provider="llm_studio", model="x", payload={}))
+
+
+def test_llm_studio_provider_uses_openai_compatible_chat_endpoint(tmp_path, monkeypatch) -> None:
+    log_file = tmp_path / "usage.jsonl"
+    monkeypatch.setenv("OPENAI_USAGE_LOG_FILE", str(log_file))
+    client = _FakeHFClient()
+    handler = LLMHandler({"llm_studio": OpenAICompatibleChatProvider(client=client, api_key="local-key", base_url="http://127.0.0.1:1234/v1")})
+
+    result = handler.predict(LLMRequest(provider="lm_studio", model="local-trader", payload=_payload(), usage_context={"purpose": "local_unit"}))
+
+    assert result.parsed == {"decision": "Buy"}
+    sent = client.chat.completions.payload
+    assert sent["model"] == "local-trader"
+    assert sent["messages"][0] == {"role": "system", "content": "system"}
+    row = json.loads(log_file.read_text().splitlines()[0])
+    assert row["provider"] == "llm_studio"
+    assert row["model"] == "local-trader"
