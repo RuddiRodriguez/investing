@@ -1,22 +1,18 @@
-"""Optional OpenAI-based interpretation for strategy results.
+"""Optional LLM-based interpretation for strategy results.
 
-This module is intentionally isolated so the app still works without OpenAI.
+This module is intentionally isolated so the app still works without LLM credentials.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 from datetime import date
 
 import pandas as pd
 from dotenv import load_dotenv
 
-try:
-    from openai import OpenAI
-except ImportError:  # pragma: no cover
-    OpenAI = None
+from src.llm_handler import LLMRequest, call_llm, normalize_provider_name, resolve_llm_model
 
 
 load_dotenv()
@@ -63,21 +59,17 @@ def interpret_results_with_openai(
     user_note: str = "",
     model: str = "gpt-4.1",
     use_web_search: bool = True,
+    provider: str = "openai",
 ) -> str:
-    """Ask OpenAI for a structured interpretation of the latest portfolio state."""
+    """Ask the selected LLM provider for a structured interpretation."""
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Set OPENAI_API_KEY to enable AI interpretation.")
-    if OpenAI is None:
-        raise ValueError("The openai package is not installed. Run `pip install -r requirements.txt`.")
-
-    client = OpenAI(api_key=api_key)
+    provider_name = normalize_provider_name(provider)
+    selected_model = resolve_llm_model(model, provider_name)
     payload = build_analysis_payload(results, user_note)
 
-    tools = [{"type": "web_search"}] if use_web_search else []
+    tools = [{"type": "web_search"}] if use_web_search and provider_name in {"openai", "bedrock"} else []
     tool_choice: str | dict[str, Any] = "auto"
-    if use_web_search:
+    if tools:
         tool_choice = "required"
 
     today = date.today().isoformat()
@@ -104,24 +96,29 @@ def interpret_results_with_openai(
         "When you mention news or macro events, include the month and year."
     )
 
-    response = client.responses.create(
-        model=model,
-        instructions=instructions,
-        input=(
-            "Interpret this ETF rotation model output and provide a cautious stance.\n\n"
-            f"{json.dumps(payload, indent=2)}"
-        ),
-        tools=tools,
-        tool_choice=tool_choice,
-        include=["web_search_call.action.sources"] if use_web_search else [],
+    result = call_llm(
+        LLMRequest(
+            provider=provider_name,
+            model=selected_model,
+            payload={
+                "instructions": instructions,
+                "input": (
+                    "Interpret this ETF rotation model output and provide a cautious stance.\n\n"
+                    f"{json.dumps(payload, indent=2)}"
+                ),
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "include": ["web_search_call.action.sources"] if tools else [],
+            },
+        )
     )
 
-    output_text = getattr(response, "output_text", "").strip()
-    if not use_web_search:
+    output_text = result.output_text.strip()
+    if not tools:
         return output_text
 
     sources = []
-    for item in getattr(response, "output", []):
+    for item in getattr(result.response, "output", []):
         if getattr(item, "type", None) != "web_search_call":
             continue
         action = getattr(item, "action", None)

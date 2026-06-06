@@ -9,6 +9,7 @@ import streamlit as st
 
 from src.ai_interpreter import interpret_results_with_openai
 from src.data import download_prices, load_inflation_series, parse_uploaded_csv
+from src.llm_handler import DEFAULT_BEDROCK_OPENAI_MODEL, DEFAULT_HUGGINGFACE_MODEL, DEFAULT_OPENAI_MODEL
 from src.strategy import StrategyConfig, backtest
 
 
@@ -96,12 +97,24 @@ def main() -> None:
             rebalance_frequency = "M" if rebalance_frequency_label == "Monthly" else "Q"
 
             st.header("Optional AI Explanation")
-            enable_ai = st.checkbox("Use OpenAI to explain the results", value=False)
-            openai_model = st.text_input("OpenAI model", value="gpt-4.1", disabled=not enable_ai)
+            enable_ai = st.checkbox("Use an LLM to explain the results", value=False)
+            llm_provider = st.selectbox(
+                "LLM provider",
+                ["openai", "bedrock", "huggingface", "llm_studio"],
+                index=0,
+                disabled=not enable_ai,
+            )
+            default_model = {
+                "openai": DEFAULT_OPENAI_MODEL,
+                "bedrock": DEFAULT_BEDROCK_OPENAI_MODEL,
+                "huggingface": DEFAULT_HUGGINGFACE_MODEL,
+                "llm_studio": "local-model",
+            }[llm_provider]
+            openai_model = st.text_input("LLM model", value=default_model, disabled=not enable_ai)
             use_web_search = st.checkbox(
                 "Include recent market news",
                 value=True,
-                disabled=not enable_ai,
+                disabled=not enable_ai or llm_provider not in {"openai", "bedrock"},
                 help="The AI can look at recent market news and big world events before giving its view.",
             )
             user_note = st.text_area(
@@ -225,6 +238,7 @@ def main() -> None:
                                 user_note=user_note,
                                 model=openai_model,
                                 use_web_search=use_web_search,
+                                provider=llm_provider,
                             )
                         if interpretation:
                             st.markdown(interpretation)
