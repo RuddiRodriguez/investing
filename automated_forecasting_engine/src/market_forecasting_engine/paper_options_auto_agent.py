@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-abs-forecast-return", type=float, default=0.001)
     parser.add_argument("--min-intraday-rows", type=int, default=120)
     parser.add_argument("--enable-llm-ticker-selection", action="store_true", help="Let an LLM rank the candidates after hard liquidity/broker gates pass.")
+    parser.add_argument("--llm-ticker-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai")
     parser.add_argument("--llm-ticker-model", default="gpt-4o-mini")
     parser.add_argument("--llm-ticker-use-web", action="store_true", help="Allow the LLM ticker ranker to use web search. Hard broker/liquidity gates still cannot be overridden.")
     return parser
@@ -167,6 +168,7 @@ def _selector_config_from_args(args: argparse.Namespace) -> OptionTickerSelector
         min_abs_forecast_return=float(args.min_abs_forecast_return),
         min_intraday_rows=int(args.min_intraday_rows),
         enable_llm_selection=bool(args.enable_llm_ticker_selection),
+        llm_provider=str(args.llm_ticker_provider),
         llm_model=str(args.llm_ticker_model),
         llm_use_web=bool(args.llm_ticker_use_web),
     )

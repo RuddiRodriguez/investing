@@ -16,6 +16,7 @@ from market_forecasting_engine.alpaca_options_trader import OptionExecutionConfi
 from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine.llm_trader.run import openai_client_for_provider, resolve_llm_model, resolve_llm_provider
 from market_forecasting_engine.openai_responses import call_response
 from market_forecasting_engine.risk_profiles import risk_profile_for_name
 
@@ -81,6 +82,7 @@ class OptionTickerSelectorConfig:
     min_abs_forecast_return: float = 0.001
     min_intraday_rows: int = 120
     enable_llm_selection: bool = False
+    llm_provider: str = "openai"
     llm_model: str = "gpt-4o-mini"
     llm_use_web: bool = False
 
@@ -212,12 +214,11 @@ def choose_ticker_with_llm(
     config: OptionTickerSelectorConfig,
     now: datetime,
 ) -> dict[str, Any] | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        return {"status": "skipped", "reason": "OPENAI_API_KEY_missing"}
-    try:
-        from openai import OpenAI
-    except Exception as exc:
-        return {"status": "skipped", "reason": f"openai_import_failed:{exc}"}
+    provider = resolve_llm_provider(config.llm_provider)
+    if provider == "openai" and not os.getenv("OPENAI_API_KEY"):
+        return {"status": "skipped", "reason": "OPENAI_API_KEY_missing", "provider": provider}
+    if provider == "huggingface" and not (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_API_KEY")):
+        return {"status": "skipped", "reason": "HF_TOKEN_or_HUGGINGFACE_API_KEY_missing", "provider": provider}
     compact = [
         {
             "ticker": row["ticker"],
@@ -233,11 +234,12 @@ def choose_ticker_with_llm(
         }
         for row in candidates
     ]
-    tools = [{"type": "web_search_preview"}] if config.llm_use_web else []
+    tools = [{"type": "web_search_preview"}] if config.llm_use_web and provider == "openai" else []
     try:
         _payload, _response, parsed = call_response(
-            client=OpenAI(),
-            model=config.llm_model,
+            client=openai_client_for_provider(provider, timeout=60.0),
+            provider=provider,
+            model=resolve_llm_model(config.llm_model, provider=provider),
             system_message=(
                 "You rank already-filtered US option day-trading tickers. "
                 "Never select a ticker outside the candidate list. "
@@ -270,9 +272,10 @@ def choose_ticker_with_llm(
                 "strict": True,
             },
             tools=tools,
-            usage_context={"process": "option_ticker_selector", "risk_profile": config.risk_profile},
+            usage_context={"process": "option_ticker_selector", "risk_profile": config.risk_profile, "provider": provider},
         )
         parsed["status"] = "ok"
+        parsed["provider"] = provider
         return parsed
     except Exception as exc:
         return {"status": "error", "reason": str(exc)[:300]}

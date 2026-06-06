@@ -26,6 +26,8 @@ class ModelName(str, Enum):
     GPT_5_4_2026_03_05 = "gpt-5.4-2026-03-05"
     GPT_5_4_MINI_2026_03_17 = "gpt-5.4-mini-2026-03-17"
     GPT_5_4_NANO_2026_03_17 = "gpt-5.4-nano-2026-03-17"
+    BEDROCK_OPENAI_GPT_5_4 = "openai.gpt-5.4"
+    BEDROCK_OPENAI_GPT_5_5 = "openai.gpt-5.5"
     O3_DEEP_RESEARCH_2025_06_26 = "o3-deep-research-2025-06-26"
     O4_MINI_DEEP_RESEARCH_2025_06_26 = "o4-mini-deep-research-2025-06-26"
 
@@ -42,6 +44,12 @@ REASONING_MODELS = {
 
 
 DEFAULT_OPENAI_MODEL = ModelName.GPT_5_4_MINI_2026_03_17.value
+DEFAULT_BEDROCK_OPENAI_MODEL = ModelName.BEDROCK_OPENAI_GPT_5_4.value
+BEDROCK_OPENAI_MODELS = {
+    ModelName.BEDROCK_OPENAI_GPT_5_4.value,
+    ModelName.BEDROCK_OPENAI_GPT_5_5.value,
+}
+BEDROCK_OPENAI_BASE_URL = "https://bedrock-mantle.us-east-2.api.aws/openai/v1"
 DEFAULT_REASONING_EFFORT = "none"
 
 
