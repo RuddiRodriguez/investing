@@ -1,4 +1,9 @@
-# Core data/science stack
+# Install from this folder with:
+#   python -m pip install -r requirements.txt
+#
+# For editable package entry points, also run:
+#   python -m pip install -e .
+
 numpy>=1.26,<2.0
 pandas>=2.2,<3.0
 scipy>=1.11,<1.14
@@ -9,20 +14,16 @@ PyWavelets>=1.8,<2.0
 joblib>=1.4,<2.0
 pyarrow>=16.0,<22.0
 
-# Market data, trading, and dashboards
 yfinance>=0.2.54,<0.3.0
 requests>=2.32,<3.0
 websockets>=15,<16
-streamlit>=1.43,<2.0
 plotly>=6.0,<7.0
 matplotlib>=3.8,<4.0
 pdfplumber>=0.11,<1.0
 exchange-calendars>=4.5,<5.0
 
-# ML / optimization / backtesting
 hmmlearn>=0.3.3,<0.4.0
 ta>=0.11.0,<0.12.0
-backtrader2>=1.9.76.123,<2.0.0
 torch>=2.2,<3.0
 lightgbm>=4.5,<5.0
 xgboost>=3.2,<4.0
@@ -30,16 +31,12 @@ optuna>=4.2,<5.0
 pymc>=5,<6
 umap-learn>=0.5,<1.0
 
-# LLM and app configuration
 openai>=1.68,<2.0
 python-dotenv>=1.0,<2.0
-pydantic>=2.7,<3.0
 
-# Trade Republic integrations
 deprecated>=1.2,<2.0
 ecdsa>=0.19,<1.0
 pytr @ git+https://github.com/pytr-org/pytr.git
 TradeRepublicApi @ git+https://github.com/Zarathustra2/TradeRepublicApi.git
 
-# Test tooling
 pytest>=8.3,<9.0
