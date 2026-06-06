@@ -29,6 +29,8 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
     spot = _to_float((report.get("selected_forecast") or {}).get("spot"))
     position_pl = summarize_position_pl(report.get("option_positions") or [], underlying_price_usd=spot)
     fibonacci = trade_plan.get("fibonacci_analysis") or (report.get("selected_forecast") or {}).get("fibonacci_analysis") or {}
+    chart_patterns = trade_plan.get("chart_pattern_analysis") or (report.get("selected_forecast") or {}).get("chart_pattern_analysis") or {}
+    curve_shape = trade_plan.get("curve_shape_analysis") or (report.get("selected_forecast") or {}).get("curve_shape_analysis") or {}
     market_regime = trade_plan.get("market_regime") or (report.get("selected_forecast") or {}).get("market_regime") or {}
     forecast_chart = build_forecast_chart(history=history, latest_report=report)
     report_age_seconds = _age_seconds(report.get("checked_at"))
@@ -68,6 +70,8 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_history: int = 
             "spread_pct": selected.get("spread_pct"),
             "greeks": selected.get("greeks") or {},
             "fibonacci": fibonacci,
+            "chart_patterns": chart_patterns,
+            "curve_shape": curve_shape,
             "market_regime": market_regime,
             "liquidity": selected.get("liquidity") or {},
             "entry_price_base": order.get("price"),
@@ -307,15 +311,28 @@ def dashboard_html(refresh_seconds: int) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Deribit Options Agent</title>
   <style>
-    :root {{ --bg:#f4f6f8; --panel:#fff; --text:#17202a; --muted:#5d6b7c; --line:#d8dee8; --good:#067647; --warn:#7a4d00; --bad:#b42318; --accent:#1d4ed8; }}
+    :root {{
+      --bg:#0b0f14;
+      --panel:#111822;
+      --panel2:#151e2b;
+      --text:#e6edf6;
+      --muted:#8b9bb0;
+      --line:#263241;
+      --good:#35c98b;
+      --warn:#f5a524;
+      --bad:#ff5c74;
+      --accent:#4f8cff;
+      --chart:#d8e2f0;
+    }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }}
-    header {{ display:flex; justify-content:space-between; gap:16px; padding:18px 22px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:2; }}
+    header {{ display:flex; justify-content:space-between; gap:16px; padding:18px 22px; background:rgba(17,24,34,.96); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:2; backdrop-filter:blur(10px); }}
     h1 {{ margin:0; font-size:20px; }}
     main {{ max-width:1360px; margin:0 auto; padding:18px 22px 30px; }}
     .small,.meta {{ color:var(--muted); font-size:13px; }}
     .cards {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:14px; }}
-    .card,.panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .card,.panel {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; box-shadow:0 10px 28px rgba(0,0,0,.18); }}
+    .card {{ background:var(--panel2); }}
     .label {{ color:var(--muted); font-size:12px; margin-bottom:5px; }}
     .value {{ font-size:22px; font-weight:750; overflow-wrap:anywhere; }}
     .badge {{ display:inline-block; border-radius:999px; padding:5px 10px; font-size:12px; font-weight:750; color:white; background:var(--warn); text-transform:uppercase; }}
@@ -325,30 +342,31 @@ def dashboard_html(refresh_seconds: int) -> str:
     .grid2 {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(420px,.85fr); gap:14px; margin-bottom:14px; }}
     .chartWrap {{ width:100%; height:460px; }}
     svg {{ display:block; width:100%; height:100%; }}
-    .axis {{ stroke:#9aa4b2; stroke-width:1; }}
-    .grid {{ stroke:#e5e9f0; stroke-width:1; }}
-    .actualLine {{ fill:none; stroke:#233044; stroke-width:2; }}
-    .forecastLine {{ fill:none; stroke:#dc2626; stroke-width:2; stroke-dasharray:7 5; }}
-    .forecastBand {{ fill:#dc2626; opacity:.10; }}
-    .asOf {{ stroke:#1d4ed8; stroke-width:1.5; stroke-dasharray:3 4; }}
-    .dotActual {{ fill:#233044; }}
-    .dotForecast {{ fill:#dc2626; }}
-    .dotAsOf {{ fill:#1d4ed8; }}
-    .chartLabel {{ fill:#526071; font-size:12px; }}
-    .chartValue {{ fill:#17202a; font-size:12px; font-weight:650; }}
-    .callout {{ stroke:#9aa4b2; stroke-width:1; }}
+    .axis {{ stroke:#53657c; stroke-width:1; }}
+    .grid {{ stroke:#223044; stroke-width:1; }}
+    .actualLine {{ fill:none; stroke:var(--chart); stroke-width:2; }}
+    .forecastLine {{ fill:none; stroke:#ff5c74; stroke-width:2; stroke-dasharray:7 5; }}
+    .forecastBand {{ fill:#ff5c74; opacity:.14; }}
+    .asOf {{ stroke:var(--accent); stroke-width:1.5; stroke-dasharray:3 4; }}
+    .dotActual {{ fill:var(--chart); }}
+    .dotForecast {{ fill:#ff5c74; }}
+    .dotAsOf {{ fill:var(--accent); }}
+    .chartLabel {{ fill:#9aabc0; font-size:12px; }}
+    .chartValue {{ fill:#f1f5fb; font-size:12px; font-weight:650; }}
+    .callout {{ stroke:#65758a; stroke-width:1; }}
     .chartLegend {{ display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; }}
     .legendItem {{ display:inline-flex; align-items:center; gap:6px; color:var(--muted); font-size:13px; }}
-    .legendSwatch {{ width:18px; height:3px; display:inline-block; background:#233044; }}
-    .legendSwatch.forecast {{ background:#dc2626; border-top:1px dashed #dc2626; }}
-    .legendSwatch.asof {{ background:#1d4ed8; }}
+    .legendSwatch {{ width:18px; height:3px; display:inline-block; background:var(--chart); }}
+    .legendSwatch.forecast {{ background:#ff5c74; border-top:1px dashed #ff5c74; }}
+    .legendSwatch.asof {{ background:var(--accent); }}
     .rangeControls {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 12px; }}
-    .rangeButton {{ border:1px solid var(--line); background:#fff; color:var(--muted); border-radius:7px; padding:7px 10px; font-weight:700; cursor:pointer; }}
+    .rangeButton {{ border:1px solid var(--line); background:#0f1621; color:var(--muted); border-radius:7px; padding:7px 10px; font-weight:700; cursor:pointer; }}
+    .rangeButton:hover {{ color:var(--text); border-color:#3a4b61; }}
     .rangeButton.active {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
     table {{ width:100%; border-collapse:collapse; font-size:13px; }}
     th,td {{ padding:8px 6px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
     th {{ color:var(--muted); font-weight:650; }}
-    pre {{ margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; max-height:640px; overflow:auto; }}
+    pre {{ margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; max-height:640px; overflow:auto; color:#d6e0ed; }}
     .bad {{ color:var(--bad); font-weight:650; }}
     @media (max-width:980px) {{ header {{ flex-direction:column; }} .cards,.grid2 {{ grid-template-columns:1fr; }} }}
   </style>
@@ -435,6 +453,24 @@ def dashboard_html(refresh_seconds: int) -> str:
       </div>
     </section>
     <section class="panel">
+      <strong>Chart Pattern Context</strong>
+      <div class="cards" style="margin:12px 0 8px;">
+        <div class="card"><div class="label">Permission</div><div class="value" id="patternPermission">-</div><div class="small" id="patternReason">-</div></div>
+        <div class="card"><div class="label">Dominant Pattern</div><div class="value" id="patternDominant">-</div><div class="small" id="patternDominantMeta">-</div></div>
+        <div class="card"><div class="label">Confluence</div><div class="value" id="patternCounts">-</div><div class="small">supportive / conflicting / confirmed</div></div>
+        <div class="card"><div class="label">Source</div><div class="value" id="patternStatus">-</div><div class="small" id="patternSource">-</div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <strong>Curve Shape Label</strong>
+      <div class="cards" style="margin:12px 0 8px;">
+        <div class="card"><div class="label">Shape</div><div class="value" id="curveShapeLabel">-</div><div class="small" id="curveShapeReason">-</div></div>
+        <div class="card"><div class="label">Direction</div><div class="value" id="curveShapeDirection">-</div><div class="small" id="curveShapeConfidence">-</div></div>
+        <div class="card"><div class="label">Option Bias</div><div class="value" id="curveShapeBias">-</div><div class="small">pre-trade curve shape only</div></div>
+        <div class="card"><div class="label">SMA State</div><div class="value" id="curveShapeSma">-</div><div class="small" id="curveShapeImpulse">-</div></div>
+      </div>
+    </section>
+    <section class="panel">
       <strong>Open Winning / Losing Positions</strong>
       <div class="cards" style="margin:12px 0 8px;">
         <div class="card"><div class="label">Plain English</div><div class="value" id="plStatus">-</div><div class="small" id="plGuardMeta">Open marks, not final results</div></div>
@@ -502,6 +538,11 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("contract", s.contract || "-");
       const g = s.greeks || {{}};
       const fib = s.fibonacci || {{}};
+      const patterns = s.chart_patterns || {{}};
+      const patternSummary = patterns.summary || {{}};
+      const curveShape = s.curve_shape || {{}};
+      const curveFeatures = curveShape.features || {{}};
+      const curveImpulse = curveFeatures.impulse || {{}};
       const feedback = s.feedback || {{}};
       const feedbackMetrics = feedback.metrics || {{}};
       const liq = s.liquidity || {{}};
@@ -522,6 +563,20 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("fibTrend", `${{fib.trend || "-"}} | rows ${{fib.lookback_rows || "-"}}`);
       set("fibLevels", `${{money(fib.nearest_support)}} / ${{money(fib.nearest_resistance)}}`);
       set("fibTarget", money(fib.nearest_target_price));
+      set("patternPermission", patternSummary.permission || (patterns.enabled === false ? "Off" : "-"));
+      set("patternReason", patternSummary.reason || patterns.reason || "-");
+      set("patternDominant", patternSummary.dominant_pattern || "-");
+      set("patternDominantMeta", `${{patternSummary.dominant_direction || "-"}} | ${{patternSummary.dominant_status || "-"}} | confidence ${{num(patternSummary.dominant_confidence)}}`);
+      set("patternCounts", `${{patternSummary.supportive_count || 0}} / ${{patternSummary.conflicting_count || 0}} / ${{patternSummary.confirmed_count || 0}}`);
+      set("patternStatus", patterns.status || "-");
+      set("patternSource", patterns.source || "-");
+      set("curveShapeLabel", curveShape.label || (curveShape.enabled === false ? "Off" : "-"));
+      set("curveShapeReason", curveShape.reason || curveShape.status || "-");
+      set("curveShapeDirection", curveShape.direction || "-");
+      set("curveShapeConfidence", `confidence ${{num(curveShape.confidence)}} | rows ${{curveShape.lookback_rows || "-"}}`);
+      set("curveShapeBias", curveShape.recommended_option_bias || "-");
+      set("curveShapeSma", curveFeatures.sma_state || "-");
+      set("curveShapeImpulse", `${{curveImpulse.direction || "-"}} | move ${{num((curveImpulse.move_pct || 0) * 100)}}% | bars ${{curveImpulse.bars || "-"}}`);
       set("account", `${{num(account.equity)}} ${{accountCurrency}}`);
       set("accountMeta", `available ${{num(account.available_funds)}} ${{accountCurrency}} | balance ${{num(account.balance)}} ${{accountCurrency}}`);
       set("exposure", `${{s.open_order_count || 0}} / ${{s.position_count || 0}}`);

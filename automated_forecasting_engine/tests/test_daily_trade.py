@@ -5,6 +5,7 @@ import pandas as pd
 
 from market_forecasting_engine.daily_trade import (
     DailyTradeConfig,
+    add_forecast_bars,
     add_trading_bars,
     add_trading_minutes,
     build_intraday_feature_frame,
@@ -101,6 +102,20 @@ def test_forecast_timestamp_keeps_weekends_for_247_markets() -> None:
     forecast_time = add_trading_bars(index, pd.Timestamp("2026-05-29 23:55"), 2, 5.0)
 
     assert forecast_time == pd.Timestamp("2026-05-30 00:05")
+
+
+def test_continuous_forecast_timestamp_does_not_use_equity_session_projection() -> None:
+    index = pd.date_range("2026-06-05 21:30", periods=120, freq="1min")
+
+    forecast_time = add_forecast_bars(
+        index,
+        pd.Timestamp("2026-06-05 22:59"),
+        15,
+        1.0,
+        calendar="continuous_24_7",
+    )
+
+    assert forecast_time == pd.Timestamp("2026-06-05 23:14")
 
 
 def test_intraday_feature_frame_adds_session_features() -> None:

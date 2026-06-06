@@ -2,16 +2,29 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import pandas as pd
+
+from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+
 
 DEFAULT_LOG_DIR = Path("automated_forecasting_engine/runs/watch_agent_state/logs")
 DEFAULT_REFRESH_SECONDS = 10
+CHART_RANGES = {
+    "1M": 31,
+    "3M": 93,
+    "6M": 186,
+    "1Y": 366,
+    "5Y": 366 * 5,
+}
+CHART_CACHE_SECONDS = 15 * 60
+_CHART_CACHE: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
 
 
 def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
@@ -134,6 +147,91 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def read_price_chart(ticker: str, range_key: str = "3M") -> dict[str, Any]:
+    normalized_range = str(range_key or "3M").upper()
+    if normalized_range not in CHART_RANGES:
+        normalized_range = "3M"
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        return {"ticker": symbol, "range": normalized_range, "rows": [], "error": "missing_ticker"}
+
+    cache_key = (symbol, normalized_range)
+    now = datetime.now().astimezone()
+    cached = _CHART_CACHE.get(cache_key)
+    if cached and (now - cached[0]).total_seconds() < CHART_CACHE_SECONDS:
+        return cached[1]
+
+    requested_days = CHART_RANGES[normalized_range]
+    start = (now.date() - timedelta(days=max(requested_days * 2, requested_days + 30))).isoformat()
+    try:
+        result = _load_chart_prices(symbol=symbol, start=start)
+        frame = result.frame.copy()
+        cutoff = pd.Timestamp(now).tz_convert(None) - timedelta(days=requested_days)
+        frame = frame[frame.index >= cutoff].copy()
+        if not frame.empty and pd.Timestamp(frame.index.min()).tz_localize(None) > cutoff + timedelta(days=min(10, requested_days // 4)):
+            wider_start = (now.date() - timedelta(days=max(requested_days * 4, requested_days + 120))).isoformat()
+            wider_result = _load_chart_prices(symbol=symbol, start=wider_start)
+            wider_frame = wider_result.frame.copy()
+            wider_frame = wider_frame[wider_frame.index >= cutoff].copy()
+            if len(wider_frame) > len(frame):
+                result = wider_result
+                frame = wider_frame
+        if frame.empty:
+            frame = result.frame.tail(max(5, min(CHART_RANGES[normalized_range], len(result.frame)))).copy()
+        rows = []
+        for index, row in frame.iterrows():
+            close = _number_or_none(row.get("close"))
+            if close is None:
+                continue
+            rows.append(
+                {
+                    "date": index.isoformat() if hasattr(index, "isoformat") else str(index),
+                    "close": close,
+                    "volume": _number_or_none(row.get("volume")) or 0.0,
+                }
+            )
+        payload = {
+            "ticker": symbol,
+            "range": normalized_range,
+            "provider": "yahoo",
+            "generated_at": now.isoformat(),
+            "rows": rows,
+            "error": None,
+        }
+    except Exception as exc:
+        payload = {
+            "ticker": symbol,
+            "range": normalized_range,
+            "provider": "yahoo",
+            "generated_at": now.isoformat(),
+            "rows": [],
+            "error": str(exc),
+        }
+    _CHART_CACHE[cache_key] = (now, payload)
+    return payload
+
+
+def _load_chart_prices(*, symbol: str, start: str):
+    return load_prices_with_provider(
+        "yahoo",
+        DataRequest(
+            ticker=symbol,
+            start=start,
+            interval="1d",
+            target_column="close",
+            adjustment_policy="auto_adjust",
+        ),
+    )
+
+
+def _number_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in {float("inf"), float("-inf")} else None
+
+
 def dashboard_html(refresh_seconds: int) -> str:
     return f"""<!doctype html>
 <html lang="en">
@@ -178,7 +276,7 @@ def dashboard_html(refresh_seconds: int) -> str:
     main {{ padding: 18px 22px 28px; max-width: 1180px; margin: 0 auto; }}
     .grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      grid-template-columns: 1fr;
       gap: 14px;
     }}
     .card {{
@@ -212,6 +310,49 @@ def dashboard_html(refresh_seconds: int) -> str:
     .PARSE_ERROR {{ background: var(--sell); }}
     .price {{ font-size: 34px; font-weight: 760; margin: 8px 0 2px; }}
     .reason {{ color: var(--muted); font-size: 14px; min-height: 20px; }}
+    .card-layout {{
+      display: grid;
+      grid-template-columns: minmax(330px, 0.95fr) minmax(420px, 1.35fr);
+      gap: 14px;
+      align-items: stretch;
+    }}
+    .chart-panel {{
+      border-left: 1px solid var(--line);
+      padding-left: 14px;
+      min-height: 300px;
+    }}
+    .range-controls {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }}
+    .range-buttons {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+    .range-button {{
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }}
+    .range-button.active {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }}
+    .chart-title {{ font-size: 13px; color: var(--muted); }}
+    .chart-canvas {{
+      width: 100%;
+      height: 260px;
+      display: block;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }}
     .badge-label {{ color: var(--muted); font-size: 11px; text-align: center; margin-bottom: 4px; }}
     .conflict {{
       margin-top: 10px;
@@ -260,6 +401,8 @@ def dashboard_html(refresh_seconds: int) -> str:
       .fields {{ grid-template-columns: 1fr; }}
       .price {{ font-size: 30px; }}
       table {{ display: block; overflow-x: auto; }}
+      .card-layout {{ grid-template-columns: 1fr; }}
+      .chart-panel {{ border-left: none; border-top: 1px solid var(--line); padding-left: 0; padding-top: 12px; }}
     }}
   </style>
 </head>
@@ -306,43 +449,164 @@ def dashboard_html(refresh_seconds: int) -> str:
       const action = String(row.action || "").toUpperCase();
       return (action === "BUY" && llm && llm !== "BUY") || (action === "SELL" && llm && llm !== "SELL");
     }}
+    const selectedRanges = new Map();
+    function chartKey(row) {{
+      return `${{row.ticker || "UNKNOWN"}}_${{row.profile || "default"}}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+    }}
+    function selectedRangeFor(key) {{
+      return selectedRanges.get(key) || "3M";
+    }}
     function card(row) {{
+      const key = chartKey(row);
+      const selectedRange = selectedRangeFor(key);
       return `<article class="card">
-        <div class="card-head">
+        <div class="card-layout">
           <div>
-            <div class="ticker">${{row.ticker || "UNKNOWN"}}</div>
-            <div class="profile">${{row.profile || "default"}} · ${{time(row.checked_at)}}</div>
-            ${{row.portfolio_name ? `<div class="profile">${{row.portfolio_name}}</div>` : ""}}
+            <div class="card-head">
+              <div>
+                <div class="ticker">${{row.ticker || "UNKNOWN"}}</div>
+                <div class="profile">${{row.profile || "default"}} · ${{time(row.checked_at)}}</div>
+                ${{row.portfolio_name ? `<div class="profile">${{row.portfolio_name}}</div>` : ""}}
+              </div>
+              <div>
+                <div class="badge-label">Watch alert</div>
+                <div class="badge ${{cls(row.action)}}">${{row.action || "-"}}</div>
+              </div>
+            </div>
+            <div class="price">${{money(row.price)}}</div>
+            <div class="reason">${{row.reason || ""}}</div>
+            ${{hasDecisionConflict(row) ? `<div class="conflict">Watch alert conflicts with LLM decision (${{row.llm_decision}}). Treat this as a stale/level-trigger warning until the agent writes a fresh check.</div>` : ""}}
+            <div class="fields">
+              <div class="field"><span>LLM Decision</span><strong>${{row.llm_decision || "-"}}</strong></div>
+              <div class="field"><span>Confidence</span><strong>${{row.llm_confidence ?? "-"}}</strong></div>
+              <div class="field"><span>Market</span><strong>${{row.market_status || "-"}}</strong></div>
+              <div class="field"><span>Asset Class</span><strong>${{row.asset_class || "-"}}</strong></div>
+              <div class="field"><span>Price Provider</span><strong>${{row.price_provider || "-"}}</strong></div>
+              <div class="field"><span>Latest Bar</span><strong>${{time(row.latest_price_time)}}</strong></div>
+              <div class="field"><span>Broker</span><strong>${{row.portfolio_broker || "-"}}</strong></div>
+              <div class="field"><span>ISIN</span><strong>${{row.portfolio_isin || "-"}}</strong></div>
+              <div class="field"><span>Quantity</span><strong>${{money(row.portfolio_quantity)}}</strong></div>
+              <div class="field"><span>Avg Cost</span><strong>${{money(row.portfolio_entry_price)}}</strong></div>
+              <div class="field"><span>Position Value</span><strong>${{money(row.portfolio_position_value)}}</strong></div>
+              <div class="field"><span>Unrealized P/L</span><strong>${{money(row.portfolio_unrealized_pl)}} (${{money(row.portfolio_unrealized_pl_pct)}}%)</strong></div>
+              <div class="field"><span>Buy Near</span><strong>${{money(row.buy_near)}}</strong></div>
+              <div class="field"><span>Buy Above</span><strong>${{money(row.buy_above)}}</strong></div>
+              <div class="field"><span>Sell Near</span><strong>${{money(row.sell_near)}}</strong></div>
+              <div class="field"><span>Stop Loss</span><strong>${{money(row.stop_loss)}}</strong></div>
+              <div class="field"><span>Take Profit</span><strong>${{money(row.take_profit)}}</strong></div>
+              <div class="field"><span>Refreshed</span><strong>${{row.forecast_refreshed_this_run ? "yes" : "no"}}</strong></div>
+            </div>
           </div>
-          <div>
-            <div class="badge-label">Watch alert</div>
-            <div class="badge ${{cls(row.action)}}">${{row.action || "-"}}</div>
+          <div class="chart-panel">
+            <div class="range-controls">
+              <div class="chart-title">Price / Volume</div>
+              <div class="range-buttons" data-chart-buttons="${{key}}">
+                ${{["1M", "3M", "6M", "1Y", "5Y"].map(range => `<button class="range-button ${{range === selectedRange ? "active" : ""}}" data-ticker="${{row.ticker || ""}}" data-key="${{key}}" data-range="${{range}}">${{range}}</button>`).join("")}}
+              </div>
+            </div>
+            <canvas class="chart-canvas" id="chart_${{key}}" width="760" height="320" data-ticker="${{row.ticker || ""}}" data-range="${{selectedRange}}"></canvas>
           </div>
-        </div>
-        <div class="price">${{money(row.price)}}</div>
-        <div class="reason">${{row.reason || ""}}</div>
-        ${{hasDecisionConflict(row) ? `<div class="conflict">Watch alert conflicts with LLM decision (${{row.llm_decision}}). Treat this as a stale/level-trigger warning until the agent writes a fresh check.</div>` : ""}}
-        <div class="fields">
-          <div class="field"><span>LLM Decision</span><strong>${{row.llm_decision || "-"}}</strong></div>
-          <div class="field"><span>Confidence</span><strong>${{row.llm_confidence ?? "-"}}</strong></div>
-          <div class="field"><span>Market</span><strong>${{row.market_status || "-"}}</strong></div>
-          <div class="field"><span>Asset Class</span><strong>${{row.asset_class || "-"}}</strong></div>
-          <div class="field"><span>Price Provider</span><strong>${{row.price_provider || "-"}}</strong></div>
-          <div class="field"><span>Latest Bar</span><strong>${{time(row.latest_price_time)}}</strong></div>
-          <div class="field"><span>Broker</span><strong>${{row.portfolio_broker || "-"}}</strong></div>
-          <div class="field"><span>ISIN</span><strong>${{row.portfolio_isin || "-"}}</strong></div>
-          <div class="field"><span>Quantity</span><strong>${{money(row.portfolio_quantity)}}</strong></div>
-          <div class="field"><span>Avg Cost</span><strong>${{money(row.portfolio_entry_price)}}</strong></div>
-          <div class="field"><span>Position Value</span><strong>${{money(row.portfolio_position_value)}}</strong></div>
-          <div class="field"><span>Unrealized P/L</span><strong>${{money(row.portfolio_unrealized_pl)}} (${{money(row.portfolio_unrealized_pl_pct)}}%)</strong></div>
-          <div class="field"><span>Buy Near</span><strong>${{money(row.buy_near)}}</strong></div>
-          <div class="field"><span>Buy Above</span><strong>${{money(row.buy_above)}}</strong></div>
-          <div class="field"><span>Sell Near</span><strong>${{money(row.sell_near)}}</strong></div>
-          <div class="field"><span>Stop Loss</span><strong>${{money(row.stop_loss)}}</strong></div>
-          <div class="field"><span>Take Profit</span><strong>${{money(row.take_profit)}}</strong></div>
-          <div class="field"><span>Refreshed</span><strong>${{row.forecast_refreshed_this_run ? "yes" : "no"}}</strong></div>
         </div>
       </article>`;
+    }}
+    const chartCache = new Map();
+    async function loadChart(canvas, range) {{
+      const ticker = canvas.dataset.ticker;
+      if (!ticker) return;
+      const cacheKey = `${{ticker}}_${{range}}`;
+      let payload = chartCache.get(cacheKey);
+      if (!payload) {{
+        const response = await fetch(`/api/chart?ticker=${{encodeURIComponent(ticker)}}&range=${{encodeURIComponent(range)}}`, {{ cache: 'no-store' }});
+        payload = await response.json();
+        chartCache.set(cacheKey, payload);
+      }}
+      drawChart(canvas, payload);
+    }}
+    function drawChart(canvas, payload) {{
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      const rows = payload.rows || [];
+      if (!rows.length) {{
+        ctx.fillStyle = '#687386';
+        ctx.font = '14px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+        ctx.fillText(payload.error || 'No chart data', 18, 36);
+        return;
+      }}
+      const pad = {{ left: 54, right: 16, top: 24, bottom: 54 }};
+      const priceH = Math.round((h - pad.top - pad.bottom) * 0.68);
+      const volTop = pad.top + priceH + 20;
+      const volH = h - volTop - pad.bottom + 18;
+      const closes = rows.map(r => Number(r.close)).filter(Number.isFinite);
+      const volumes = rows.map(r => Number(r.volume || 0)).filter(Number.isFinite);
+      const minP = Math.min(...closes);
+      const maxP = Math.max(...closes);
+      const maxV = Math.max(...volumes, 1);
+      const x = i => pad.left + (rows.length === 1 ? 0 : i * (w - pad.left - pad.right) / (rows.length - 1));
+      const yPrice = v => pad.top + (maxP === minP ? priceH / 2 : (maxP - v) * priceH / (maxP - minP));
+      const yVol = v => volTop + volH - (v / maxV) * volH;
+      ctx.strokeStyle = '#e5e7eb';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 4; i++) {{
+        const y = pad.top + i * priceH / 3;
+        ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke();
+      }}
+      ctx.fillStyle = '#93c5fd';
+      rows.forEach((row, i) => {{
+        const barW = Math.max(1, (w - pad.left - pad.right) / Math.max(rows.length, 1) * 0.7);
+        const bx = x(i) - barW / 2;
+        const by = yVol(Number(row.volume || 0));
+        ctx.fillRect(bx, by, barW, volTop + volH - by);
+      }});
+      ctx.strokeStyle = '#1f6feb';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      rows.forEach((row, i) => {{
+        const px = x(i);
+        const py = yPrice(Number(row.close));
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }});
+      ctx.stroke();
+      const last = rows[rows.length - 1];
+      ctx.fillStyle = '#1f6feb';
+      ctx.beginPath(); ctx.arc(x(rows.length - 1), yPrice(Number(last.close)), 3.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#18202a';
+      ctx.font = '12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+      ctx.fillText(`${{payload.ticker}} ${{payload.range}}`, pad.left, 16);
+      ctx.fillStyle = '#687386';
+      ctx.fillText(`High ${{money(maxP)}}`, 8, pad.top + 4);
+      ctx.fillText(`Low ${{money(minP)}}`, 8, pad.top + priceH);
+      ctx.fillText('Volume', 8, volTop + 12);
+      const firstDate = new Date(rows[0].date);
+      const lastDate = new Date(last.date);
+      ctx.fillText(Number.isNaN(firstDate.getTime()) ? rows[0].date : firstDate.toLocaleDateString(), pad.left, h - 14);
+      const lastLabel = Number.isNaN(lastDate.getTime()) ? last.date : lastDate.toLocaleDateString();
+      const labelWidth = ctx.measureText(lastLabel).width;
+      ctx.fillText(lastLabel, w - pad.right - labelWidth, h - 14);
+      const priceLabel = money(last.close);
+      const priceWidth = ctx.measureText(priceLabel).width;
+      ctx.fillStyle = '#1f6feb';
+      ctx.fillText(priceLabel, w - pad.right - priceWidth, Math.max(14, yPrice(Number(last.close)) - 6));
+    }}
+    function activateCharts() {{
+      document.querySelectorAll('canvas.chart-canvas').forEach(canvas => loadChart(canvas, canvas.dataset.range || '3M').catch(error => drawChart(canvas, {{ rows: [], error: String(error) }})));
+      document.querySelectorAll('.range-button').forEach(button => {{
+        button.addEventListener('click', event => {{
+          const target = event.currentTarget;
+          const key = target.dataset.key;
+          const range = target.dataset.range || '3M';
+          selectedRanges.set(key, range);
+          document.querySelectorAll(`[data-chart-buttons="${{key}}"] .range-button`).forEach(item => item.classList.toggle('active', item === target));
+          const canvas = document.getElementById(`chart_${{key}}`);
+          if (canvas) {{
+            canvas.dataset.range = range;
+            loadChart(canvas, range).catch(error => drawChart(canvas, {{ rows: [], error: String(error) }}));
+          }}
+        }});
+      }});
     }}
     function historyTable(rows) {{
       const all = Object.values(rows.histories || {{}}).flat().sort((a, b) => String(b.checked_at || "").localeCompare(String(a.checked_at || ""))).slice(0, 30);
@@ -369,6 +633,7 @@ def dashboard_html(refresh_seconds: int) -> str:
         const latest = data.latest || [];
         document.getElementById('latest').innerHTML = latest.length ? latest.map(card).join("") : '<div class="empty">No watch-agent records found.</div>';
         document.getElementById('history').innerHTML = historyTable(data);
+        activateCharts();
       }} catch (error) {{
         document.getElementById('updated').textContent = `Load failed: ${{error}}`;
       }}
@@ -394,6 +659,12 @@ class WatchDashboardHandler(BaseHTTPRequestHandler):
             max_history = int(query.get("max_history", ["50"])[0])
             payload = read_watch_logs(self.log_dir, max_history=max(1, min(max_history, 500)))
             self._send_json(payload)
+            return
+        if parsed.path == "/api/chart":
+            query = parse_qs(parsed.query)
+            ticker = query.get("ticker", [""])[0]
+            range_key = query.get("range", ["3M"])[0]
+            self._send_json(read_price_chart(ticker, range_key))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 

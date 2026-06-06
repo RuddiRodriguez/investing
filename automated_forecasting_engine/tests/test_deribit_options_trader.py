@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from market_forecasting_engine.chart_patterns import build_chart_pattern_analysis
 from market_forecasting_engine.deribit_options_trader import (
     DeribitOptionExecutionConfig,
     build_fibonacci_analysis,
@@ -15,11 +16,13 @@ from market_forecasting_engine.deribit_options_trader import (
 )
 from market_forecasting_engine.deribit_options_agent import (
     _cancel_open_option_orders,
+    _entry_quality_context,
     _liquidate_option_positions,
     _manage_expiry_risk,
     _manage_position_unrealized_guards,
     _manage_total_unrealized_profit,
     _manage_total_unrealized_loss,
+    _option_performance_context,
     _positions_for_total_profit_close,
     _positions_for_total_loss_close,
     _protective_close_triggered,
@@ -111,6 +114,29 @@ class FakeNoGreeksBroker(FakeDeribitBroker):
             "stats": {"volume": 10, "volume_usd": 1000},
             "open_interest": 100,
         }
+
+
+class FakeTradeHistoryBroker:
+    def __init__(self, trades):
+        self._trades = trades
+
+    def user_trades(self, *, currency: str = "USDC", kind: str = "option", count: int = 1000):
+        return self._trades[:count]
+
+
+class FakeTickSizeBroker(FakeDeribitBroker):
+    def instruments(self, *, currency: str = "ETH", kind: str = "option", expired: bool = False):
+        return [
+            {
+                "instrument_name": "ETH_USDC-8JUN26-1575-P",
+                "option_type": "put",
+                "strike": 1575.0,
+                "expiration_timestamp": 1780905600000,
+                "is_active": True,
+                "min_trade_amount": 0.1,
+                "tick_size": 0.2,
+            }
+        ]
 
 
 def test_score_deribit_contracts_uses_live_order_book_gates() -> None:
@@ -276,6 +302,148 @@ def test_options_market_regime_blocks_impulse_opposite_forecast() -> None:
     assert regime["allow_directional_entry"] is False
 
 
+def test_options_market_regime_blocks_late_downtrend_after_reversal_starts() -> None:
+    import pandas as pd
+
+    prices = pd.DataFrame({"close": [1660, 1658, 1662, 1659, 1661, 1657, 1660, 1658, 1662, 1660] * 3 + [1655, 1648, 1640, 1632, 1624, 1616, 1608, 1610, 1612]})
+
+    regime = build_options_market_regime(
+        prices,
+        current_price=1612.0,
+        forecast={"expected_return": -0.02},
+        lookback_rows=20,
+        min_trend_strength_pct=0.001,
+        impulse_lookback_bars=8,
+        min_impulse_move_pct=0.004,
+        min_impulse_directional_bars=5,
+        max_late_entry_move_pct=0.01,
+        max_ema_extension_pct=0.004,
+        exhaustion_reversal_bars=2,
+    )
+
+    assert regime["regime"] == "late_trend"
+    assert regime["breakout_status"] == "late_entry_exhaustion"
+    assert regime["exhaustion"]["late_entry_block"] is True
+    assert "recent_bullish_reversal_bars" in regime["exhaustion"]["late_reasons"]
+    assert regime["allow_directional_entry"] is False
+
+
+def test_chart_pattern_analysis_detects_confirmed_double_top_conflict() -> None:
+    import pandas as pd
+
+    closes = [100, 102, 104, 106, 110, 107, 104, 101, 103, 106, 109.8, 107, 104, 100, 98, 96]
+    prices = pd.DataFrame({"close": closes * 3, "volume": [100] * 44 + [160, 180, 210, 260]})
+
+    analysis = build_chart_pattern_analysis(
+        prices,
+        current_price=96.0,
+        forecast={"expected_return": 0.02},
+        lookback_rows=48,
+        min_volume_ratio=1.1,
+    )
+
+    assert analysis["status"] == "ok"
+    assert analysis["summary"]["permission"] == "conflict"
+    assert analysis["summary"]["dominant_pattern"] == "double_top"
+    assert analysis["patterns"][0]["status"] == "confirmed"
+
+
+def test_deribit_trade_plan_blocks_confirmed_conflicting_chart_pattern() -> None:
+    broker = FakeDeribitBroker()
+
+    plan = build_deribit_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        currency="ETH",
+        underlying_price_usd=2000.0,
+        forecast={
+            "predicted_price": 2050.0,
+            "expected_return": 0.02,
+            "expected_direction": "Upward",
+            "chart_pattern_analysis": {
+                "enabled": True,
+                "status": "ok",
+                "summary": {
+                    "permission": "conflict",
+                    "dominant_pattern": "double_top",
+                    "dominant_direction": "bearish",
+                    "dominant_status": "confirmed",
+                    "dominant_confidence": 0.8,
+                },
+            },
+        },
+        account={"equity": 10.0, "balance": 10.0},
+        config=DeribitOptionExecutionConfig(currency="ETH", max_spread_pct=0.2, block_chart_pattern_conflicts=True, min_chart_pattern_confidence=0.7),
+        now=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "hold"
+    assert plan["reason"] == "chart_pattern_conflicts_with_forecast"
+    assert plan["chart_pattern_analysis"]["summary"]["dominant_pattern"] == "double_top"
+
+
+def test_option_performance_context_summarizes_today_realized_pl_and_latest_loss() -> None:
+    now = datetime(2026, 6, 5, 19, 45, tzinfo=UTC)
+    broker = FakeTradeHistoryBroker(
+        [
+            {
+                "timestamp": int(datetime(2026, 6, 5, 19, 30, tzinfo=UTC).timestamp() * 1000),
+                "instrument_name": "ETH_USDC-8JUN26-1525-P",
+                "direction": "sell",
+                "amount": 0.1,
+                "price": 25.0,
+                "profit_loss": -0.42,
+                "reduce_only": True,
+            },
+            {
+                "timestamp": int(datetime(2026, 6, 5, 18, 52, tzinfo=UTC).timestamp() * 1000),
+                "instrument_name": "ETH_USDC-8JUN26-1550-P",
+                "direction": "sell",
+                "amount": 0.1,
+                "price": 36.6,
+                "profit_loss": 0.64,
+                "reduce_only": True,
+            },
+            {
+                "timestamp": int(datetime(2026, 6, 4, 23, 55, tzinfo=UTC).timestamp() * 1000),
+                "instrument_name": "ETH_USDC-8JUN26-1550-P",
+                "direction": "sell",
+                "amount": 0.1,
+                "price": 36.6,
+                "profit_loss": -9.0,
+                "reduce_only": True,
+            },
+        ]
+    )
+
+    context = _option_performance_context(broker=broker, currency="ETH", instrument_currency="USDC", now=now)
+
+    assert context["status"] == "ok"
+    assert context["closing_trade_count"] == 2
+    assert context["winning_close_count"] == 1
+    assert context["losing_close_count"] == 1
+    assert context["net_realized_options_pl_usd"] == 0.22
+    assert context["latest_losing_close"]["profit_loss_usd"] == -0.42
+    assert context["latest_losing_close_age_minutes"] == 15
+
+
+def test_entry_quality_blocks_daily_loss_cooldown_and_weak_forecast() -> None:
+    from argparse import Namespace
+
+    now = datetime(2026, 6, 5, 19, 45, tzinfo=UTC)
+    context = _entry_quality_context(
+        args=Namespace(max_daily_realized_loss_usd=10, loss_cooldown_minutes=30, min_entry_expected_return_pct=0.008),
+        forecast={"expected_return": 0.003},
+        performance_context={"net_realized_options_pl_usd": -16.02, "latest_losing_close_age_minutes": 12},
+        now=now,
+    )
+
+    assert context["blocks"] == [
+        "entry_expected_return_below_min",
+        "daily_realized_loss_limit_reached",
+        "loss_cooldown_active",
+    ]
+
+
 def test_score_deribit_contracts_blocks_entries_too_close_to_forecast_horizon_and_expiry_close_window() -> None:
     broker = FakeDeribitBroker()
     scored = score_deribit_option_contracts(
@@ -347,6 +515,27 @@ def test_submit_deribit_limit_order_rejects_non_limit_orders() -> None:
     )
     assert result["order"]["instrument_name"] == "ETH-5JUN26-2100-C"
     assert broker.submitted["post_only"] is False
+
+
+def test_submit_deribit_limit_order_rounds_exit_price_to_contract_tick_size() -> None:
+    broker = FakeTickSizeBroker()
+
+    result = submit_deribit_limit_order(
+        broker,  # type: ignore[arg-type]
+        {
+            "type": "limit",
+            "side": "sell",
+            "instrument_name": "ETH_USDC-8JUN26-1575-P",
+            "amount": 0.1,
+            "price": 38.976,
+            "reduce_only": True,
+        },
+        label="profit-exit",
+    )
+
+    assert result["order"]["price"] == 38.8
+    assert broker.submitted["price"] == 38.8
+    assert broker.submitted["reduce_only"] is True
 
 
 def test_manage_positions_uses_position_entry_for_exit_and_falls_back_after_reduce_only_rejection() -> None:

@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from market_forecasting_engine.chart_patterns import build_chart_pattern_analysis
+from market_forecasting_engine.curve_shape import build_curve_shape_analysis
 from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
@@ -95,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-fibonacci-confluence", action="store_true", help="Block entries when Fibonacci analysis conflicts with the forecast direction.")
     parser.add_argument("--fibonacci-lookback-rows", type=int, default=720)
     parser.add_argument("--max-fibonacci-distance-pct", type=float, default=0.006)
+    parser.add_argument("--enable-chart-patterns", action=argparse.BooleanOptionalAction, default=True, help="Detect named chart patterns and include them in option-entry decisions.")
+    parser.add_argument("--block-chart-pattern-conflicts", action=argparse.BooleanOptionalAction, default=True, help="Block entries when a confirmed high-confidence chart pattern conflicts with the forecast.")
+    parser.add_argument("--chart-pattern-lookback-rows", type=int, default=240)
+    parser.add_argument("--chart-pattern-level-tolerance-pct", type=float, default=0.006)
+    parser.add_argument("--chart-pattern-breakout-buffer-pct", type=float, default=0.0015)
+    parser.add_argument("--chart-pattern-min-volume-ratio", type=float, default=1.20)
+    parser.add_argument("--min-chart-pattern-confidence", type=float, default=0.70)
     parser.add_argument("--enable-market-regime-filter", action=argparse.BooleanOptionalAction, default=True, help="Block directional option entries unless the market is trending or breaking out.")
     parser.add_argument("--allow-range-edge-reversal-entry", action="store_true", help="Allow optional contrarian entries near support/resistance in range-bound markets. Default is to wait.")
     parser.add_argument("--market-regime-lookback-rows", type=int, default=120)
@@ -105,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--impulse-lookback-bars", type=int, default=12)
     parser.add_argument("--min-impulse-move-pct", type=float, default=0.006)
     parser.add_argument("--min-impulse-directional-bars", type=int, default=7)
+    parser.add_argument("--enable-late-entry-filter", action=argparse.BooleanOptionalAction, default=True, help="Block new option entries when the impulse/trend is already extended or showing reversal candles.")
+    parser.add_argument("--max-late-entry-move-pct", type=float, default=0.018)
+    parser.add_argument("--max-ema-extension-pct", type=float, default=0.010)
+    parser.add_argument("--exhaustion-reversal-bars", type=int, default=2)
     parser.add_argument("--close-before-expiry-hours", type=float, default=12.0, help="Automatically close open option positions this many hours before expiry.")
     parser.add_argument("--expiry-warning-hours", type=float, default=24.0, help="Log and display a warning when open positions are this close to expiry.")
     parser.add_argument("--entry-expiry-buffer-hours", type=float, default=4.0, help="Extra buffer added to forecast horizon and close window when screening new option entries.")
@@ -133,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-open-option-contracts", type=float, default=2.0, help="Block new entries when existing option contract amount is at or above this value.")
     parser.add_argument("--max-open-option-premium-usd", type=float, default=300.0, help="Block new entries when current open option premium exposure is at or above this amount.")
     parser.add_argument("--allow-mixed-option-direction", action="store_true", help="Allow opening calls while puts are open, or puts while calls are open.")
+    parser.add_argument("--max-daily-realized-loss-usd", type=float, default=None, help="Block new option entries for the rest of the UTC day when realized option P/L is at or below this loss.")
+    parser.add_argument("--loss-cooldown-minutes", type=float, default=0.0, help="Block new entries for this many minutes after a losing option close.")
+    parser.add_argument("--min-entry-expected-return-pct", type=float, default=0.0, help="Minimum absolute underlying forecast return required before opening a new option position.")
     parser.add_argument("--enable-feedback-loop", action=argparse.BooleanOptionalAction, default=True, help="Evaluate matured forecasts and block new entries when recent performance is weak.")
     parser.add_argument("--feedback-min-matured", type=int, default=5)
     parser.add_argument("--feedback-min-direction-accuracy", type=float, default=0.45)
@@ -168,6 +184,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 ticker=f"{args.currency.upper()}-USD",
                 interval=args.data_interval,
                 forecast_hours=tuple(float(value.strip()) for value in args.forecast_hours.split(",") if value.strip()),
+                forecast_calendar="continuous_24_7",
                 minimum_score_to_trade=1.5 if args.risk_profile == "aggressive" else 2.0,
             ),
         )
@@ -184,6 +201,28 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
             if bool(args.enable_fibonacci)
             else {"enabled": False}
         )
+        forecast["chart_pattern_analysis"] = (
+            build_chart_pattern_analysis(
+                prices,
+                current_price=float(plan["latest_price"]),
+                forecast=forecast,
+                lookback_rows=int(args.chart_pattern_lookback_rows),
+                level_tolerance_pct=float(args.chart_pattern_level_tolerance_pct),
+                breakout_buffer_pct=float(args.chart_pattern_breakout_buffer_pct),
+                min_volume_ratio=float(args.chart_pattern_min_volume_ratio),
+            )
+            if bool(args.enable_chart_patterns)
+            else {"enabled": False}
+        )
+        forecast["curve_shape_analysis"] = build_curve_shape_analysis(
+            prices,
+            current_price=float(plan["latest_price"]),
+            lookback_rows=120,
+            short_window=9,
+            long_window=21,
+            impulse_bars=int(args.impulse_lookback_bars),
+            range_lookback=int(args.market_regime_lookback_rows),
+        )
         forecast["market_regime"] = (
             build_options_market_regime(
                 prices,
@@ -198,6 +237,10 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
                 impulse_lookback_bars=int(args.impulse_lookback_bars),
                 min_impulse_move_pct=float(args.min_impulse_move_pct),
                 min_impulse_directional_bars=int(args.min_impulse_directional_bars),
+                enable_late_entry_filter=bool(args.enable_late_entry_filter),
+                max_late_entry_move_pct=float(args.max_late_entry_move_pct),
+                max_ema_extension_pct=float(args.max_ema_extension_pct),
+                exhaustion_reversal_bars=int(args.exhaustion_reversal_bars),
             )
             if bool(args.enable_market_regime_filter)
             else {"enabled": False}
@@ -215,6 +258,10 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         forecast["account_equity"] = _float_or_none(account.get("equity"))
         if "fibonacci_analysis" not in forecast:
             forecast["fibonacci_analysis"] = {"enabled": False, "status": "missing_from_cached_forecast"}
+        if "chart_pattern_analysis" not in forecast:
+            forecast["chart_pattern_analysis"] = {"enabled": False, "status": "missing_from_cached_forecast"}
+        if "curve_shape_analysis" not in forecast:
+            forecast["curve_shape_analysis"] = {"enabled": False, "status": "missing_from_cached_forecast"}
         if "market_regime" not in forecast:
             forecast["market_regime"] = {"enabled": False, "status": "missing_from_cached_forecast"}
     profile = risk_profile_for_name(args.risk_profile)
@@ -240,6 +287,9 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         enable_fibonacci=bool(args.enable_fibonacci),
         require_fibonacci_confluence=bool(args.require_fibonacci_confluence),
         max_fibonacci_distance_pct=float(args.max_fibonacci_distance_pct),
+        enable_chart_patterns=bool(args.enable_chart_patterns),
+        block_chart_pattern_conflicts=bool(args.block_chart_pattern_conflicts),
+        min_chart_pattern_confidence=float(args.min_chart_pattern_confidence),
         enable_market_regime_filter=bool(args.enable_market_regime_filter),
         allow_range_edge_reversal_entry=bool(args.allow_range_edge_reversal_entry),
         market_regime_lookback_rows=int(args.market_regime_lookback_rows),
@@ -250,6 +300,10 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         impulse_lookback_bars=int(args.impulse_lookback_bars),
         min_impulse_move_pct=float(args.min_impulse_move_pct),
         min_impulse_directional_bars=int(args.min_impulse_directional_bars),
+        enable_late_entry_filter=bool(args.enable_late_entry_filter),
+        max_late_entry_move_pct=float(args.max_late_entry_move_pct),
+        max_ema_extension_pct=float(args.max_ema_extension_pct),
+        exhaustion_reversal_bars=int(args.exhaustion_reversal_bars),
         close_before_expiry_hours=float(args.close_before_expiry_hours),
         entry_expiry_buffer_hours=float(args.entry_expiry_buffer_hours),
         target_moneyness=float(args.target_moneyness),
@@ -276,6 +330,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         if bool(args.enable_feedback_loop)
         else {"enabled": False}
     )
+    performance_context = _option_performance_context(broker=broker, currency=args.currency, instrument_currency=instrument_currency, now=now)
     trade_plan = build_deribit_option_trade_plan(
         broker=broker,
         currency=instrument_currency,
@@ -309,8 +364,13 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         trade_plan = {"action": "hold", "reason": "waiting_until_next_forecast_after_protective_close"}
     elif (feedback_context.get("blocks") or []) and trade_plan.get("action") == "buy_option":
         trade_plan = {"action": "hold", "reason": "feedback_loop_blocked_entry", "feedback_blocks": feedback_context.get("blocks")}
+    elif trade_plan.get("action") == "buy_option":
+        entry_quality = _entry_quality_context(args=args, forecast=forecast, performance_context=performance_context, now=now)
+        if entry_quality.get("blocks"):
+            trade_plan = {"action": "hold", "reason": "entry_quality_blocked", "entry_quality_blocks": entry_quality.get("blocks")}
     else:
         state.pop("wait_until_next_forecast_after_close", None)
+    entry_quality_context = _entry_quality_context(args=args, forecast=forecast, performance_context=performance_context, now=now)
     execution_blocks = execution_block_reasons(args=args, trade_plan=trade_plan, open_orders=open_orders, positions=positions, underlying_price_usd=underlying_price)
     order_result = {"submitted": False, "reason": "execution_disabled" if not _orders_enabled(args) else "execution_blocked", "blocks": execution_blocks}
     if _orders_enabled(args) and trade_plan.get("action") == "buy_option" and not execution_blocks:
@@ -339,6 +399,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         "option_execution_config": config.__dict__,
         "risk_control_config": _risk_control_config(args),
         "feedback_context": feedback_context,
+        "performance_context": performance_context,
+        "entry_quality_context": entry_quality_context,
         "option_trade_plan": trade_plan,
         "open_option_orders": open_orders,
         "option_positions": positions,
@@ -362,6 +424,107 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         record["feedback_ledger_append"] = append_decision_to_ledger(output_dir=output_dir, currency=args.currency, record=record)
         write_record(output_dir, args.currency, record)
     return record
+
+
+def _option_performance_context(
+    *,
+    broker: Any,
+    currency: str,
+    instrument_currency: str,
+    now: datetime,
+    trade_count: int = 1000,
+) -> dict[str, Any]:
+    if not hasattr(broker, "user_trades"):
+        return {"enabled": False, "status": "broker_trade_history_unavailable"}
+    try:
+        trades = broker.user_trades(currency=instrument_currency, kind="option", count=trade_count)
+    except Exception as exc:
+        return {"enabled": True, "status": "trade_history_error", "error": f"{type(exc).__name__}: {exc}"}
+    day_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+    closing_trades: list[dict[str, Any]] = []
+    for trade in trades if isinstance(trades, list) else []:
+        if not isinstance(trade, dict):
+            continue
+        instrument = str(trade.get("instrument_name") or "").upper()
+        if not instrument.startswith(_instrument_prefix(currency, instrument_currency)):
+            continue
+        ts = _timestamp_ms_to_datetime(_float_or_none(trade.get("timestamp")))
+        if ts is None or ts < day_start or ts > now:
+            continue
+        direction = str(trade.get("direction") or "").lower()
+        if direction != "sell" and not bool(trade.get("reduce_only")):
+            continue
+        pl = _float_or_none(trade.get("profit_loss")) or 0.0
+        closing_trades.append(
+            {
+                "timestamp_utc": ts.isoformat(),
+                "instrument_name": trade.get("instrument_name"),
+                "direction": direction,
+                "amount": _float_or_none(trade.get("amount")),
+                "price": _float_or_none(trade.get("price")),
+                "profit_loss_usd": pl,
+                "reduce_only": trade.get("reduce_only"),
+                "label": trade.get("label"),
+                "order_id": trade.get("order_id"),
+            }
+        )
+    closing_trades.sort(key=lambda item: str(item.get("timestamp_utc") or ""))
+    wins = [trade for trade in closing_trades if (_float_or_none(trade.get("profit_loss_usd")) or 0.0) > 0]
+    losses = [trade for trade in closing_trades if (_float_or_none(trade.get("profit_loss_usd")) or 0.0) < 0]
+    latest_losing_close = losses[-1] if losses else None
+    latest_losing_close_age_minutes = None
+    if latest_losing_close:
+        latest_ts = _parse_time(latest_losing_close.get("timestamp_utc"))
+        if latest_ts is not None:
+            latest_losing_close_age_minutes = max(0.0, (now - latest_ts).total_seconds() / 60.0)
+    return {
+        "enabled": True,
+        "status": "ok",
+        "day_start_utc": day_start.isoformat(),
+        "closing_trade_count": len(closing_trades),
+        "winning_close_count": len(wins),
+        "losing_close_count": len(losses),
+        "gross_wins_usd": round(sum(_float_or_none(trade.get("profit_loss_usd")) or 0.0 for trade in wins), 6),
+        "gross_losses_usd": round(sum(_float_or_none(trade.get("profit_loss_usd")) or 0.0 for trade in losses), 6),
+        "net_realized_options_pl_usd": round(sum(_float_or_none(trade.get("profit_loss_usd")) or 0.0 for trade in closing_trades), 6),
+        "latest_losing_close": latest_losing_close,
+        "latest_losing_close_age_minutes": None if latest_losing_close_age_minutes is None else round(latest_losing_close_age_minutes, 2),
+        "recent_closing_trades": closing_trades[-10:],
+    }
+
+
+def _entry_quality_context(
+    *,
+    args: argparse.Namespace,
+    forecast: dict[str, Any],
+    performance_context: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    blocks: list[str] = []
+    expected_return = _float_or_none(forecast.get("expected_return"))
+    min_expected = _float_or_none(getattr(args, "min_entry_expected_return_pct", None))
+    if min_expected is not None and min_expected > 0:
+        if expected_return is None or abs(float(expected_return)) < float(min_expected):
+            blocks.append("entry_expected_return_below_min")
+    max_daily_loss = _abs_or_none(getattr(args, "max_daily_realized_loss_usd", None))
+    net_realized = _float_or_none(performance_context.get("net_realized_options_pl_usd"))
+    if max_daily_loss is not None and net_realized is not None and net_realized <= -float(max_daily_loss):
+        blocks.append("daily_realized_loss_limit_reached")
+    cooldown_minutes = _float_or_none(getattr(args, "loss_cooldown_minutes", None)) or 0.0
+    latest_loss_age = _float_or_none(performance_context.get("latest_losing_close_age_minutes"))
+    if cooldown_minutes > 0 and latest_loss_age is not None and latest_loss_age < cooldown_minutes:
+        blocks.append("loss_cooldown_active")
+    return {
+        "enabled": True,
+        "checked_at_utc": now.isoformat(),
+        "blocks": blocks,
+        "expected_return": expected_return,
+        "min_entry_expected_return_pct": min_expected,
+        "max_daily_realized_loss_usd": max_daily_loss,
+        "loss_cooldown_minutes": cooldown_minutes,
+        "latest_losing_close_age_minutes": latest_loss_age,
+        "net_realized_options_pl_usd": net_realized,
+    }
 
 
 def execution_block_reasons(
@@ -1717,6 +1880,13 @@ def _risk_control_config(args: argparse.Namespace) -> dict[str, Any]:
         "profit_close_limit_offset_pct": getattr(args, "profit_close_limit_offset_pct", None),
         "enable_forecast_reversal_exit": getattr(args, "enable_forecast_reversal_exit", None),
         "min_reversal_edge_pct": getattr(args, "min_reversal_edge_pct", None),
+        "enable_chart_patterns": getattr(args, "enable_chart_patterns", None),
+        "block_chart_pattern_conflicts": getattr(args, "block_chart_pattern_conflicts", None),
+        "chart_pattern_lookback_rows": getattr(args, "chart_pattern_lookback_rows", None),
+        "chart_pattern_level_tolerance_pct": getattr(args, "chart_pattern_level_tolerance_pct", None),
+        "chart_pattern_breakout_buffer_pct": getattr(args, "chart_pattern_breakout_buffer_pct", None),
+        "chart_pattern_min_volume_ratio": getattr(args, "chart_pattern_min_volume_ratio", None),
+        "min_chart_pattern_confidence": getattr(args, "min_chart_pattern_confidence", None),
         "close_before_expiry_hours": getattr(args, "close_before_expiry_hours", None),
         "expiry_warning_hours": getattr(args, "expiry_warning_hours", None),
         "liquidation_limit_offset_pct": getattr(args, "liquidation_limit_offset_pct", None),
@@ -1734,6 +1904,10 @@ def _risk_control_config(args: argparse.Namespace) -> dict[str, Any]:
         "impulse_lookback_bars": getattr(args, "impulse_lookback_bars", None),
         "min_impulse_move_pct": getattr(args, "min_impulse_move_pct", None),
         "min_impulse_directional_bars": getattr(args, "min_impulse_directional_bars", None),
+        "enable_late_entry_filter": getattr(args, "enable_late_entry_filter", None),
+        "max_late_entry_move_pct": getattr(args, "max_late_entry_move_pct", None),
+        "max_ema_extension_pct": getattr(args, "max_ema_extension_pct", None),
+        "exhaustion_reversal_bars": getattr(args, "exhaustion_reversal_bars", None),
         "enable_feedback_loop": getattr(args, "enable_feedback_loop", None),
         "feedback_min_matured": getattr(args, "feedback_min_matured", None),
         "feedback_min_direction_accuracy": getattr(args, "feedback_min_direction_accuracy", None),
@@ -1810,6 +1984,26 @@ def _age_seconds(timestamp: Any, now: datetime) -> float | None:
     except ValueError:
         return None
     return (now - parsed).total_seconds()
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _timestamp_ms_to_datetime(value: float | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _float_or_none(value: Any) -> float | None:

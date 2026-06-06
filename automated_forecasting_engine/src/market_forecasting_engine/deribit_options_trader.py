@@ -33,6 +33,9 @@ class DeribitOptionExecutionConfig:
     enable_fibonacci: bool = True
     require_fibonacci_confluence: bool = False
     max_fibonacci_distance_pct: float = 0.006
+    enable_chart_patterns: bool = True
+    block_chart_pattern_conflicts: bool = True
+    min_chart_pattern_confidence: float = 0.70
     enable_market_regime_filter: bool = True
     allow_range_edge_reversal_entry: bool = False
     market_regime_lookback_rows: int = 120
@@ -43,6 +46,10 @@ class DeribitOptionExecutionConfig:
     impulse_lookback_bars: int = 12
     min_impulse_move_pct: float = 0.006
     min_impulse_directional_bars: int = 7
+    enable_late_entry_filter: bool = True
+    max_late_entry_move_pct: float = 0.018
+    max_ema_extension_pct: float = 0.010
+    exhaustion_reversal_bars: int = 2
     min_hours_to_expiry_for_entry: float = 18.0
     close_before_expiry_hours: float = 12.0
     entry_expiry_buffer_hours: float = 4.0
@@ -80,6 +87,24 @@ def build_deribit_option_trade_plan(
             "fibonacci_analysis": fibonacci,
             "forecast": forecast,
         }
+    chart_patterns = forecast.get("chart_pattern_analysis") if isinstance(forecast.get("chart_pattern_analysis"), dict) else {}
+    pattern_summary = chart_patterns.get("summary") if isinstance(chart_patterns.get("summary"), dict) else {}
+    if (
+        config.enable_chart_patterns
+        and config.block_chart_pattern_conflicts
+        and pattern_summary.get("permission") == "conflict"
+        and (_float_or_none(pattern_summary.get("dominant_confidence")) or 0.0) >= float(config.min_chart_pattern_confidence)
+        and pattern_summary.get("dominant_status") == "confirmed"
+    ):
+        return {
+            "action": "hold",
+            "reason": "chart_pattern_conflicts_with_forecast",
+            "currency": currency.upper(),
+            "option_type": option_type,
+            "chart_pattern_analysis": chart_patterns,
+            "fibonacci_analysis": fibonacci if config.enable_fibonacci else {"enabled": False},
+            "forecast": forecast,
+        }
     regime = forecast.get("market_regime") if isinstance(forecast.get("market_regime"), dict) else {}
     if config.enable_market_regime_filter and regime and regime.get("allow_directional_entry") is False:
         return {
@@ -89,6 +114,7 @@ def build_deribit_option_trade_plan(
             "option_type": option_type,
             "market_regime": regime,
             "fibonacci_analysis": fibonacci if config.enable_fibonacci else {"enabled": False},
+            "chart_pattern_analysis": chart_patterns if config.enable_chart_patterns else {"enabled": False},
             "forecast": forecast,
         }
     instruments = broker.instruments(currency=currency, kind="option", expired=False)
@@ -160,6 +186,7 @@ def build_deribit_option_trade_plan(
         "currency": currency.upper(),
         "option_type": option_type,
         "fibonacci_analysis": fibonacci if config.enable_fibonacci else {"enabled": False},
+        "chart_pattern_analysis": chart_patterns if config.enable_chart_patterns else {"enabled": False},
         "market_regime": regime if config.enable_market_regime_filter else {"enabled": False},
         "selected_contract": selected,
         "order": entry_order,
@@ -469,25 +496,49 @@ def submit_deribit_limit_order(
 ) -> dict[str, Any]:
     if order.get("type") != "limit":
         raise ValueError("Deribit options agent only submits limit orders.")
-    if str(order.get("side")) == "buy":
+    side = str(order.get("side"))
+    normalized_price = _normalize_limit_price_for_instrument(
+        broker=broker,
+        instrument_name=str(order["instrument_name"]),
+        price=float(order["price"]),
+        side=side,
+    )
+    if side == "buy":
         return broker.buy_limit(
             instrument_name=str(order["instrument_name"]),
             amount=float(order["amount"]),
-            price=float(order["price"]),
+            price=normalized_price,
             label=label,
             post_only=bool(order.get("post_only")),
             reduce_only=bool(order.get("reduce_only")),
         )
-    if str(order.get("side")) == "sell":
+    if side == "sell":
         return broker.sell_limit(
             instrument_name=str(order["instrument_name"]),
             amount=float(order["amount"]),
-            price=float(order["price"]),
+            price=normalized_price,
             label=label,
             post_only=bool(order.get("post_only")),
             reduce_only=bool(order.get("reduce_only", True)),
         )
     raise ValueError("Deribit order side must be buy or sell.")
+
+
+def _normalize_limit_price_for_instrument(
+    *,
+    broker: DeribitTestnetBroker | DeribitOptionsBroker,
+    instrument_name: str,
+    price: float,
+    side: str,
+) -> float:
+    if price <= 0:
+        raise ValueError("Deribit option limit orders require a positive price.")
+    tick_size = _instrument_tick_size(broker=broker, instrument_name=instrument_name, price=price)
+    if tick_size is None:
+        return float(price)
+    if str(side).lower() == "sell":
+        return _round_down_to_tick(price, tick_size)
+    return _round_to_tick(price, tick_size)
 
 
 def build_fibonacci_analysis(
@@ -592,6 +643,10 @@ def build_options_market_regime(
     impulse_lookback_bars: int = 12,
     min_impulse_move_pct: float = 0.006,
     min_impulse_directional_bars: int = 7,
+    enable_late_entry_filter: bool = True,
+    max_late_entry_move_pct: float = 0.018,
+    max_ema_extension_pct: float = 0.010,
+    exhaustion_reversal_bars: int = 2,
 ) -> dict[str, Any]:
     if prices is None or prices.empty:
         return {"enabled": True, "status": "unavailable", "reason": "missing_price_history", "allow_directional_entry": False}
@@ -632,6 +687,16 @@ def build_options_market_regime(
         min_move_pct=float(min_impulse_move_pct),
         min_directional_bars=int(min_impulse_directional_bars),
     ) if enable_impulse_entry else {"enabled": False, "allow_entry": False}
+    exhaustion = _options_exhaustion_signal(
+        window,
+        forecast_direction=forecast_direction,
+        support=support,
+        resistance=resistance,
+        lookback_bars=int(impulse_lookback_bars),
+        max_late_entry_move_pct=float(max_late_entry_move_pct),
+        max_ema_extension_pct=float(max_ema_extension_pct),
+        reversal_bars=int(exhaustion_reversal_bars),
+    ) if enable_late_entry_filter else {"enabled": False, "late_entry_block": False}
     range_edge_reversal = bool(
         allow_range_edge_reversal_entry
         and (
@@ -669,7 +734,13 @@ def build_options_market_regime(
         or bool(impulse.get("allow_entry"))
         or range_edge_reversal
     )
+    if allow_entry and bool(exhaustion.get("late_entry_block")):
+        allow_entry = False
+        regime = "late_trend"
+        breakout_status = "late_entry_exhaustion"
     reason = "directional_trend_confirmed" if allow_entry and not range_edge_reversal and not bool(impulse.get("allow_entry")) else "impulse_entry_confirmed" if bool(impulse.get("allow_entry")) else "range_edge_reversal_allowed" if allow_entry else "range_or_noise_without_confirmed_direction"
+    if bool(exhaustion.get("late_entry_block")):
+        reason = str(exhaustion.get("reason") or "late_entry_exhaustion")
     if in_middle and not allow_entry:
         reason = "price_in_middle_of_range"
     return {
@@ -695,6 +766,7 @@ def build_options_market_regime(
         "near_resistance": near_resistance,
         "range_edge_reversal_allowed": range_edge_reversal,
         "impulse": impulse,
+        "exhaustion": exhaustion,
         "lookback_rows": len(window),
     }
 
@@ -736,6 +808,72 @@ def _options_impulse_signal(
         "up_bars": up_bars,
         "down_bars": down_bars,
         "min_directional_bars": required_bars,
+        "forecast_direction": forecast_direction,
+    }
+
+
+def _options_exhaustion_signal(
+    close: pd.Series,
+    *,
+    forecast_direction: str,
+    support: float,
+    resistance: float,
+    lookback_bars: int,
+    max_late_entry_move_pct: float,
+    max_ema_extension_pct: float,
+    reversal_bars: int,
+) -> dict[str, Any]:
+    if len(close) < max(8, int(lookback_bars) + 1):
+        return {"enabled": True, "status": "insufficient_history", "late_entry_block": False}
+    lookback = max(3, int(lookback_bars))
+    segment = close.tail(lookback + 1)
+    start = float(segment.iloc[0])
+    latest = float(segment.iloc[-1])
+    move_pct = latest / max(abs(start), 1e-9) - 1.0
+    ema = close.ewm(span=min(9, len(close)), adjust=False).mean()
+    ema_extension_pct = latest / max(float(ema.iloc[-1]), 1e-9) - 1.0
+    diffs = close.diff().dropna()
+    recent = diffs.tail(max(1, int(reversal_bars)))
+    reversal_up = bool(len(recent) >= max(1, int(reversal_bars)) and (recent > 0).all())
+    reversal_down = bool(len(recent) >= max(1, int(reversal_bars)) and (recent < 0).all())
+    support_distance_pct = abs(latest - float(support)) / max(abs(latest), 1e-9)
+    resistance_distance_pct = abs(float(resistance) - latest) / max(abs(latest), 1e-9)
+    late_reasons: list[str] = []
+    if forecast_direction == "down":
+        if move_pct <= -abs(float(max_late_entry_move_pct)):
+            late_reasons.append("down_move_already_extended")
+        if ema_extension_pct <= -abs(float(max_ema_extension_pct)):
+            late_reasons.append("price_extended_below_fast_ema")
+        if reversal_up:
+            late_reasons.append("recent_bullish_reversal_bars")
+        if support_distance_pct <= 0.0025:
+            late_reasons.append("price_near_support_after_drop")
+    elif forecast_direction == "up":
+        if move_pct >= abs(float(max_late_entry_move_pct)):
+            late_reasons.append("up_move_already_extended")
+        if ema_extension_pct >= abs(float(max_ema_extension_pct)):
+            late_reasons.append("price_extended_above_fast_ema")
+        if reversal_down:
+            late_reasons.append("recent_bearish_reversal_bars")
+        if resistance_distance_pct <= 0.0025:
+            late_reasons.append("price_near_resistance_after_rally")
+    has_reversal_warning = "recent_bullish_reversal_bars" in late_reasons or "recent_bearish_reversal_bars" in late_reasons
+    late_entry_block = len(late_reasons) >= 2 and has_reversal_warning
+    return {
+        "enabled": True,
+        "status": "ok",
+        "late_entry_block": late_entry_block,
+        "reason": "late_entry_exhaustion" if late_entry_block else "not_exhausted",
+        "late_reasons": late_reasons,
+        "move_pct": round(float(move_pct), 6),
+        "max_late_entry_move_pct": float(max_late_entry_move_pct),
+        "ema_extension_pct": round(float(ema_extension_pct), 6),
+        "max_ema_extension_pct": float(max_ema_extension_pct),
+        "support_distance_pct": round(float(support_distance_pct), 6),
+        "resistance_distance_pct": round(float(resistance_distance_pct), 6),
+        "reversal_up": reversal_up,
+        "reversal_down": reversal_down,
+        "reversal_bars": max(1, int(reversal_bars)),
         "forecast_direction": forecast_direction,
     }
 
@@ -855,6 +993,51 @@ def _candidate_score(
 def _round_to_tick(value: float, tick_size: float) -> float:
     tick = max(float(tick_size), 1e-8)
     return float(round(float(np.ceil(float(value) / tick) * tick), 8))
+
+
+def _round_down_to_tick(value: float, tick_size: float) -> float:
+    tick = max(float(tick_size), 1e-8)
+    return float(round(max(tick, float(np.floor(float(value) / tick) * tick)), 8))
+
+
+def _instrument_tick_size(
+    *,
+    broker: DeribitTestnetBroker | DeribitOptionsBroker,
+    instrument_name: str,
+    price: float | None = None,
+) -> float | None:
+    currency = _instrument_currency_from_name(instrument_name)
+    try:
+        instruments = broker.instruments(currency=currency, kind="option", expired=False)
+    except (RuntimeError, AttributeError):
+        return None
+    for instrument in instruments:
+        if str(instrument.get("instrument_name") or "") != instrument_name:
+            continue
+        stepped = _tick_size_from_steps(instrument.get("tick_size_steps"), price)
+        if stepped is not None:
+            return stepped
+        return _float_or_none(instrument.get("tick_size"))
+    return None
+
+
+def _instrument_currency_from_name(instrument_name: str) -> str:
+    prefix = str(instrument_name or "").split("-", 1)[0].upper()
+    if "_" in prefix:
+        return prefix.rsplit("_", 1)[-1]
+    return prefix
+
+
+def _tick_size_from_steps(steps: Any, price: float | None) -> float | None:
+    if not isinstance(steps, list) or price is None:
+        return None
+    selected: float | None = None
+    for step in sorted(steps, key=lambda row: _float_or_none(row.get("above_price")) or 0.0):
+        above = _float_or_none(step.get("above_price")) or 0.0
+        tick = _float_or_none(step.get("tick_size"))
+        if tick is not None and float(price) >= above:
+            selected = tick
+    return selected
 
 
 def _round_amount(value: float, minimum: float) -> float:

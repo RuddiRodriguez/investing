@@ -8,6 +8,7 @@ PROFILE="${PROFILE:-medium}"
 HOLDING_STATUS="${HOLDING_STATUS:-not_owned}"
 STATE_DIR="${STATE_DIR:-automated_forecasting_engine/runs/watch_agent_state}"
 REFRESH_AFTER_HOURS="${REFRESH_AFTER_HOURS:-12}"
+HORIZONS="${HORIZONS:-1,5,30}"
 LLM_ENV_FILE="${LLM_ENV_FILE:-$PROJECT_DIR/.env}"
 QUIET_UNCHANGED="${QUIET_UNCHANGED:-1}"
 OPENAI_USAGE_PROCESS_NAME="${OPENAI_USAGE_PROCESS_NAME:-watch_agent}"
@@ -21,6 +22,9 @@ PORTFOLIO_NOTES="${PORTFOLIO_NOTES:-}"
 PORTFOLIO_CONTEXT_JSON="${PORTFOLIO_CONTEXT_JSON:-}"
 PORTFOLIO_CONTEXT_FILE="${PORTFOLIO_CONTEXT_FILE:-}"
 STARTUP_DELAY_SECONDS="${STARTUP_DELAY_SECONDS:-0}"
+ACTIVE_TIMEZONE="${ACTIVE_TIMEZONE:-Europe/Amsterdam}"
+ACTIVE_START_LOCAL_TIME="${ACTIVE_START_LOCAL_TIME:-}"
+STOP_AFTER_LOCAL_TIME="${STOP_AFTER_LOCAL_TIME:-}"
 
 if [[ "$STATE_DIR" = /* ]]; then
   STATE_ROOT="$STATE_DIR"
@@ -33,6 +37,32 @@ mkdir -p /private/tmp/mfe_mpl
 
 cd "$PROJECT_DIR"
 
+local_minutes() {
+  TZ="$ACTIVE_TIMEZONE" date '+%H:%M' | awk -F: '{print ($1 * 60) + $2}'
+}
+
+clock_minutes() {
+  echo "$1" | awk -F: '{print ($1 * 60) + $2}'
+}
+
+if [[ -n "$ACTIVE_START_LOCAL_TIME" || -n "$STOP_AFTER_LOCAL_TIME" ]]; then
+  NOW_MINUTES="$(local_minutes)"
+  if [[ -n "$ACTIVE_START_LOCAL_TIME" ]]; then
+    START_MINUTES="$(clock_minutes "$ACTIVE_START_LOCAL_TIME")"
+    if (( NOW_MINUTES < START_MINUTES )); then
+      echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LAUNCHD | skipped_before_active_window ticker=$TICKER timezone=$ACTIVE_TIMEZONE active_start=$ACTIVE_START_LOCAL_TIME"
+      exit 0
+    fi
+  fi
+  if [[ -n "$STOP_AFTER_LOCAL_TIME" ]]; then
+    STOP_MINUTES="$(clock_minutes "$STOP_AFTER_LOCAL_TIME")"
+    if (( NOW_MINUTES >= STOP_MINUTES )); then
+      echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LAUNCHD | skipped_after_stop_time ticker=$TICKER timezone=$ACTIVE_TIMEZONE stop_after=$STOP_AFTER_LOCAL_TIME"
+      exit 0
+    fi
+  fi
+fi
+
 if [[ "$STARTUP_DELAY_SECONDS" != "0" && "$STARTUP_DELAY_SECONDS" != "" ]]; then
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LAUNCHD | delayed_start ticker=$TICKER profile=$PROFILE delay_seconds=$STARTUP_DELAY_SECONDS"
   sleep "$STARTUP_DELAY_SECONDS"
@@ -44,6 +74,7 @@ WATCH_ARGS=(
   --holding-status "$HOLDING_STATUS"
   --state-dir "$STATE_DIR"
   --refresh-after-hours "$REFRESH_AFTER_HOURS"
+  --horizons "$HORIZONS"
   --llm-env-file "$LLM_ENV_FILE"
   --calendar "$CALENDAR"
   --live-price-provider "$LIVE_PRICE_PROVIDER"

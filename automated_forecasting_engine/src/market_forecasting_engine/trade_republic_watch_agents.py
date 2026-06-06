@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     parser.add_argument("--profile", choices=("aggressive", "medium", "conservative"), default="medium")
     parser.add_argument("--refresh-after-hours", default="12")
+    parser.add_argument("--horizons", default="1,3,5,10")
     parser.add_argument("--interval-seconds", default="3600")
     parser.add_argument(
         "--stagger-seconds",
@@ -29,6 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delay between portfolio watcher starts. Prevents every holding from running a full forecast at once.",
     )
     parser.add_argument("--llm-env-file", default=None)
+    parser.add_argument("--active-timezone", default="Europe/Amsterdam")
+    parser.add_argument("--active-start-local-time", default="07:00")
+    parser.add_argument("--stop-after-local-time", default="22:00")
     parser.add_argument("--quiet-unchanged", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -45,9 +49,13 @@ def main() -> None:
         state_dir=args.state_dir,
         profile=args.profile,
         refresh_after_hours=args.refresh_after_hours,
+        horizons=args.horizons,
         interval_seconds=args.interval_seconds,
         stagger_seconds=args.stagger_seconds,
         llm_env_file=args.llm_env_file or str(args.project_dir / ".env"),
+        active_timezone=args.active_timezone,
+        active_start_local_time=args.active_start_local_time,
+        stop_after_local_time=args.stop_after_local_time,
         quiet_unchanged=args.quiet_unchanged,
         max_holdings=args.max_holdings,
     )
@@ -69,10 +77,14 @@ def build_agent_plans(
     state_dir: str,
     profile: str,
     refresh_after_hours: str,
-    interval_seconds: str,
-    stagger_seconds: str,
-    llm_env_file: str,
-    quiet_unchanged: bool,
+    horizons: str = "1,3,5,10",
+    interval_seconds: str = "3600",
+    stagger_seconds: str = "300",
+    llm_env_file: str = ".env",
+    active_timezone: str = "Europe/Amsterdam",
+    active_start_local_time: str = "07:00",
+    stop_after_local_time: str = "22:00",
+    quiet_unchanged: bool = True,
     max_holdings: int | None = None,
 ) -> list[dict[str, Any]]:
     plans = []
@@ -93,6 +105,7 @@ def build_agent_plans(
             "PROFILE": profile,
             "HOLDING_STATUS": "owned",
             "REFRESH_AFTER_HOURS": str(refresh_after_hours),
+            "HORIZONS": str(horizons),
             "LLM_ENV_FILE": str(llm_env_file),
             "STATE_DIR": state_dir,
             "QUIET_UNCHANGED": "1" if quiet_unchanged else "0",
@@ -104,6 +117,9 @@ def build_agent_plans(
             "ACCOUNT_EQUITY": _string_or_empty(summary.get("total_current_value")),
             "PORTFOLIO_CONTEXT_FILE": str(context_path),
             "STARTUP_DELAY_SECONDS": str(max(0, int(float(stagger_seconds)) * index)),
+            "ACTIVE_TIMEZONE": str(active_timezone),
+            "ACTIVE_START_LOCAL_TIME": str(active_start_local_time),
+            "STOP_AFTER_LOCAL_TIME": str(stop_after_local_time),
             "OPENAI_USAGE_PROCESS_NAME": "watch_agent",
         }
         plans.append(

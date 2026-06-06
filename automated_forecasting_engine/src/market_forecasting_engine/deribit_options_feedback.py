@@ -83,6 +83,7 @@ def append_decision_to_ledger(*, output_dir: Path, currency: str, record: dict[s
         "forecast_created_at_utc": record.get("forecast_created_at_utc"),
         "as_of_price": as_of_price,
         "forecast_direction": selected.get("expected_direction"),
+        "curve_shape": _compact_curve_shape(selected.get("curve_shape_analysis")),
         "trade_action": (record.get("option_trade_plan") or {}).get("action"),
         "trade_reason": (record.get("option_trade_plan") or {}).get("reason"),
         "contract": ((record.get("option_trade_plan") or {}).get("selected_contract") or {}).get("instrument_name"),
@@ -104,6 +105,25 @@ def append_decision_to_ledger(*, output_dir: Path, currency: str, record: dict[s
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, default=str) + "\n")
     return {"decision_id": decision_id, "ledger_path": str(path), "horizon_count": len(row["horizons"])}
+
+
+def _compact_curve_shape(curve_shape: Any) -> dict[str, Any]:
+    if not isinstance(curve_shape, dict):
+        return {"enabled": False, "status": "missing"}
+    features = curve_shape.get("features") if isinstance(curve_shape.get("features"), dict) else {}
+    return {
+        "enabled": curve_shape.get("enabled"),
+        "status": curve_shape.get("status"),
+        "label": curve_shape.get("label"),
+        "direction": curve_shape.get("direction"),
+        "confidence": curve_shape.get("confidence"),
+        "recommended_option_bias": curve_shape.get("recommended_option_bias"),
+        "reason": curve_shape.get("reason"),
+        "sma_state": features.get("sma_state"),
+        "impulse": features.get("impulse"),
+        "range": features.get("range"),
+        "reversal": features.get("reversal"),
+    }
 
 
 def summarize_feedback(rows: list[dict[str, Any]], *, window: int = 50) -> dict[str, Any]:

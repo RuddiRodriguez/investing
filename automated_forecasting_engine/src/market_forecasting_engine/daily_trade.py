@@ -29,6 +29,7 @@ class DailyTradeConfig:
     stop_atr_multiple: float = 1.2
     max_hold_bars: int = 24
     forecast_hours: tuple[float, ...] = (1.0, 2.0, 4.0)
+    forecast_calendar: str = "regular_session"
     transaction_cost_bps: float = 2.0
     model_version: str = "0.1.0-intraday"
 
@@ -106,6 +107,7 @@ def build_daily_trade_plan(prices: pd.DataFrame, config: DailyTradeConfig) -> di
         interval_minutes=interval_minutes,
         signal_score=float(signals["score"]),
         forecast_hours=config.forecast_hours,
+        forecast_calendar=config.forecast_calendar,
     )
 
     return {
@@ -143,6 +145,7 @@ def _hourly_forecasts(
     interval_minutes: float | None,
     signal_score: float,
     forecast_hours: tuple[float, ...],
+    forecast_calendar: str = "regular_session",
 ) -> list[dict[str, Any]]:
     if interval_minutes is None or interval_minutes <= 0:
         interval_minutes = 5.0
@@ -162,7 +165,13 @@ def _hourly_forecasts(
         predicted_price = latest_price * float(np.exp(expected_log_return))
         lower_price = latest_price * float(np.exp(expected_log_return - interval_width))
         upper_price = latest_price * float(np.exp(expected_log_return + interval_width))
-        forecast_timestamp = add_trading_bars(close.index, latest_timestamp, horizon_bars, interval_minutes)
+        forecast_timestamp = add_forecast_bars(
+            close.index,
+            latest_timestamp,
+            horizon_bars,
+            interval_minutes,
+            calendar=forecast_calendar,
+        )
         forecasts.append(
             {
                 "horizon_hours": float(hours),
@@ -366,6 +375,25 @@ def add_trading_bars(
         if day.date() == current.date() and observed[-1].date() == current.date() and observed_span_minutes < 385.0:
             return add_trading_minutes(current, interval * bars)
         day += pd.Timedelta(days=1)
+
+
+def add_forecast_bars(
+    index: pd.DatetimeIndex,
+    timestamp: pd.Timestamp,
+    bars: int,
+    interval_minutes: float | None = None,
+    *,
+    calendar: str = "regular_session",
+) -> pd.Timestamp:
+    """Return a future forecast timestamp using the configured market calendar."""
+
+    if bars <= 0:
+        return pd.Timestamp(timestamp)
+    observed = pd.DatetimeIndex(index)
+    interval = float(interval_minutes or infer_bar_interval_minutes(observed) or 5.0)
+    if str(calendar or "regular_session").lower() in {"continuous", "continuous_24_7", "crypto", "24_7"}:
+        return pd.Timestamp(timestamp) + pd.Timedelta(minutes=interval * bars)
+    return add_trading_bars(observed, timestamp, bars, interval)
 
 
 def _same_day_regular_session_projection(timestamp: pd.Timestamp, minutes: float) -> pd.Timestamp | None:
