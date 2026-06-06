@@ -601,16 +601,9 @@ def _llm_review_override_or_execute(
             "recommended_action": None,
             "reason": "LLM review was not enabled for this run.",
         }
-    if provider != "openai":
-        return {
-            "status": "skipped",
-            "provider": provider,
-            "model": model,
-            "recommended_action": None,
-            "reason": "Only the optional OpenAI reviewer is implemented.",
-        }
-    return _execute_openai_review(
+    return _execute_llm_review(
         packet=packet,
+        provider=provider,
         model=model,
         temperature=temperature,
         reasoning_effort=reasoning_effort,
@@ -619,30 +612,34 @@ def _llm_review_override_or_execute(
     )
 
 
-def _execute_openai_review(
+def _execute_llm_review(
     packet: dict[str, Any],
+    provider: str,
     model: str | None,
     temperature: float,
     reasoning_effort: str,
     timeout_seconds: int,
     env_file: str | None,
 ) -> dict[str, Any]:
-    api_key = os.environ.get("OPENAI_API_KEY") or _read_env_value(env_file, "OPENAI_API_KEY")
-    selected_model = model or os.environ.get("OPENAI_MODEL") or _read_env_value(env_file, "OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
-    if not api_key:
+    from market_forecasting_engine.llm_trader.run import openai_client_for_provider, resolve_llm_model, resolve_llm_provider
+
+    selected_provider = resolve_llm_provider(provider)
+    selected_model = resolve_llm_model(model or _read_provider_model(env_file, selected_provider), provider=selected_provider)
+    missing_key = _missing_provider_key(env_file, selected_provider)
+    if missing_key:
         return {
             "status": "skipped",
-            "provider": "openai",
+            "provider": selected_provider,
             "model": selected_model,
             "recommended_action": None,
-            "reason": "OPENAI_API_KEY is not available in the environment or configured .env file.",
+            "reason": missing_key,
         }
     try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key, timeout=float(timeout_seconds))
+        _ensure_provider_env_from_file(env_file, selected_provider)
+        client = openai_client_for_provider(selected_provider, timeout=float(timeout_seconds))
         _, _, parsed = call_response(
             client=client,
+            provider=selected_provider,
             model=selected_model,
             system_message=(
                 "You are a governed trading decision reviewer. You do not predict prices. "
@@ -653,13 +650,14 @@ def _execute_openai_review(
             json_schema=_openai_tactical_review_schema(),
             reasoning_effort=reasoning_effort,
             item={"packet": json.dumps(packet, sort_keys=True)},
+            usage_context={"purpose": "chapter_18_tactical_review", "ticker": packet.get("ticker"), "provider": selected_provider},
         )
         if not isinstance(parsed, dict):
             raise ValueError("LLM response JSON must be an object.")
         parsed.setdefault("recommended_action", parsed.get("final_action"))
         return {
             "status": "executed",
-            "provider": "openai",
+            "provider": selected_provider,
             "model": selected_model,
             "recommended_action": parsed.get("recommended_action"),
             "confidence": _finite_or_none(parsed.get("confidence")),
@@ -671,12 +669,48 @@ def _execute_openai_review(
     except Exception as exc:
         return {
             "status": "failed",
-            "provider": "openai",
+            "provider": selected_provider,
             "model": selected_model,
             "recommended_action": None,
             "error_type": type(exc).__name__,
             "reason": str(exc)[:500],
         }
+
+
+def _read_provider_model(env_file: str | None, provider: str) -> str | None:
+    if provider == "openai":
+        return _read_env_value(env_file, "OPENAI_MODEL")
+    if provider == "huggingface":
+        return _read_env_value(env_file, "HUGGINGFACE_MODEL") or _read_env_value(env_file, "HF_MODEL")
+    if provider == "bedrock":
+        return _read_env_value(env_file, "BEDROCK_OPENAI_MODEL") or _read_env_value(env_file, "BEDROCK_MODEL")
+    if provider == "llm_studio":
+        return _read_env_value(env_file, "LLM_STUDIO_MODEL")
+    return None
+
+
+def _missing_provider_key(env_file: str | None, provider: str) -> str | None:
+    if provider == "openai" and not (os.environ.get("OPENAI_API_KEY") or _read_env_value(env_file, "OPENAI_API_KEY")):
+        return "OPENAI_API_KEY is not available in the environment or configured .env file."
+    if provider == "huggingface" and not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY") or _read_env_value(env_file, "HF_TOKEN") or _read_env_value(env_file, "HUGGINGFACE_API_KEY")):
+        return "HF_TOKEN or HUGGINGFACE_API_KEY is not available in the environment or configured .env file."
+    return None
+
+
+def _ensure_provider_env_from_file(env_file: str | None, provider: str) -> None:
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        value = _read_env_value(env_file, "OPENAI_API_KEY")
+        if value:
+            os.environ["OPENAI_API_KEY"] = value
+    if provider == "huggingface":
+        if not os.environ.get("HF_TOKEN"):
+            value = _read_env_value(env_file, "HF_TOKEN")
+            if value:
+                os.environ["HF_TOKEN"] = value
+        if not os.environ.get("HUGGINGFACE_API_KEY"):
+            value = _read_env_value(env_file, "HUGGINGFACE_API_KEY")
+            if value:
+                os.environ["HUGGINGFACE_API_KEY"] = value
 
 
 def _openai_tactical_review_schema() -> dict[str, Any]:

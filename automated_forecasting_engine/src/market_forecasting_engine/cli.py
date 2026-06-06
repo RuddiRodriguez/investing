@@ -95,8 +95,8 @@ def main() -> None:
         default="intermediate",
         help="Chapter 18 tactical profile for stops, reward/risk gates, and holding horizon.",
     )
-    parser.add_argument("--enable-llm-review", action="store_true", help="Enable the optional governed OpenAI tactical reviewer.")
-    parser.add_argument("--llm-provider", choices=("openai",), default="openai", help="LLM provider for optional tactical review.")
+    parser.add_argument("--enable-llm-review", action="store_true", help="Enable the optional governed LLM tactical reviewer.")
+    parser.add_argument("--llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai", help="LLM provider for optional tactical review. Defaults to OpenAI.")
     parser.add_argument(
         "--llm-model",
         default=None,

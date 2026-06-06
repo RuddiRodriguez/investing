@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from market_forecasting_engine.llm_handler import LLMRequest, default_llm_handler, response_json
 from market_forecasting_engine.openai_models import DEFAULT_REASONING_EFFORT, is_reasoning_model
 
 
@@ -45,13 +46,6 @@ def response_payload(
     return payload
 
 
-def response_json(response: Any) -> dict[str, Any]:
-    if hasattr(response, "model_dump"):
-        data = response.model_dump(mode="json")
-        return data if isinstance(data, dict) else {}
-    return {}
-
-
 def parse_response_output_text(response: Any) -> dict[str, Any]:
     text = str(getattr(response, "output_text", "") or "").strip()
     parsed = json.loads(text or "{}")
@@ -62,7 +56,8 @@ def parse_response_output_text(response: Any) -> dict[str, Any]:
 
 def call_response(
     *,
-    client: Any,
+    client: Any | None = None,
+    provider: str = "openai",
     model: str,
     system_message: str,
     user_message: str,
@@ -70,6 +65,7 @@ def call_response(
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     item: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    usage_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     payload = response_payload(
         model=model,
@@ -80,5 +76,7 @@ def call_response(
         item=item,
         tools=tools,
     )
-    response = client.responses.create(**payload)
-    return payload, response_json(response), parse_response_output_text(response)
+    result = default_llm_handler(openai_client=client if provider == "openai" else None).predict(
+        LLMRequest(provider=provider, model=model, payload=payload, usage_context=usage_context or {})
+    )
+    return payload, result.response_data, result.parsed
