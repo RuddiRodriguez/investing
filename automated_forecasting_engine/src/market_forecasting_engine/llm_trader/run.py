@@ -4,8 +4,6 @@ import runpy
 from datetime import UTC, datetime
 from pathlib import Path
 
-from openai import OpenAI
-
 from market_forecasting_engine.calendar import summarize_calendar_alignment
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_manifest import build_data_manifest
@@ -14,7 +12,8 @@ from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.governance import write_audit_bundle
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import call_response
-from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL
+from market_forecasting_engine.llm_handler import normalize_provider_name
+from market_forecasting_engine.openai_models import DEFAULT_BEDROCK_OPENAI_MODEL, DEFAULT_OPENAI_MODEL
 from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.plots import write_plot_artifacts
 from market_forecasting_engine.schema import ForecastConfig
@@ -59,22 +58,25 @@ def run_autonomous_trader(args):
             args,
             "LLM",
             "calling autonomous trader LLM",
-            model=resolve_llm_model(args.llm_model),
-            web_search=not args.no_web_search,
+            provider=resolve_llm_provider(getattr(args, "llm_provider", None)),
+            model=resolve_llm_model(args.llm_model, provider=resolve_llm_provider(getattr(args, "llm_provider", None))),
+            web_search=not args.no_web_search and resolve_llm_provider(getattr(args, "llm_provider", None)) == "openai",
         )
         load_env(args.llm_env_file)
-        client = OpenAI(timeout=float(args.llm_timeout))
+        provider = resolve_llm_provider(getattr(args, "llm_provider", None))
+        client = openai_client_for_provider(provider, timeout=float(args.llm_timeout))
         payload, raw_response, decision = call_response(
             client=client,
-            model=resolve_llm_model(args.llm_model),
+            provider=provider,
+            model=resolve_llm_model(args.llm_model, provider=provider),
             system_message=prompt["system_message"],
             user_message=prompt["user_message"],
             json_schema=prompt["json_schema"],
             reasoning_effort=args.reasoning_effort,
             item=item,
-            use_web_search=not args.no_web_search,
+            use_web_search=not args.no_web_search and provider == "openai",
             search_context_size=args.search_context_size,
-            usage_context={"purpose": "autonomous_trader_decision", "ticker": args.ticker.upper(), "profile": args.profile},
+            usage_context={"purpose": "autonomous_trader_decision", "ticker": args.ticker.upper(), "profile": args.profile, "provider": provider},
         )
         emit_progress(
             args,
@@ -102,7 +104,8 @@ def run_autonomous_trader(args):
             args,
             "SUMMARY",
             "calling non-technical summary LLM",
-            model=resolve_llm_model(args.summary_model or args.llm_model),
+            provider=resolve_llm_provider(getattr(args, "summary_provider", None) or getattr(args, "llm_provider", None)),
+            model=resolve_llm_model(args.summary_model or args.llm_model, provider=resolve_llm_provider(getattr(args, "summary_provider", None) or getattr(args, "llm_provider", None))),
         )
         summary_prompt = load_prompt(args.summary_prompt)
         currency_context = build_currency_context(args)
@@ -115,9 +118,12 @@ def run_autonomous_trader(args):
             "trader_decision_json": json.dumps(decision, indent=2, sort_keys=True),
             "technical_packet_json": json.dumps(technical_packet, indent=2, sort_keys=True),
         }
+        summary_provider = resolve_llm_provider(getattr(args, "summary_provider", None) or getattr(args, "llm_provider", None))
+        summary_client = openai_client_for_provider(summary_provider, timeout=float(args.llm_timeout))
         summary_payload, summary_raw_response, trader_summary = call_response(
-            client=client,
-            model=resolve_llm_model(args.summary_model or args.llm_model),
+            client=summary_client,
+            provider=summary_provider,
+            model=resolve_llm_model(args.summary_model or args.llm_model, provider=summary_provider),
             system_message=summary_prompt["system_message"],
             user_message=summary_prompt["user_message"],
             json_schema=summary_prompt["json_schema"],
@@ -125,7 +131,7 @@ def run_autonomous_trader(args):
             item=summary_item,
             use_web_search=False,
             search_context_size="low",
-            usage_context={"purpose": "nontechnical_trader_summary", "ticker": args.ticker.upper(), "profile": args.profile},
+            usage_context={"purpose": "nontechnical_trader_summary", "ticker": args.ticker.upper(), "profile": args.profile, "provider": summary_provider},
         )
         emit_progress(args, "SUMMARY", "non-technical summary received")
     result = {
@@ -150,8 +156,29 @@ def run_autonomous_trader(args):
     return result
 
 
-def resolve_llm_model(model: str | None) -> str:
-    return model or os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+def resolve_llm_provider(provider: str | None) -> str:
+    return normalize_provider_name(provider or os.environ.get("LLM_PROVIDER") or "openai")
+
+
+def resolve_llm_model(model: str | None, *, provider: str | None = None) -> str:
+    selected_provider = resolve_llm_provider(provider)
+    if model:
+        return model
+    if selected_provider == "huggingface":
+        return os.environ.get("HUGGINGFACE_MODEL") or os.environ.get("HF_MODEL") or "openai/gpt-oss-20b:cerebras"
+    if selected_provider == "bedrock":
+        return os.environ.get("BEDROCK_OPENAI_MODEL") or os.environ.get("BEDROCK_MODEL") or DEFAULT_BEDROCK_OPENAI_MODEL
+    if selected_provider == "llm_studio":
+        return os.environ.get("LLM_STUDIO_MODEL") or "local-model"
+    return os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+
+
+def openai_client_for_provider(provider: str, *, timeout: float):
+    if resolve_llm_provider(provider) != "openai":
+        return None
+    from openai import OpenAI
+
+    return OpenAI(timeout=timeout)
 
 
 def run_forecast(args, output_dir):

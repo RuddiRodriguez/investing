@@ -29,7 +29,7 @@ from market_forecasting_engine.governance import write_audit_bundle
 from market_forecasting_engine.llm_trader.prompts import autonomous_trader
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import call_response, response_payload
-from market_forecasting_engine.llm_trader.run import build_technical_packet, load_env, resolve_llm_model
+from market_forecasting_engine.llm_trader.run import build_technical_packet, load_env, openai_client_for_provider, resolve_llm_model, resolve_llm_provider
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 from market_forecasting_engine.models import HistoricalMeanReturn, RecentMeanReturn, default_candidates
 from market_forecasting_engine.options_decision import (
@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--options-min-probability-breakeven", type=float, default=None, help="Minimum probability of finishing beyond option breakeven; defaults from risk profile.")
     parser.add_argument("--enable-llm-decision", action="store_true", help="Run the autonomous LLM trader as a final governed decision layer.")
     parser.add_argument("--llm-dry-run", action="store_true", help="Build the LLM decision packet without calling the LLM.")
+    parser.add_argument("--llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai")
     parser.add_argument("--llm-model", default=None, help=f"Defaults to OPENAI_MODEL or {DEFAULT_OPENAI_MODEL}.")
     parser.add_argument("--llm-reasoning-effort", default=DEFAULT_REASONING_EFFORT)
     parser.add_argument("--llm-timeout", type=int, default=120)
@@ -593,7 +594,8 @@ def _run_daily_llm_decision(report: dict, args: argparse.Namespace, *, dry_run: 
         "portfolio_context_json": json.dumps(portfolio_context, indent=2, sort_keys=True),
         "technical_packet_json": json.dumps(technical_packet, indent=2, sort_keys=True, default=str),
     }
-    model = resolve_llm_model(args.llm_model)
+    provider = resolve_llm_provider(getattr(args, "llm_provider", None))
+    model = resolve_llm_model(args.llm_model, provider=provider)
     if dry_run:
         payload = response_payload(
             model=model,
@@ -618,20 +620,19 @@ def _run_daily_llm_decision(report: dict, args: argparse.Namespace, *, dry_run: 
 
     load_env(args.llm_env_file)
     try:
-        from openai import OpenAI
-
-        client = OpenAI(timeout=float(args.llm_timeout))
+        client = openai_client_for_provider(provider, timeout=float(args.llm_timeout))
         payload, raw_response, decision = call_response(
             client=client,
+            provider=provider,
             model=model,
             system_message=autonomous_trader.system_message,
             user_message=autonomous_trader.user_message,
             json_schema=autonomous_trader.json_schema,
             reasoning_effort=args.llm_reasoning_effort,
             item=item,
-            use_web_search=not args.llm_no_web_search,
+            use_web_search=not args.llm_no_web_search and provider == "openai",
             search_context_size=args.llm_search_context_size,
-            usage_context={"purpose": "daily_trade_llm_decision", "ticker": args.ticker.upper(), "risk_profile": args.risk_profile},
+            usage_context={"purpose": "daily_trade_llm_decision", "ticker": args.ticker.upper(), "risk_profile": args.risk_profile, "provider": provider},
         )
     except Exception as exc:
         return {

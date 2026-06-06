@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from market_forecasting_engine.llm_usage import log_openai_usage, monotonic_ms, new_llm_call_id
+from market_forecasting_engine.llm_handler import LLMRequest, default_llm_handler, response_json
 from market_forecasting_engine.openai_models import DEFAULT_REASONING_EFFORT, is_reasoning_model
 
 
@@ -46,13 +46,6 @@ def response_payload(
     return payload
 
 
-def response_json(response: Any) -> dict[str, Any]:
-    if hasattr(response, "model_dump"):
-        data = response.model_dump(mode="json")
-        return data if isinstance(data, dict) else {}
-    return {}
-
-
 def parse_response_output_text(response: Any) -> dict[str, Any]:
     text = str(getattr(response, "output_text", "") or "").strip()
     parsed = json.loads(text or "{}")
@@ -63,7 +56,8 @@ def parse_response_output_text(response: Any) -> dict[str, Any]:
 
 def call_response(
     *,
-    client: Any,
+    client: Any | None = None,
+    provider: str = "openai",
     model: str,
     system_message: str,
     user_message: str,
@@ -73,8 +67,6 @@ def call_response(
     tools: list[dict[str, Any]] | None = None,
     usage_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    call_id = new_llm_call_id()
-    started_ms = monotonic_ms()
     payload = response_payload(
         model=model,
         system_message=system_message,
@@ -84,29 +76,7 @@ def call_response(
         item=item,
         tools=tools,
     )
-    try:
-        response = client.responses.create(**payload)
-        data = response_json(response)
-        log_openai_usage(
-            call_id=call_id,
-            model=model,
-            payload=payload,
-            response_data=data,
-            started_ms=started_ms,
-            status="ok",
-            context=usage_context,
-            api_key=getattr(client, "api_key", None),
-        )
-        return payload, data, parse_response_output_text(response)
-    except Exception as exc:
-        log_openai_usage(
-            call_id=call_id,
-            model=model,
-            payload=payload,
-            started_ms=started_ms,
-            status="error",
-            error=str(exc),
-            context=usage_context,
-            api_key=getattr(client, "api_key", None),
-        )
-        raise
+    result = default_llm_handler(openai_client=client if provider == "openai" else None).predict(
+        LLMRequest(provider=provider, model=model, payload=payload, usage_context=usage_context or {})
+    )
+    return payload, result.response_data, result.parsed
