@@ -169,11 +169,13 @@ class OpenAICompatibleChatProvider:
         api_key: str | None = None,
         base_url: str | None = None,
         provider_name: str = "llm_studio",
+        use_response_format: bool | None = None,
     ):
         self.client = client
         self.api_key = api_key
         self.base_url = base_url or os.getenv("LLM_STUDIO_BASE_URL") or os.getenv("LOCAL_LLM_BASE_URL") or DEFAULT_LLM_STUDIO_BASE_URL
         self.name = normalize_provider_name(provider_name)
+        self.use_response_format = use_response_format
 
     def generate(self, request: LLMRequest) -> LLMResult:
         client = self.client or self._client()
@@ -181,14 +183,17 @@ class OpenAICompatibleChatProvider:
         if payload.get("tools"):
             raise LLMProviderNotConfigured(f"{self.name} provider does not support Responses API tools in this framework yet.")
         messages = responses_payload_to_chat_messages(payload)
+        if not self._should_use_response_format():
+            messages = _messages_with_json_instruction(messages, payload.get("text"))
         create_payload: dict[str, Any] = {
             "model": request.model,
             "messages": messages,
             "temperature": payload.get("temperature"),
         }
-        response_format = _chat_response_format(payload.get("text"))
-        if response_format is not None:
-            create_payload["response_format"] = response_format
+        if self._should_use_response_format():
+            response_format = _chat_response_format(payload.get("text"))
+            if response_format is not None:
+                create_payload["response_format"] = response_format
         create_payload = {key: value for key, value in create_payload.items() if value is not None}
         response = client.chat.completions.create(**create_payload)
         response_data = response_json(response)
@@ -209,6 +214,14 @@ class OpenAICompatibleChatProvider:
         except ImportError as exc:
             raise LLMProviderNotConfigured("Install the openai package to use the OpenAI-compatible local provider.") from exc
         return OpenAI(api_key=self.api_key or os.getenv("LLM_STUDIO_API_KEY") or os.getenv("LOCAL_LLM_API_KEY") or "local", base_url=self.base_url)
+
+    def _should_use_response_format(self) -> bool:
+        if self.use_response_format is not None:
+            return bool(self.use_response_format)
+        value = os.getenv("LLM_STUDIO_USE_RESPONSE_FORMAT") or os.getenv("LOCAL_LLM_USE_RESPONSE_FORMAT")
+        if value is None:
+            return True
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class NotConfiguredProvider:
@@ -442,7 +455,14 @@ def _chat_output_text(response: Any, response_data: dict[str, Any]) -> str:
         message = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else {}
         content = message.get("content") if isinstance(message, dict) else None
         if content is not None:
-            return str(content)
+            text = str(content)
+            if text.strip():
+                return text
+        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+        if reasoning_content is not None:
+            text = str(reasoning_content)
+            if text.strip():
+                return text
     try:
         return str(response.choices[0].message.content)
     except Exception:

@@ -6,16 +6,20 @@ PYTHON="${PYTHON:-$PROJECT_DIR/venv/bin/python}"
 CURRENCY="${CURRENCY:-ETH}"
 INSTRUMENT_CURRENCY="${INSTRUMENT_CURRENCY:-USDC}"
 STATE_DIR="${STATE_DIR:-automated_forecasting_engine/runs/llm_options_trader_live_shadow}"
-CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-300}"
+CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-60}"
+FORECAST_HOURS="${FORECAST_HOURS:-0.083333,0.166667,0.25,0.5}"
 DATA_PROVIDER="${DATA_PROVIDER:-deribit}"
 DATA_INTERVAL="${DATA_INTERVAL:-1m}"
 MAX_ORDER_AMOUNT="${MAX_ORDER_AMOUNT:-10}"
 MAX_ORDER_PRICE="${MAX_ORDER_PRICE:-5000}"
 LLM_PROVIDER="${LLM_PROVIDER:-openai}"
+ENTRY_BIAS="${ENTRY_BIAS:-unrestricted}"
 DEFAULT_LLM_MODEL="$(
-  PYTHONPATH=automated_forecasting_engine/src "$PYTHON" - <<'PY'
-from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL
-print(DEFAULT_OPENAI_MODEL)
+  LLM_PROVIDER="$LLM_PROVIDER" PYTHONPATH=automated_forecasting_engine/src "$PYTHON" - <<'PY'
+import os
+from market_forecasting_engine.llm_trader.run import resolve_llm_model
+
+print(resolve_llm_model(None, provider=os.environ.get("LLM_PROVIDER")))
 PY
 )"
 LLM_MODEL="${LLM_MODEL:-$DEFAULT_LLM_MODEL}"
@@ -37,9 +41,15 @@ fi
 cd "$PROJECT_DIR"
 mkdir -p "$STATE_DIR"
 
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+  set -a
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
+
 screen -S llm_options_live_shadow_agent -X quit 2>/dev/null || true
 screen -S llm_options_live_shadow_dashboard -X quit 2>/dev/null || true
-pkill -f "market_forecasting_engine.llm_options_trader.agent.*llm_options_trader_live_shadow" 2>/dev/null || true
+pkill -f "market_forecasting_engine.llm_options_trader.agent.*$STATE_DIR" 2>/dev/null || true
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LLM_OPTIONS_LIVE_SHADOW | start simulated live-market trader"
 screen -dmS llm_options_live_shadow_agent zsh -lc "
@@ -52,7 +62,7 @@ screen -dmS llm_options_live_shadow_agent zsh -lc "
 	    --data-provider '$DATA_PROVIDER' \
 	    --data-interval '$DATA_INTERVAL' \
     --lookback-days 20 \
-    --forecast-hours 0.25,0.5,1 \
+    --forecast-hours '$FORECAST_HOURS' \
     --option-chain-limit 120 \
     --min-dte 1 \
     --max-dte 14 \
@@ -65,6 +75,7 @@ screen -dmS llm_options_live_shadow_agent zsh -lc "
     --chronos-num-samples '$CHRONOS_NUM_SAMPLES' \
     --llm-provider '$LLM_PROVIDER' \
     --llm-model '$LLM_MODEL' \
+    --entry-bias '$ENTRY_BIAS' \
     --trader-profile '$TRADER_PROFILE' \
     --memory-events '$MEMORY_EVENTS' \
     --check-interval-seconds '$CHECK_INTERVAL_SECONDS' \

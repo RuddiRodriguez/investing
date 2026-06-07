@@ -49,6 +49,7 @@ class _FakeBedrockOpenAIFactory:
 
 class _FakeHFMessage:
     content = '{"decision":"Buy"}'
+    reasoning_content = None
 
 
 class _FakeHFChoice:
@@ -159,6 +160,51 @@ def test_llm_studio_provider_uses_openai_compatible_chat_endpoint(tmp_path, monk
     sent = client.chat.completions.payload
     assert sent["model"] == "local-trader"
     assert sent["messages"][0] == {"role": "system", "content": "system"}
+    assert sent["response_format"]["type"] == "json_schema"
     row = json.loads(log_file.read_text().splitlines()[0])
     assert row["provider"] == "llm_studio"
     assert row["model"] == "local-trader"
+
+
+def test_llm_studio_provider_reads_structured_json_from_reasoning_content(tmp_path, monkeypatch) -> None:
+    class Message:
+        content = ""
+        reasoning_content = '{"decision":"Hold"}'
+
+    class Choice:
+        message = Message()
+
+    class Response:
+        choices = [Choice()]
+
+        def model_dump(self, mode="json"):
+            return {
+                "id": "chat_reasoning_1",
+                "choices": [{"message": {"content": "", "reasoning_content": '{"decision":"Hold"}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+
+    class Completions:
+        def create(self, **payload):
+            self.payload = payload
+            return Response()
+
+    class Chat:
+        def __init__(self):
+            self.completions = Completions()
+
+    class Client:
+        api_key = "local-key"
+
+        def __init__(self):
+            self.chat = Chat()
+
+    log_file = tmp_path / "usage.jsonl"
+    monkeypatch.setenv("OPENAI_USAGE_LOG_FILE", str(log_file))
+    client = Client()
+    handler = LLMHandler({"llm_studio": OpenAICompatibleChatProvider(client=client, api_key="local-key", base_url="http://127.0.0.1:1234/v1")})
+
+    result = handler.predict(LLMRequest(provider="llm_studio", model="local-trader", payload=_payload(), usage_context={"purpose": "local_reasoning_unit"}))
+
+    assert result.parsed == {"decision": "Hold"}
+    assert client.chat.completions.payload["response_format"]["type"] == "json_schema"

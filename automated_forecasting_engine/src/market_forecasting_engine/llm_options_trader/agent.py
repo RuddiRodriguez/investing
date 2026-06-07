@@ -87,6 +87,7 @@ def run_once(*, args: argparse.Namespace, broker, config: LLMOptionsRuntimeConfi
     if args.simulation_only:
         full_packet["shadow_simulation"] = load_and_update_shadow_state(output_dir=Path(args.output_dir), currency=config.currency, broker=broker)
     full_packet["trader_profile"] = profile
+    full_packet["entry_mandate"] = _entry_mandate(args.entry_bias)
     full_packet["trader_memory"] = load_recent_memory(Path(args.output_dir), config.currency, limit=int(args.memory_events))
     full_packet["strategy_memory"] = load_strategy_memory(Path(args.output_dir), config.currency, max_lessons=int(args.strategy_memory_lessons))
     full_packet["external_forecasts"] = {
@@ -250,6 +251,7 @@ def run_once(*, args: argparse.Namespace, broker, config: LLMOptionsRuntimeConfi
             "chronos_refresh_seconds": int(args.chronos_refresh_seconds),
             "enable_profit_policy_llm": bool(args.enable_profit_policy_llm),
             "profit_policy_llm_model": resolve_llm_model(args.profit_policy_llm_model or args.llm_model, provider=provider),
+            "entry_bias": args.entry_bias,
         },
     }
     append_memory_event(Path(args.output_dir), config.currency, compact_decision_event(process="agent", record=record))
@@ -402,6 +404,32 @@ def _packet_with_shadow_exposure(packet: dict) -> dict:
     return updated
 
 
+def _entry_mandate(entry_bias: str) -> dict:
+    normalized = str(entry_bias or "unrestricted").strip().lower()
+    if normalized == "put_only":
+        return {
+            "mode": "put_only",
+            "instruction": "For new entries, evaluate only long put setups from the provided option_chain. Do not open calls. If no put setup has sufficient edge, return hold.",
+            "allowed_entry_intents": ["open_put", "hold"],
+            "disallowed_entry_intents": ["open_call"],
+            "order_policy": "If trading, submit a buy limit order for one executable put instrument from option_chain with reduce_only=false.",
+        }
+    if normalized == "call_only":
+        return {
+            "mode": "call_only",
+            "instruction": "For new entries, evaluate only long call setups from the provided option_chain. Do not open puts. If no call setup has sufficient edge, return hold.",
+            "allowed_entry_intents": ["open_call", "hold"],
+            "disallowed_entry_intents": ["open_put"],
+            "order_policy": "If trading, submit a buy limit order for one executable call instrument from option_chain with reduce_only=false.",
+        }
+    return {
+        "mode": "unrestricted",
+        "instruction": "For new entries, choose call, put, or hold according to the market data and strategy context.",
+        "allowed_entry_intents": ["open_call", "open_put", "hold"],
+        "disallowed_entry_intents": [],
+    }
+
+
 def runtime_config(args: argparse.Namespace) -> LLMOptionsRuntimeConfig:
     return LLMOptionsRuntimeConfig(
         currency=args.currency,
@@ -446,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--enable-profit-policy-llm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--profit-policy-llm-model", default=None)
+    parser.add_argument("--entry-bias", choices=("unrestricted", "put_only", "call_only"), default="unrestricted")
     parser.add_argument("--trader-profile", default="gambit")
     parser.add_argument("--memory-events", type=int, default=12)
     parser.add_argument("--strategy-memory-lessons", type=int, default=12)

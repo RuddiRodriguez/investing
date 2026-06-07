@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from market_forecasting_engine.llm_options_trader.common import LLMOptionsRuntimeConfig, load_underlying_prices, price_summary, recent_price_bars
+
 
 DEFAULT_STATE_DIR = Path("automated_forecasting_engine/runs/llm_options_trader_testnet")
 
@@ -34,6 +36,12 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
     if not exit_decision:
         exit_decision = agent_decision if agent_report else _decision_summary(exit_report)
     packet = latest_packet
+    fallback_bars = []
+    fallback_price_summary: dict[str, Any] = {}
+    if not (latest.get("dashboard_price_bars") or packet.get("recent_price_bars")):
+        fallback = _fallback_price_payload(currency)
+        fallback_bars = fallback.get("recent_price_bars") or []
+        fallback_price_summary = fallback.get("price_summary") or {}
     account = packet.get("account") if isinstance(packet.get("account"), dict) else {}
     shadow = packet.get("shadow_simulation") if isinstance(packet.get("shadow_simulation"), dict) else {}
     llm_cost = float(llm_usage.get("total_cost_usd") or 0.0)
@@ -53,8 +61,8 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
             "account_mode": packet.get("account_mode") or (latest.get("account_mode") if isinstance(latest, dict) else None),
             "execution_mode": packet.get("execution_mode") or ("simulation_only" if latest.get("simulation_only") else None),
             "latest_underlying_price": packet.get("latest_underlying_price"),
-            "price_data_provider": packet.get("price_data_provider"),
-            "price_data_interval": packet.get("price_data_interval"),
+            "price_data_provider": packet.get("price_data_provider") or ("deribit" if fallback_bars else None),
+            "price_data_interval": packet.get("price_data_interval") or ("1m" if fallback_bars else None),
             "entry_checked_at": entry_report.get("checked_at_utc"),
             "exit_checked_at": exit_report.get("checked_at_utc"),
             "agent_checked_at": agent_report.get("checked_at_utc"),
@@ -80,7 +88,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
         "open_option_orders": packet.get("open_option_orders") or [],
         "option_positions": packet.get("option_positions") or [],
         "recent_option_trades": packet.get("recent_option_trades") or [],
-        "price_summary": packet.get("price_summary") or {},
+        "price_summary": packet.get("price_summary") or fallback_price_summary or {},
         "technical_observations": packet.get("technical_observations") or {},
         "short_tape_summary": packet.get("short_tape_summary") or {},
         "regime_transition_warning": packet.get("regime_transition_warning") or {},
@@ -90,13 +98,33 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
         "strategy_memory": packet.get("strategy_memory") or strategy_memory or {},
         "forecast_validation": packet.get("forecast_validation") or {},
         "chronos_forecast": ((packet.get("external_forecasts") or {}).get("chronos") if isinstance(packet.get("external_forecasts"), dict) else {}) or {},
-        "recent_price_bars": latest.get("dashboard_price_bars") or packet.get("recent_price_bars") or [],
+        "recent_price_bars": latest.get("dashboard_price_bars") or packet.get("recent_price_bars") or fallback_bars,
         "option_chain": packet.get("option_chain") or [],
         "trader_memory": memory,
         "llm_usage": llm_usage,
         "agent_history": agent_log[-80:],
         "entry_history": entry_log[-80:],
         "exit_history": exit_log[-80:],
+    }
+
+
+def _fallback_price_payload(currency: str) -> dict[str, Any]:
+    try:
+        config = LLMOptionsRuntimeConfig(
+            currency=currency.upper(),
+            instrument_currency="USDC",
+            data_provider="deribit",
+            data_interval="1m",
+            lookback_days=2,
+            max_price_rows=3000,
+        )
+        prices = load_underlying_prices(config=config, now=datetime.now(UTC))
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc), "recent_price_bars": [], "price_summary": {}}
+    return {
+        "status": "ok",
+        "recent_price_bars": recent_price_bars(prices, rows=3000),
+        "price_summary": price_summary(prices),
     }
 
 
