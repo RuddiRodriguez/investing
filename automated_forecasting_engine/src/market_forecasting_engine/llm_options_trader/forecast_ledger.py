@@ -64,7 +64,72 @@ def compact_forecast_validation(payload: dict[str, Any], *, max_recent: int = 12
         "summary": summarize_forecast_records(records),
         "by_horizon": _by_horizon(matured),
         "recent_matured": matured[-max(1, int(max_recent)) :],
+        "error_feedback": forecast_error_feedback(matured[-max(1, int(max_recent)) :]),
     }
+
+
+def forecast_error_feedback(matured_records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not matured_records:
+        return {
+            "status": "empty",
+            "instruction": "No matured forecast errors yet. Treat the current forecast as unvalidated evidence, not a command.",
+        }
+    recent = matured_records[-min(8, len(matured_records)) :]
+    errors = [_float(record.get("error")) for record in recent]
+    errors = [value for value in errors if value is not None]
+    abs_errors = [abs(value) for value in errors]
+    directions = [record for record in recent if record.get("direction_correct") is not None]
+    direction_accuracy = None if not directions else sum(1 for record in directions if record.get("direction_correct")) / len(directions)
+    mean_error = None if not errors else sum(errors) / len(errors)
+    mae = None if not abs_errors else sum(abs_errors) / len(abs_errors)
+    latest = recent[-1]
+    latest_error = _float(latest.get("error"))
+    bias = "unknown"
+    if mean_error is not None:
+        if mean_error > 0:
+            bias = "under_predicted_actual_price"
+        elif mean_error < 0:
+            bias = "over_predicted_actual_price"
+        else:
+            bias = "unbiased_recently"
+    reliability = "unvalidated"
+    if direction_accuracy is not None:
+        if direction_accuracy < 0.4:
+            reliability = "poor_directional_reliability"
+        elif direction_accuracy < 0.6:
+            reliability = "mixed_directional_reliability"
+        else:
+            reliability = "acceptable_directional_reliability"
+    instruction = _forecast_error_instruction(bias=bias, reliability=reliability, mean_error=mean_error, latest_error=latest_error)
+    return {
+        "status": "ok",
+        "sample_size": len(recent),
+        "bias": bias,
+        "mean_error_actual_minus_predicted": mean_error,
+        "mae": mae,
+        "directional_accuracy": direction_accuracy,
+        "latest_error_actual_minus_predicted": latest_error,
+        "latest_direction_correct": latest.get("direction_correct"),
+        "reliability": reliability,
+        "instruction": instruction,
+    }
+
+
+def _forecast_error_instruction(*, bias: str, reliability: str, mean_error: float | None, latest_error: float | None) -> str:
+    parts: list[str] = []
+    if reliability == "poor_directional_reliability":
+        parts.append("Recent forecast direction has been poor; do not let it veto tape, MA, A/D, StochRSI, or option-chain evidence.")
+    elif reliability == "mixed_directional_reliability":
+        parts.append("Recent forecast direction is mixed; use it only as weak evidence and demand agreement with live tape.")
+    else:
+        parts.append("Recent forecast direction is usable but still secondary to executable option edge and live tape.")
+    if bias == "under_predicted_actual_price":
+        parts.append("Forecasts have recently under-read actual price; adjust upward/upside scenarios and be careful rejecting calls only because the median forecast is flat or low.")
+    elif bias == "over_predicted_actual_price":
+        parts.append("Forecasts have recently over-read actual price; adjust downward/downside scenarios and be careful rejecting puts only because the median forecast is flat or high.")
+    if latest_error is not None and mean_error is not None and (latest_error > 0) != (mean_error > 0):
+        parts.append("Latest error differs from the recent bias, so treat the forecast as unstable and lean more on current price action.")
+    return " ".join(parts)
 
 
 def summarize_forecast_records(records: list[dict[str, Any]]) -> str:

@@ -128,6 +128,7 @@ def compact_market_packet(packet: dict[str, Any], *, max_contracts_per_side: int
         "price_data_interval": packet.get("price_data_interval"),
         "latest_underlying_price": packet.get("latest_underlying_price"),
         "account": packet.get("account") or {},
+        "shadow_trading_budget": packet.get("shadow_trading_budget") or {},
         "open_option_orders": packet.get("open_option_orders") or [],
         "option_positions": packet.get("option_positions") or [],
         "recent_option_trades": (packet.get("recent_option_trades") or [])[: max(0, int(max_trades))],
@@ -138,10 +139,13 @@ def compact_market_packet(packet: dict[str, Any], *, max_contracts_per_side: int
         "regime_transition_warning": packet.get("regime_transition_warning") or {},
         "option_tradeability_summary": packet.get("option_tradeability_summary") or {},
         "adaptive_profit_policy": packet.get("adaptive_profit_policy") or {},
+        "entry_mandate": packet.get("entry_mandate") or {},
+        "strategy_mode": packet.get("strategy_mode") or {},
         "strategy_knowledge": packet.get("strategy_knowledge") or {},
         "strategy_memory": packet.get("strategy_memory") or {},
         "external_forecasts": packet.get("external_forecasts") or {},
         "forecast_validation": packet.get("forecast_validation") or {},
+        "forecast_error_feedback": packet.get("forecast_error_feedback") or {},
         "recent_price_bars": (packet.get("recent_price_bars") or [])[-max(2, int(max_price_bars)) :],
         "option_chain": selected_chain,
         "api_contract": packet.get("api_contract") or {},
@@ -970,6 +974,181 @@ def adaptive_profit_protection(prices: pd.DataFrame, *, short_window: int = 20, 
     }
 
 
+def trend_carry_context(prices: pd.DataFrame, *, window: int = 45, pullback_window: int = 9) -> dict[str, Any]:
+    close = pd.to_numeric(prices.get("close"), errors="coerce").dropna()
+    if len(close) < max(window, 30):
+        return {"status": "insufficient_data", "window": window, "pullback_window": pullback_window}
+    recent = close.tail(window)
+    latest = float(recent.iloc[-1])
+    if latest == 0:
+        return {"status": "invalid_latest_price", "window": window, "pullback_window": pullback_window}
+    sma9 = close.rolling(9).mean()
+    sma21 = close.rolling(21).mean()
+    recent_sma9 = sma9.tail(window)
+    recent_sma21 = sma21.tail(window)
+    returns = recent.pct_change().dropna()
+    net_return = float(recent.iloc[-1] / recent.iloc[0] - 1.0)
+    positive_bar_ratio = float((returns > 0).mean()) if len(returns) else None
+    negative_bar_ratio = float((returns < 0).mean()) if len(returns) else None
+    monotonicity = None
+    if len(returns):
+        monotonicity = float(abs(returns.sum()) / returns.abs().sum()) if float(returns.abs().sum()) else 0.0
+    rolling_peak = recent.cummax()
+    rolling_trough = recent.cummin()
+    max_drawdown_from_peak = float(((recent / rolling_peak) - 1.0).min())
+    max_bounce_from_trough = float(((recent / rolling_trough) - 1.0).max())
+    recent_high = float(recent.max())
+    recent_low = float(recent.min())
+    distance_from_recent_high_pct = float(latest / recent_high - 1.0) if recent_high else None
+    distance_from_recent_low_pct = float(latest / recent_low - 1.0) if recent_low else None
+    lower_highs = _swing_lower_high_count(recent)
+    higher_lows = _swing_higher_low_count(recent)
+    sma_signal = _ma_crossover_signal(sma9, sma21)
+    latest_sma9 = _series_latest(sma9)
+    latest_sma21 = _series_latest(sma21)
+    sma9_slope = _series_change(recent_sma9.dropna(), min(8, max(1, len(recent_sma9.dropna()) - 1)))
+    sma21_slope = _series_change(recent_sma21.dropna(), min(8, max(1, len(recent_sma21.dropna()) - 1)))
+    pullback = close.tail(max(3, pullback_window))
+    failed_reclaim_sma9 = False
+    failed_reclaim_sma21 = False
+    failed_hold_sma9 = False
+    failed_hold_sma21 = False
+    if latest_sma9 is not None and len(pullback):
+        failed_reclaim_sma9 = bool(float(pullback.max()) >= latest_sma9 and latest < latest_sma9)
+        failed_hold_sma9 = bool(float(pullback.min()) <= latest_sma9 and latest > latest_sma9)
+    if latest_sma21 is not None and len(pullback):
+        failed_reclaim_sma21 = bool(float(pullback.max()) >= latest_sma21 and latest < latest_sma21)
+        failed_hold_sma21 = bool(float(pullback.min()) <= latest_sma21 and latest > latest_sma21)
+    state = "no_clear_trend_carry"
+    reason_codes: list[str] = []
+    if net_return <= -0.006:
+        reason_codes.append("net_down_window")
+    if net_return >= 0.006:
+        reason_codes.append("net_up_window")
+    if monotonicity is not None and monotonicity >= 0.35:
+        reason_codes.append("smooth_directional_drift")
+    if negative_bar_ratio is not None and negative_bar_ratio >= 0.52:
+        reason_codes.append("negative_bar_majority")
+    if positive_bar_ratio is not None and positive_bar_ratio >= 0.52:
+        reason_codes.append("positive_bar_majority")
+    if lower_highs >= 2:
+        reason_codes.append("lower_highs")
+    if higher_lows >= 2:
+        reason_codes.append("higher_lows")
+    if sma_signal.get("signal") in {"death_cross", "short_below_long"}:
+        reason_codes.append("sma9_below_sma21")
+    if sma_signal.get("signal") in {"golden_cross", "short_above_long"}:
+        reason_codes.append("sma9_above_sma21")
+    if failed_reclaim_sma9 or failed_reclaim_sma21:
+        reason_codes.append("pullback_failed_to_reclaim_ma")
+    if failed_hold_sma9 or failed_hold_sma21:
+        reason_codes.append("pullback_held_ma_support")
+    if distance_from_recent_high_pct is not None and distance_from_recent_high_pct <= -0.003 and ("sma9_below_sma21" in reason_codes or failed_reclaim_sma9 or failed_reclaim_sma21):
+        reason_codes.append("rejected_recent_high")
+    if distance_from_recent_low_pct is not None and distance_from_recent_low_pct >= 0.003 and ("sma9_above_sma21" in reason_codes or failed_hold_sma9 or failed_hold_sma21):
+        reason_codes.append("rejected_recent_low")
+    down_score = sum(
+        1
+        for code in (
+            "net_down_window",
+            "smooth_directional_drift",
+            "negative_bar_majority",
+            "lower_highs",
+            "sma9_below_sma21",
+            "pullback_failed_to_reclaim_ma",
+            "rejected_recent_high",
+        )
+        if code in reason_codes
+    )
+    up_score = sum(
+        1
+        for code in (
+            "net_up_window",
+            "smooth_directional_drift",
+            "positive_bar_majority",
+            "higher_lows",
+            "sma9_above_sma21",
+            "pullback_held_ma_support",
+            "rejected_recent_low",
+        )
+        if code in reason_codes
+    )
+    if down_score >= 4:
+        state = "trend_carry_down"
+        instruction = "Smooth net downside pressure is present. Consider a put trend-carry setup before a sharp breakdown only if the move is not already exhausted and put spread/theta/liquidity are acceptable."
+    elif up_score >= 4:
+        state = "trend_carry_up"
+        instruction = "Smooth net upside pressure is present. Consider a call trend-carry setup before a sharp breakout only if the move is not already exhausted and call spread/theta/liquidity are acceptable."
+    elif down_score >= 3 and "rejected_recent_high" in reason_codes:
+        state = "early_trend_carry_down"
+        instruction = "A recent high/rejection is rolling into bearish MA structure. Consider a small exploratory put before support breaks if option tradeability is good and the entry is still far enough from support to pay spread/theta."
+    elif up_score >= 3 and "rejected_recent_low" in reason_codes:
+        state = "early_trend_carry_up"
+        instruction = "A recent low/rejection is rolling into bullish MA structure. Consider a small exploratory call before resistance breaks if option tradeability is good and the entry is still far enough from resistance to pay spread/theta."
+    else:
+        instruction = "No strong trend-carry setup. Prefer scalp, mean-reversion, or hold logic unless evidence improves."
+    return {
+        "status": "ok",
+        "state": state,
+        "window": window,
+        "pullback_window": pullback_window,
+        "net_return_pct": net_return,
+        "positive_bar_ratio": positive_bar_ratio,
+        "negative_bar_ratio": negative_bar_ratio,
+        "monotonicity_score": monotonicity,
+        "max_drawdown_from_peak_pct": max_drawdown_from_peak,
+        "max_bounce_from_trough_pct": max_bounce_from_trough,
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "distance_from_recent_high_pct": distance_from_recent_high_pct,
+        "distance_from_recent_low_pct": distance_from_recent_low_pct,
+        "lower_high_count": lower_highs,
+        "higher_low_count": higher_lows,
+        "sma9_slope_pct": sma9_slope,
+        "sma21_slope_pct": sma21_slope,
+        "failed_reclaim_sma9": failed_reclaim_sma9,
+        "failed_reclaim_sma21": failed_reclaim_sma21,
+        "failed_hold_sma9": failed_hold_sma9,
+        "failed_hold_sma21": failed_hold_sma21,
+        "reason_codes": reason_codes,
+        "instruction": instruction,
+    }
+
+
+def multi_window_trend_carry_context(prices: pd.DataFrame) -> dict[str, Any]:
+    windows = [30, 60, 120, 180]
+    contexts = {str(window): trend_carry_context(prices, window=window, pullback_window=9) for window in windows}
+    usable = [item for item in contexts.values() if item.get("status") == "ok"]
+    states = [str(item.get("state") or "") for item in usable]
+    up_states = {"early_trend_carry_up", "trend_carry_up"}
+    down_states = {"early_trend_carry_down", "trend_carry_down"}
+    up_count = sum(1 for state in states if state in up_states)
+    down_count = sum(1 for state in states if state in down_states)
+    long_bias = "none"
+    if up_count >= 2:
+        long_bias = "multi_window_up"
+        instruction = "Multiple windows show upward carry. A call may be justified on pullbacks or early continuation, not only after an obvious breakout."
+    elif down_count >= 2:
+        long_bias = "multi_window_down"
+        instruction = "Multiple windows show downward carry. A put may be justified on failed bounces or early continuation, not only after an obvious breakdown."
+    elif any(state in up_states for state in states):
+        long_bias = "single_window_up"
+        instruction = "One window shows upward carry. Treat it as a potential early call clue, not a standalone trade command."
+    elif any(state in down_states for state in states):
+        long_bias = "single_window_down"
+        instruction = "One window shows downward carry. Treat it as a potential early put clue, not a standalone trade command."
+    else:
+        instruction = "No carry state is confirmed across windows."
+    return {
+        "status": "ok" if usable else "insufficient_data",
+        "windows": contexts,
+        "bias": long_bias,
+        "up_state_count": up_count,
+        "down_state_count": down_count,
+        "instruction": instruction,
+    }
+
+
 def technical_observations(prices: pd.DataFrame) -> dict[str, Any]:
     close = prices["close"].dropna()
     if close.empty:
@@ -986,6 +1165,8 @@ def technical_observations(prices: pd.DataFrame) -> dict[str, Any]:
     stoch_rsi = stochastic_rsi(close)
     ad_line = accumulation_distribution(prices)
     adaptive_profit = adaptive_profit_protection(prices)
+    carry = trend_carry_context(prices)
+    multi_carry = multi_window_trend_carry_context(prices)
     return {
         "latest_close": latest,
         "ema_9": None if pd.isna(fast.iloc[-1]) else float(fast.iloc[-1]),
@@ -1001,8 +1182,32 @@ def technical_observations(prices: pd.DataFrame) -> dict[str, Any]:
         "stochastic_rsi": stoch_rsi,
         "accumulation_distribution": ad_line,
         "adaptive_profit_protection": adaptive_profit,
+        "trend_carry_context": carry,
+        "multi_window_trend_carry": multi_carry,
         "note": "These are descriptive observations only, not a forecast or trade recommendation.",
     }
+
+
+def _swing_lower_high_count(series: pd.Series, *, lookback: int = 5) -> int:
+    clean = series.dropna().astype(float)
+    if len(clean) < lookback * 2:
+        return 0
+    highs = clean.rolling(lookback, min_periods=lookback).max().dropna()
+    if len(highs) < 3:
+        return 0
+    tail = highs.tail(6)
+    return int(sum(float(tail.iloc[index]) < float(tail.iloc[index - 1]) for index in range(1, len(tail))))
+
+
+def _swing_higher_low_count(series: pd.Series, *, lookback: int = 5) -> int:
+    clean = series.dropna().astype(float)
+    if len(clean) < lookback * 2:
+        return 0
+    lows = clean.rolling(lookback, min_periods=lookback).min().dropna()
+    if len(lows) < 3:
+        return 0
+    tail = lows.tail(6)
+    return int(sum(float(tail.iloc[index]) > float(tail.iloc[index - 1]) for index in range(1, len(tail))))
 
 
 def _json_default(value: Any) -> Any:

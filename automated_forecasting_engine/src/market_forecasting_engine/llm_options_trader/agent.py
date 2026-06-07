@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from market_forecasting_engine.llm_trader.responses_api import call_response
-from market_forecasting_engine.llm_trader.run import openai_client_for_provider, resolve_llm_model, resolve_llm_provider
+from market_forecasting_engine.llm_trader.run import load_env, openai_client_for_provider, resolve_llm_model, resolve_llm_provider
 from market_forecasting_engine.llm_options_trader.common import (
     LLMOptionsRuntimeConfig,
     apply_forecast_validation_to_transition,
@@ -29,7 +29,7 @@ from market_forecasting_engine.llm_options_trader.memory import (
     load_strategy_memory,
     update_strategy_memory_from_record,
 )
-from market_forecasting_engine.llm_options_trader.profiles import trader_profile
+from market_forecasting_engine.llm_options_trader.profiles import strategy_mode_profile, trader_profile
 from market_forecasting_engine.llm_options_trader.prompts import (
     COMBINED_JSON_SCHEMA,
     COMBINED_SYSTEM_MESSAGE,
@@ -49,7 +49,8 @@ from market_forecasting_engine.llm_options_trader.shadow_ledger import (
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    args = _load_config_overrides(build_parser().parse_args())
+    load_env(".env")
     output_dir = Path(args.output_dir)
     broker = live_broker() if args.account_mode == "live" else testnet_broker()
     config = runtime_config(args)
@@ -86,8 +87,10 @@ def run_once(*, args: argparse.Namespace, broker, config: LLMOptionsRuntimeConfi
     full_packet["execution_mode"] = "live_shadow_simulation" if args.simulation_only else args.account_mode
     if args.simulation_only:
         full_packet["shadow_simulation"] = load_and_update_shadow_state(output_dir=Path(args.output_dir), currency=config.currency, broker=broker)
+        full_packet["shadow_trading_budget"] = _shadow_trading_budget(args=args, config=config)
     full_packet["trader_profile"] = profile
     full_packet["entry_mandate"] = _entry_mandate(args.entry_bias)
+    full_packet["strategy_mode"] = strategy_mode_profile(args.strategy_mode)
     full_packet["trader_memory"] = load_recent_memory(Path(args.output_dir), config.currency, limit=int(args.memory_events))
     full_packet["strategy_memory"] = load_strategy_memory(Path(args.output_dir), config.currency, max_lessons=int(args.strategy_memory_lessons))
     full_packet["external_forecasts"] = {
@@ -108,6 +111,7 @@ def run_once(*, args: argparse.Namespace, broker, config: LLMOptionsRuntimeConfi
         forecast=full_packet["external_forecasts"]["chronos"],
         price_bars=full_packet.get("recent_price_bars") or [],
     )
+    full_packet["forecast_error_feedback"] = full_packet["forecast_validation"].get("error_feedback") or {}
     full_packet["regime_transition_warning"] = apply_forecast_validation_to_transition(
         full_packet.get("regime_transition_warning") or {},
         full_packet["forecast_validation"],
@@ -252,6 +256,7 @@ def run_once(*, args: argparse.Namespace, broker, config: LLMOptionsRuntimeConfi
             "enable_profit_policy_llm": bool(args.enable_profit_policy_llm),
             "profit_policy_llm_model": resolve_llm_model(args.profit_policy_llm_model or args.llm_model, provider=provider),
             "entry_bias": args.entry_bias,
+            "strategy_mode": args.strategy_mode,
         },
     }
     append_memory_event(Path(args.output_dir), config.currency, compact_decision_event(process="agent", record=record))
@@ -430,6 +435,29 @@ def _entry_mandate(entry_bias: str) -> dict:
     }
 
 
+def _shadow_trading_budget(*, args: argparse.Namespace, config: LLMOptionsRuntimeConfig) -> dict:
+    equity = max(0.0, float(args.shadow_account_equity))
+    max_entry_debit = max(0.0, float(args.shadow_max_entry_debit))
+    max_session_debit = max(max_entry_debit, float(args.shadow_max_session_debit))
+    return {
+        "mode": "simulation_only_budget",
+        "instruction": (
+            "For live_shadow_simulation, evaluate affordability and sizing from this simulated budget, not from the live wallet balance. "
+            "The live account is included only to show real venue/account context; Python will not submit real orders."
+        ),
+        "currency": config.instrument_currency,
+        "simulated_equity": equity,
+        "max_entry_debit": max_entry_debit,
+        "max_session_debit": max_session_debit,
+        "max_order_amount": config.max_order_amount,
+        "max_order_price": config.max_order_price,
+        "position_sizing_guidance": (
+            "Use the minimum executable amount for exploratory probes unless conviction and liquidity justify more. "
+            "Do not reject a trade solely because the real live wallet balance is smaller than this simulated budget."
+        ),
+    }
+
+
 def runtime_config(args: argparse.Namespace) -> LLMOptionsRuntimeConfig:
     return LLMOptionsRuntimeConfig(
         currency=args.currency,
@@ -447,8 +475,24 @@ def runtime_config(args: argparse.Namespace) -> LLMOptionsRuntimeConfig:
     )
 
 
+def _load_config_overrides(args: argparse.Namespace) -> argparse.Namespace:
+    config_path = Path(args.config) if getattr(args, "config", None) else None
+    if not config_path:
+        return args
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("--config must point to a JSON object.")
+    for key, value in payload.items():
+        attr = key.replace("-", "_")
+        if not hasattr(args, attr):
+            raise ValueError(f"Unknown Deribit LLM options config key `{key}`.")
+        setattr(args, attr, value)
+    return args
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Single LLM-authoritative Deribit testnet option trader.")
+    parser.add_argument("--config", default=None, help="Path to a JSON config file. CLI args are parsed first, then config values override them.")
     parser.add_argument("--account-mode", choices=("testnet", "live"), default="testnet")
     parser.add_argument("--currency", default="ETH", help="Deribit base currency, for example ETH, BTC, or another supported option currency.")
     parser.add_argument("--instrument-currency", default="USDC", help="Deribit instrument/account currency, for example USDC, ETH, or BTC.")
@@ -475,7 +519,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-profit-policy-llm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--profit-policy-llm-model", default=None)
     parser.add_argument("--entry-bias", choices=("unrestricted", "put_only", "call_only"), default="unrestricted")
+    parser.add_argument("--strategy-mode", default="crypto_options_directional")
     parser.add_argument("--trader-profile", default="gambit")
+    parser.add_argument("--shadow-account-equity", type=float, default=0.0, help="Simulated account equity for live-shadow strategy evaluation.")
+    parser.add_argument("--shadow-max-entry-debit", type=float, default=0.0, help="Maximum simulated debit for one live-shadow option entry.")
+    parser.add_argument("--shadow-max-session-debit", type=float, default=0.0, help="Maximum simulated debit for all live-shadow entries in one session.")
     parser.add_argument("--memory-events", type=int, default=12)
     parser.add_argument("--strategy-memory-lessons", type=int, default=12)
     parser.add_argument("--strategy-memory-max-lessons", type=int, default=24)

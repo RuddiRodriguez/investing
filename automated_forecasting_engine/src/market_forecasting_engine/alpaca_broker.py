@@ -28,7 +28,13 @@ def load_env_file() -> None:
 class AlpacaPaperBroker:
     def __init__(self, *, base_url: str | None = None, key_id: str | None = None, secret_key: str | None = None) -> None:
         load_env_file()
-        self.base_url = (base_url or os.getenv("ALPACA_TRADING_BASE_URL") or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets").rstrip("/")
+        self.base_url = _normalize_trading_base_url(
+            base_url
+            or os.getenv("ALPACA_TRADING_BASE_URL")
+            or os.getenv("APCA_API_BASE_URL")
+            or os.getenv("ALPACA_API_BASE_URL")
+            or "https://paper-api.alpaca.markets"
+        )
         self.data_base_url = (os.getenv("ALPACA_DATA_BASE_URL") or "https://data.alpaca.markets").rstrip("/")
         self.key_id = key_id or os.getenv("ALPACA_API_KEY_ID") or os.getenv("APCA_API_KEY_ID")
         self.secret_key = secret_key or os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
@@ -37,6 +43,9 @@ class AlpacaPaperBroker:
 
     def account(self) -> dict[str, Any]:
         return self._request("GET", "/v2/account")
+
+    def clock(self) -> dict[str, Any]:
+        return self._request("GET", "/v2/clock")
 
     def position(self, symbol: str) -> dict[str, Any] | None:
         attempted: list[str] = []
@@ -109,6 +118,15 @@ class AlpacaPaperBroker:
             if isinstance(snapshots, dict):
                 output.update(snapshots)
         return output
+
+    def crypto_snapshots(self, symbols: list[str], *, location: str | None = None) -> dict[str, Any]:
+        if not symbols:
+            return {}
+        params = {"symbols": ",".join(symbols)}
+        market = location or os.getenv("ALPACA_CRYPTO_LOCATION", "us")
+        payload = self._data_request("GET", f"/v1beta3/crypto/{quote(market, safe='')}/snapshots?" + urlencode(params))
+        snapshots = payload.get("snapshots", payload)
+        return snapshots if isinstance(snapshots, dict) else {}
 
     def stock_bars(
         self,
@@ -229,6 +247,13 @@ class AlpacaPaperBroker:
 def _env_search_paths() -> list[Path]:
     cwd = Path.cwd()
     return [cwd / ".env", *[parent / ".env" for parent in cwd.parents[:4]]]
+
+
+def _normalize_trading_base_url(value: str) -> str:
+    normalized = str(value or "").rstrip("/")
+    if normalized.endswith("/v2"):
+        normalized = normalized[: -len("/v2")]
+    return normalized
 
 
 def _position_symbol_candidates(symbol: str) -> list[str]:

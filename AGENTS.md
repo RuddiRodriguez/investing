@@ -15,5 +15,6 @@ When changing the forecasting, trading, options, broker, dashboard, or agent cod
 - Agents should make professional autonomous decisions inside the user-provided risk envelope: entry, order type, limit price, take profit, stop loss, stale-order abandonment, hold/no-trade, and exit management.
 - Avoid hidden behavior. If an agent blocks a trade, the reason must be visible in the terminal output, JSON report, and dashboard.
 - Tests should cover risk gates, sizing, order payload shape, broker constraints, and dashboard parsing for any ticker, not just TSLA.
+- Prefer shared/general trading, forecasting, shadow-execution, dashboard, and risk-management code across brokers. Add broker-specific behavior only when market structure or API constraints require it, and keep that difference explicit and configurable.
 
 The user expects momentum toward a serious paper-to-live trading system. When implementation details are open, choose the safer and more operationally complete design.

@@ -19,7 +19,10 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
     agent_report, agent_path = _read_report(state_dir, currency, "agent")
     entry_report, entry_path = _read_report(state_dir, currency, "entry")
     exit_report, exit_path = _read_report(state_dir, currency, "exit")
-    agent_log = _read_jsonl(state_dir / "logs" / f"{currency.upper()}_llm_agent.jsonl")
+    agent_log = _read_jsonl_any(
+        state_dir / "logs" / f"{currency.upper()}_llm_agent.jsonl",
+        state_dir / "logs" / f"{currency.upper()}_alpaca_llm_shadow_agent.jsonl",
+    )
     entry_log = _read_jsonl(state_dir / "logs" / f"{currency.upper()}_llm_entry_agent.jsonl")
     exit_log = _read_jsonl(state_dir / "logs" / f"{currency.upper()}_llm_exit_agent.jsonl")
     memory = _read_jsonl(state_dir / "memory" / f"{currency.upper()}_llm_trader_memory.jsonl")[-max_memory:]
@@ -58,6 +61,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
         "exit_report": exit_report,
         "summary": {
             "venue": packet.get("venue") or "deribit",
+            "asset_class": packet.get("asset_class") or ("option" if packet.get("option_chain") else None),
             "account_mode": packet.get("account_mode") or (latest.get("account_mode") if isinstance(latest, dict) else None),
             "execution_mode": packet.get("execution_mode") or ("simulation_only" if latest.get("simulation_only") else None),
             "latest_underlying_price": packet.get("latest_underlying_price"),
@@ -81,6 +85,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
             "strategy_lesson_count": len(strategy_memory.get("lessons") or []),
             "trader_profile": packet.get("trader_profile") or {},
             "llm_usage": llm_usage,
+            "spot_instrument": packet.get("spot_instrument") or {},
         },
         "account": account,
         "pnl": pnl,
@@ -100,6 +105,7 @@ def build_dashboard_state(*, state_dir: Path, currency: str, max_memory: int = 8
         "chronos_forecast": ((packet.get("external_forecasts") or {}).get("chronos") if isinstance(packet.get("external_forecasts"), dict) else {}) or {},
         "recent_price_bars": latest.get("dashboard_price_bars") or packet.get("recent_price_bars") or fallback_bars,
         "option_chain": packet.get("option_chain") or [],
+        "spot_instrument": packet.get("spot_instrument") or {},
         "trader_memory": memory,
         "llm_usage": llm_usage,
         "agent_history": agent_log[-80:],
@@ -237,8 +243,9 @@ def dashboard_html(refresh_seconds: int) -> str:
       <strong>LLM Usage / Cost</strong>
       <table><thead><tr><th>Process</th><th>Model</th><th>Calls</th><th>Input</th><th>Cached</th><th>Output</th><th>Total</th><th>Cost</th></tr></thead><tbody id="usageRows"></tbody></table>
     </section>
-    <section class="panel">
-      <strong>Option Chain Snapshot Given to LLM</strong>
+    <section class="panel" id="instrumentSection">
+      <strong id="instrumentTitle">Option Chain Snapshot Given to LLM</strong>
+      <div class="small" id="instrumentMeta">-</div>
       <table><thead><tr><th>Instrument</th><th>Type</th><th>Strike</th><th>DTE</th><th>Bid</th><th>Ask</th><th>Mark</th><th>Spread</th><th>Delta</th><th>Volume</th><th>OI</th></tr></thead><tbody id="chainRows"></tbody></table>
     </section>
     <section class="grid2">
@@ -313,7 +320,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("strategyKnowledge", JSON.stringify(data.strategy_knowledge || {{}}, null, 2));
       set("raw", JSON.stringify({{ agent_report:data.agent_report, entry_report:data.entry_report, exit_report:data.exit_report }}, null, 2));
 	      renderChart(data.recent_price_bars || [], data.chronos_forecast || {{}});
-      table("chainRows", (data.option_chain || []).slice(0, 80), row => [row.instrument_name, row.option_type, n(row.strike), n(row.dte), n(row.bid), n(row.ask), n(row.mark_price), pct(row.spread_pct), n(row.greeks?.delta), n(row.volume), n(row.open_interest)]);
+      renderInstrumentTable(data, s);
       table("usageRows", data.llm_usage?.rows || [], row => [row.process, row.model, n(row.calls), n(row.input_tokens), n(row.cached_input_tokens), n(row.output_tokens), n(row.total_tokens), m(row.estimated_cost_usd)]);
       table("ordersRows", data.open_option_orders || [], row => [row.instrument_name, row.direction, n(row.amount), n(row.price), row.order_state]);
       table("positionsRows", data.option_positions || [], row => [row.instrument_name, n(row.size), n(row.average_price), n(row.mark_price), n(row.floating_profit_loss)]);
@@ -329,6 +336,19 @@ def dashboard_html(refresh_seconds: int) -> str:
     }}
     function table(id, rows, mapper) {{
       document.getElementById(id).innerHTML = rows.length ? rows.map(row => `<tr>${{mapper(row).map(cell => `<td>${{cell ?? "-"}}</td>`).join("")}}</tr>`).join("") : `<tr><td colspan="12" class="small">No rows</td></tr>`;
+    }}
+    function renderInstrumentTable(data, summary) {{
+      const assetClass = summary.asset_class || data.agent_report?.market_packet?.asset_class || "";
+      if (assetClass === "crypto_spot") {{
+        const spot = data.spot_instrument || summary.spot_instrument || {{}};
+        set("instrumentTitle", "Spot Crypto Instrument Given to LLM");
+        set("instrumentMeta", "Alpaca does not provide crypto options here; this agent can only simulate spot buy/sell decisions for this symbol.");
+        table("chainRows", [spot], row => [row.symbol || data.currency, row.asset_class || "crypto_spot", "-", "-", "-", "-", "-", "-", "-", "-", "-"]);
+        return;
+      }}
+      set("instrumentTitle", "Option Chain Snapshot Given to LLM");
+      set("instrumentMeta", `${{(data.option_chain || []).length}} option rows`);
+      table("chainRows", (data.option_chain || []).slice(0, 80), row => [row.instrument_name, row.option_type, n(row.strike), n(row.dte), n(row.bid), n(row.ask), n(row.mark_price), pct(row.spread_pct), n(row.greeks?.delta), n(row.volume), n(row.open_interest)]);
     }}
 	    function renderChart(bars, chronos) {{
 	      const el = document.getElementById("priceChart");
@@ -543,7 +563,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def read_llm_usage(*, currency: str, state_dir: Path | None = None, provider: str | None = None) -> dict[str, Any]:
     root = Path("automated_forecasting_engine/runs/openai_usage")
-    wanted = {"llm_options_agent", "llm_options_entry_agent", "llm_options_exit_agent"}
+    wanted = {
+        "alpaca_llm_options_entry_agent",
+        "alpaca_llm_options_exit_agent",
+        "alpaca_llm_options_profit_policy",
+        "llm_options_agent",
+        "llm_options_entry_agent",
+        "llm_options_exit_agent",
+        "llm_options_profit_policy",
+    }
     wanted_state_dir = str(state_dir) if state_dir else None
     wanted_provider = str(provider).strip().lower() if provider else None
     groups: dict[tuple[str, str], dict[str, Any]] = {}
@@ -659,9 +687,13 @@ def _subdecision_summary(report: dict[str, Any], *, decision_key: str, result_ke
 
 def _read_report(state_dir: Path, currency: str, kind: str) -> tuple[dict[str, Any], Path | None]:
     if kind == "agent":
-        path = state_dir / f"{currency.upper()}_llm_agent_report.json"
+        paths = [
+            state_dir / f"{currency.upper()}_llm_agent_report.json",
+            state_dir / f"{currency.upper()}_alpaca_llm_shadow_report.json",
+        ]
     else:
-        path = state_dir / f"{currency.upper()}_llm_{kind}_agent_report.json"
+        paths = [state_dir / f"{currency.upper()}_llm_{kind}_agent_report.json"]
+    path = next((candidate for candidate in paths if candidate.exists()), paths[0])
     if not path.exists():
         return {}, None
     return _read_json(path), path
@@ -688,6 +720,14 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+    return rows
+
+
+def _read_jsonl_any(*paths: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        rows.extend(_read_jsonl(path))
+    rows.sort(key=lambda row: str(row.get("checked_at_utc") or row.get("generated_at_utc") or ""))
     return rows
 
 

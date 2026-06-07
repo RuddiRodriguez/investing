@@ -9,8 +9,11 @@ from market_forecasting_engine.llm_options_trader.common import (
     option_tradeability_summary,
     regime_transition_warning,
     short_tape_summary,
+    trend_carry_context,
+    multi_window_trend_carry_context,
 )
 from market_forecasting_engine.llm_options_trader.forecast_ledger import update_forecast_ledger
+from market_forecasting_engine.llm_options_trader.forecast_ledger import forecast_error_feedback
 from market_forecasting_engine.llm_options_trader.memory import load_strategy_memory, update_strategy_memory_from_record
 
 
@@ -95,6 +98,23 @@ def test_forecast_ledger_matures_prior_points_against_real_prices(tmp_path) -> N
     assert matured["recent_matured"][-1]["actual_price"] == 101.5
     assert matured["recent_matured"][-1]["error"] == -0.5
     assert "0.083333h" in matured["by_horizon"]
+    assert matured["error_feedback"]["status"] == "ok"
+    assert "instruction" in matured["error_feedback"]
+
+
+def test_forecast_error_feedback_teaches_llm_to_adjust_biased_forecasts() -> None:
+    feedback = forecast_error_feedback(
+        [
+            {"error": 2.0, "abs_error": 2.0, "direction_correct": False},
+            {"error": 1.0, "abs_error": 1.0, "direction_correct": False},
+            {"error": 1.5, "abs_error": 1.5, "direction_correct": True},
+        ]
+    )
+
+    assert feedback["bias"] == "under_predicted_actual_price"
+    assert feedback["reliability"] == "poor_directional_reliability"
+    assert "under-read actual price" in feedback["instruction"]
+    assert "rejecting calls" in feedback["instruction"]
 
 
 def test_llm_packet_includes_tape_transition_and_tradeability_inputs() -> None:
@@ -173,3 +193,119 @@ def test_llm_packet_includes_tape_transition_and_tradeability_inputs() -> None:
     assert tradeability["best_call_tradeability"]["grade"] == "good"
     assert packet["short_tape_summary"]["tape"] == "short_term_up"
     assert packet["option_tradeability_summary"]["best_call_tradeability"]["instrument_name"].endswith("-C")
+
+
+def test_trend_carry_context_detects_smooth_down_pressure() -> None:
+    start = datetime(2026, 6, 7, 10, 0, tzinfo=UTC)
+    rows = []
+    price = 1700.0
+    for index in range(70):
+        drift = -0.85
+        bounce = 1.4 if index % 11 in {0, 1} else 0.0
+        price += drift + bounce
+        rows.append(
+            {
+                "timestamp": start + timedelta(minutes=index),
+                "open": price + 0.25,
+                "high": price + 0.8,
+                "low": price - 0.8,
+                "close": price,
+                "volume": 20 + index,
+            }
+        )
+    import pandas as pd
+
+    prices = pd.DataFrame(rows).set_index("timestamp")
+    context = trend_carry_context(prices)
+
+    assert context["state"] == "trend_carry_down"
+    assert "net_down_window" in context["reason_codes"]
+    assert "smooth_directional_drift" in context["reason_codes"]
+    assert "sma9_below_sma21" in context["reason_codes"]
+
+
+def test_trend_carry_context_detects_smooth_up_pressure() -> None:
+    start = datetime(2026, 6, 7, 10, 0, tzinfo=UTC)
+    rows = []
+    price = 1600.0
+    for index in range(70):
+        drift = 0.85
+        dip = -1.4 if index % 11 in {0, 1} else 0.0
+        price += drift + dip
+        rows.append(
+            {
+                "timestamp": start + timedelta(minutes=index),
+                "open": price - 0.25,
+                "high": price + 0.8,
+                "low": price - 0.8,
+                "close": price,
+                "volume": 20 + index,
+            }
+        )
+    import pandas as pd
+
+    prices = pd.DataFrame(rows).set_index("timestamp")
+    context = trend_carry_context(prices)
+
+    assert context["state"] == "trend_carry_up"
+    assert "net_up_window" in context["reason_codes"]
+    assert "smooth_directional_drift" in context["reason_codes"]
+    assert "sma9_above_sma21" in context["reason_codes"]
+
+
+def test_trend_carry_context_detects_early_down_after_high_rejection() -> None:
+    start = datetime(2026, 6, 7, 17, 0, tzinfo=UTC)
+    prices = []
+    price = 1620.0
+    for index in range(20):
+        price += 0.8
+        prices.append(price)
+    for index in range(25):
+        bounce = 0.6 if index in {5, 12, 18} else 0.0
+        price += -0.55 + bounce
+        prices.append(price)
+    rows = [
+        {
+            "timestamp": start + timedelta(minutes=index),
+            "open": value + 0.2,
+            "high": value + 0.7,
+            "low": value - 0.7,
+            "close": value,
+            "volume": 20 + index,
+        }
+        for index, value in enumerate(prices)
+    ]
+    import pandas as pd
+
+    prices_frame = pd.DataFrame(rows).set_index("timestamp")
+    context = trend_carry_context(prices_frame)
+
+    assert context["state"] in {"early_trend_carry_down", "trend_carry_down"}
+    assert "rejected_recent_high" in context["reason_codes"]
+    assert "sma9_below_sma21" in context["reason_codes"]
+
+
+def test_multi_window_trend_carry_detects_steady_up_with_fluctuations() -> None:
+    start = datetime(2026, 6, 7, 15, 30, tzinfo=UTC)
+    rows = []
+    price = 1580.0
+    for index in range(170):
+        wave = -0.9 if index % 17 in {0, 1, 2} else 0.0
+        price += 0.32 + wave
+        rows.append(
+            {
+                "timestamp": start + timedelta(minutes=index),
+                "open": price - 0.15,
+                "high": price + 0.7,
+                "low": price - 0.7,
+                "close": price,
+                "volume": 30 + (index % 20),
+            }
+        )
+    import pandas as pd
+
+    prices = pd.DataFrame(rows).set_index("timestamp")
+    context = multi_window_trend_carry_context(prices)
+
+    assert context["bias"] in {"single_window_up", "multi_window_up"}
+    assert any((item.get("state") in {"early_trend_carry_up", "trend_carry_up"}) for item in context["windows"].values())
