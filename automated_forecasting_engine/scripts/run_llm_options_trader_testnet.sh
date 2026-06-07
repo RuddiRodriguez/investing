@@ -38,9 +38,9 @@ mkdir -p "$STATE_DIR"
 screen -S llm_options_entry_testnet -X quit 2>/dev/null || true
 screen -S llm_options_exit_testnet -X quit 2>/dev/null || true
 screen -S llm_options_agent_testnet -X quit 2>/dev/null || true
-pkill -f "market_forecasting_engine.llm_options_trader.entry_agent" 2>/dev/null || true
-pkill -f "market_forecasting_engine.llm_options_trader.exit_agent" 2>/dev/null || true
-pkill -f "market_forecasting_engine.llm_options_trader.agent" 2>/dev/null || true
+pkill -f "market_forecasting_engine.llm_options_trader.entry_agent.*$STATE_DIR" 2>/dev/null || true
+pkill -f "market_forecasting_engine.llm_options_trader.exit_agent.*$STATE_DIR" 2>/dev/null || true
+pkill -f "market_forecasting_engine.llm_options_trader.agent.*$STATE_DIR" 2>/dev/null || true
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') | LLM_OPTIONS_TESTNET | start combined LLM trader"
 screen -dmS llm_options_agent_testnet zsh -lc "
