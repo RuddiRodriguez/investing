@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
 from market_forecasting_engine.llm_trader.run import load_env, run_autonomous_trader
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
+from market_forecasting_engine.strategy_knowledge import DEFAULT_STRATEGY_CORPUS_DIR, DEFAULT_STRATEGY_INDEX_PATH
 
 
 def build_parser():
@@ -43,6 +44,12 @@ def build_parser():
     parser.add_argument("--horizons", default="1,5,30")
     parser.add_argument("--selection-metric", default="mae")
     parser.add_argument("--confidence-level", type=float, default=0.80)
+    parser.add_argument(
+        "--validation-workers",
+        type=int,
+        default=0,
+        help="Parallel workers for CPU-safe model validation refreshes. 0=auto bounded parallelism; -1=serial.",
+    )
     parser.add_argument("--calendar", default="XNYS")
     parser.add_argument("--chart-scale", choices=("log", "linear"), default="log")
     parser.add_argument("--no-lightgbm", action="store_true")
@@ -74,6 +81,23 @@ def build_parser():
     parser.add_argument("--no-web-search", action="store_true")
     parser.add_argument("--no-summary", action="store_true")
     parser.add_argument("--search-context-size", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument(
+        "--disable-strategy-knowledge",
+        action="store_true",
+        help="Disable default FAISS-backed book/strategy knowledge retrieval for forecast refresh CEO decisions.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-corpus-dir",
+        default=str(DEFAULT_STRATEGY_CORPUS_DIR),
+        help="Directory containing book/strategy documents for CEO retrieval.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-index",
+        default=str(DEFAULT_STRATEGY_INDEX_PATH),
+        help="FAISS index path for book/strategy knowledge.",
+    )
+    parser.add_argument("--strategy-knowledge-max-chunks", type=int, default=8)
+    parser.add_argument("--strategy-knowledge-rebuild-index", action="store_true")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress messages and only print watch actions.")
     parser.add_argument(
         "--quiet-unchanged",
@@ -124,7 +148,7 @@ def main():
             price_provider=price_snapshot.get("price_provider"),
         )
         progress(args, "ACTION", "evaluating watch levels")
-        action, reason = decide_action(decision, price, args.holding_status, market_status=price_snapshot)
+        action, reason = decide_action(decision, price, args.holding_status, market_status=price_snapshot, args=args)
         should_print = should_print_action(args, memory, action, reason)
         if should_print:
             print_loaded_advice(args, memory, decision_path, decision)
@@ -309,6 +333,11 @@ def append_decision_log(args, memory, decision, price, action, reason, printed=N
         record["portfolio_position_value"] = position.get("current_value")
         record["portfolio_unrealized_pl"] = position.get("unrealized_pl")
         record["portfolio_unrealized_pl_pct"] = position.get("unrealized_pl_pct")
+    owned_pnl = owned_position_pnl(price, args=args)
+    if owned_pnl:
+        record["owned_live_entry_price"] = owned_pnl.get("entry_price")
+        record["owned_live_unrealized_pl_pct"] = owned_pnl.get("unrealized_pl_pct")
+        record["owned_live_is_profitable"] = owned_pnl.get("is_profitable")
     if market_status:
         record["asset_class"] = market_status.get("asset_class")
         record["market_status"] = market_status.get("market_status")
@@ -391,7 +420,7 @@ def manual_price_snapshot(price):
     }
 
 
-def decide_action(decision, price, holding_status, market_status=None):
+def decide_action(decision, price, holding_status, market_status=None, args=None):
     if market_status and not market_status.get("is_tradable", True):
         return "HOLD", str(market_status.get("market_status") or "MARKET_NOT_TRADABLE").upper()
     entry = decision.get("entry_plan", {}) or {}
@@ -403,11 +432,16 @@ def decide_action(decision, price, holding_status, market_status=None):
     stop_loss = number(entry.get("stop_loss"))
     take_profit = number(entry.get("take_profit"))
     if holding_status == "owned":
+        position_pnl = owned_position_pnl(price, args=args)
         if stop_loss is not None and price <= stop_loss:
             return "SELL", "STOP_LOSS_REACHED"
         if take_profit is not None and price >= take_profit:
+            if position_pnl and not position_pnl["is_profitable"]:
+                return "HOLD", "TECHNICAL_TAKE_PROFIT_REACHED_BUT_POSITION_NOT_PROFITABLE"
             return "SELL", "TAKE_PROFIT_REACHED"
         if sell_near is not None and price >= sell_near:
+            if position_pnl and not position_pnl["is_profitable"]:
+                return "HOLD", "TECHNICAL_SELL_LEVEL_REACHED_BUT_POSITION_NOT_PROFITABLE"
             return "SELL", "SELL_LEVEL_REACHED"
         if decision_action == "Sell":
             return "SELL", "LLM_DECISION_SELL"
@@ -429,6 +463,32 @@ def decide_action(decision, price, holding_status, market_status=None):
     if decision_action == "Buy" and buy_near is None and buy_above is None:
         return "BUY", "LLM_DECISION_BUY_NO_LEVEL"
     return "HOLD", "WAITING_FOR_ADVICE_LEVEL"
+
+
+def owned_position_pnl(price, args=None):
+    entry_price = number(getattr(args, "entry_price", None)) if args is not None else None
+    portfolio_context = getattr(args, "portfolio_context", {}) if args is not None else {}
+    position = portfolio_context.get("position", {}) if isinstance(portfolio_context, dict) else {}
+    if entry_price is None:
+        entry_price = number(position.get("avg_cost"))
+    unrealized_pl = number(position.get("unrealized_pl"))
+    unrealized_pl_pct = number(position.get("unrealized_pl_pct"))
+    if entry_price is None and unrealized_pl is None and unrealized_pl_pct is None:
+        return None
+    if entry_price is not None:
+        return {
+            "entry_price": entry_price,
+            "unrealized_pl": unrealized_pl,
+            "unrealized_pl_pct": ((float(price) - entry_price) / entry_price * 100.0) if entry_price else unrealized_pl_pct,
+            "is_profitable": float(price) > entry_price,
+        }
+    return {
+        "entry_price": None,
+        "unrealized_pl": unrealized_pl,
+        "unrealized_pl_pct": unrealized_pl_pct,
+        "is_profitable": (unrealized_pl is not None and unrealized_pl > 0)
+        or (unrealized_pl_pct is not None and unrealized_pl_pct > 0),
+    }
 
 
 def print_alert(ticker, profile, price, action, reason, decision, holding_status):

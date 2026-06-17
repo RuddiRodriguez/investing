@@ -79,12 +79,35 @@ def test_trade_republic_watch_agent_plans_prefer_portfolio_tickers_and_include_c
     assert plans[1]["environment"]["STARTUP_DELAY_SECONDS"] == "300"
     assert plans[2]["environment"]["STARTUP_DELAY_SECONDS"] == "600"
     assert plans[1]["environment"]["PORTFOLIO_CONTEXT_FILE"].endswith("nvd.de_medium.json")
+    assert plans[1]["environment"]["VALIDATION_WORKERS"] == "0"
+    assert plans[1]["environment"]["STRATEGY_KNOWLEDGE_DISABLED"] == "0"
+    assert plans[1]["environment"]["STRATEGY_KNOWLEDGE_INDEX"] == "automated_forecasting_engine/strategy_knowledge/indexes/strategy_knowledge.faiss"
+    assert plans[1]["environment"]["STRATEGY_KNOWLEDGE_MAX_CHUNKS"] == "8"
     assert plans[1]["context"]["broker"] == "trade_republic"
     assert plans[1]["context"]["name"] == "NVIDIA"
     assert plans[1]["context"]["position"]["holding_status"] == "owned"
     assert plans[1]["context"]["position"]["avg_cost"] == 195.8304
     assert isinstance(plans[1]["plist_path"], Path)
     assert plans[2]["live_price_provider"] == "auto"
+
+
+def test_trade_republic_watch_agent_plans_skip_sold_portfolio_override(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "portfolio_overrides.json").write_text(
+        json.dumps({"sold": {"NVD.DE": {"status": "sold", "reason": "user sold position"}}}),
+        encoding="utf-8",
+    )
+
+    plans = build_agent_plans(
+        report=_report(),
+        project_dir=tmp_path,
+        state_dir="state",
+        profile="medium",
+        refresh_after_hours="12",
+    )
+
+    assert [plan["ticker"] for plan in plans] == ["2B76.DE", "BABA"]
 
 
 def test_trade_republic_watch_agent_calendar_and_provider_mapping() -> None:

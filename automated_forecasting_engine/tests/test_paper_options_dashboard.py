@@ -136,7 +136,10 @@ def test_recent_stock_bar_points_falls_back_to_iex(monkeypatch) -> None:
 
     monkeypatch.setattr("market_forecasting_engine.paper_options_dashboard.AlpacaPaperBroker", FakeBroker)
 
-    assert _recent_stock_bar_points("TSLA") == [{"timestamp": "2026-06-04T15:00:00Z", "price": 420.25}]
+    points = _recent_stock_bar_points("TSLA")
+    assert points[0]["timestamp"] == "2026-06-04T15:00:00Z"
+    assert points[0]["price"] == 420.25
+    assert points[0]["close"] == 420.25
 
 
 def test_summarize_position_pl_calculates_plain_english_status() -> None:

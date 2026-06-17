@@ -14,6 +14,7 @@ from market_forecasting_engine.chapter_13_unsupervised_risk import (
 )
 from market_forecasting_engine.chapter_13_eigen_trading import build_eigen_trading_plan
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine.portfolio_overrides import apply_open_position_overrides, load_portfolio_overrides
 from market_forecasting_engine.trade_republic_watch_agents import calendar_for_ticker, live_price_provider_for_ticker
 
 
@@ -86,6 +87,8 @@ def run_portfolio_brain(
     write_watch_contexts: bool = True,
     prices_by_ticker: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
+    overrides = load_portfolio_overrides(watch_state_dir / "portfolio_overrides.json")
+    report = apply_open_position_overrides(report, overrides)
     holdings = _watchable_holdings(report)
     current_values = {_watch_ticker(item): float(item.get("current_value") or 0.0) for item in holdings}
     prices = prices_by_ticker or download_universe_prices(holdings, start=start, end=end)

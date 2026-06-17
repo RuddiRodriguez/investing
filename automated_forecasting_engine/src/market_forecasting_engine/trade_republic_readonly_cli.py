@@ -30,7 +30,7 @@ def main() -> None:
         print(json.dumps(payload, indent=2, ensure_ascii=True))
         return
 
-    result = subprocess.run(command, check=False)
+    result = subprocess.run(command, check=False, env=_subprocess_env())
     raise SystemExit(result.returncode)
 
 
@@ -157,6 +157,13 @@ def _redacted_command(command: list[str]) -> list[str]:
         if item in {"--phone_no", "--pin", "--waf-token"}:
             redacted[index + 1] = "***"
     return redacted
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    scripts_dir = str(Path(sys.executable).resolve().parent)
+    env["PATH"] = scripts_dir + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def load_env_file() -> None:

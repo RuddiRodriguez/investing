@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -71,8 +71,17 @@ HIGHER_IS_BETTER_METRICS = {"directional_accuracy", "sharpe_ratio", "hit_rate", 
 class ForecastingEngine:
     """Automated model selection and governance pipeline for stock forecasts."""
 
-    def __init__(self, config: ForecastConfig) -> None:
+    def __init__(self, config: ForecastConfig, progress_callback: Callable[[dict[str, object]], None] | None = None) -> None:
         self.config = config
+        self.progress_callback = progress_callback
+
+    def _emit_progress(self, event: str, **payload: object) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback({"event": event, "ticker": self.config.ticker, **payload})
+        except Exception:
+            return
 
     def run(
         self,
@@ -80,6 +89,7 @@ class ForecastingEngine:
         data_manifest: dict[str, Any] | None = None,
         data_quality_report: dict[str, Any] | None = None,
         security_metadata: dict[str, Any] | None = None,
+        long_term_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_prices = normalize_price_frame(prices, target_column=self.config.target_column)
         if len(normalized_prices) < self.config.min_training_rows:
@@ -105,6 +115,17 @@ class ForecastingEngine:
                 target_column=self.config.target_column,
                 calendar_summary=summarize_calendar_alignment(normalized_prices),
                 security_metadata=security_metadata,
+            )
+        if long_term_context:
+            data_manifest.setdefault(
+                "long_term_sources",
+                {
+                    "status": long_term_context.get("status"),
+                    "providers_requested": long_term_context.get("providers_requested", []),
+                    "provider_summaries": long_term_context.get("provider_summaries", {}),
+                    "artifacts": long_term_context.get("artifacts", {}),
+                    "model_feature_policy": long_term_context.get("model_feature_policy", {}),
+                },
             )
 
         features = build_feature_frame(normalized_prices, target_column=self.config.target_column)
@@ -199,6 +220,7 @@ class ForecastingEngine:
         selected_validation_predictions: dict[str, list[dict[str, Any]]] = {}
 
         for horizon in self.config.horizons:
+            self._emit_progress("horizon_started", horizon_days=horizon)
             forecast, validation_results, model_card, validation_records = self._forecast_horizon(
                 horizon=horizon,
                 supervised=supervised,
@@ -213,6 +235,13 @@ class ForecastingEngine:
             all_candidate_results[str(horizon)] = validation_summaries_as_dict(validation_results)
             model_cards[str(horizon)] = model_card
             selected_validation_predictions[str(horizon)] = validation_records
+            self._emit_progress(
+                "horizon_completed",
+                horizon_days=horizon,
+                selected_model=forecast.selected_model,
+                expected_direction=forecast.expected_direction,
+                directional_confidence=forecast.directional_confidence,
+            )
 
         risk = _portfolio_risk_level(forecasts)
         raw_action = suggested_action(forecasts, risk=risk)
@@ -489,8 +518,19 @@ class ForecastingEngine:
             llm_timeout_seconds=self.config.llm_timeout_seconds,
             llm_env_file=self.config.llm_env_file,
             target_column=self.config.target_column,
+            long_term_context=long_term_context,
         )
         final_action = chapter_18_tactical_problem["final_action"]
+        final_decision_reasoning = _final_decision_reasoning(
+            final_action=final_action,
+            part_i_action=action,
+            raw_action=raw_action,
+            risk_level=risk,
+            decision_diagnostics=decision_diagnostics,
+            chapter_18_tactical_problem=chapter_18_tactical_problem,
+            forecasts=forecasts,
+            long_term_context=long_term_context,
+        )
         report = {
             "ticker": self.config.ticker.upper(),
             "as_of_date": as_of_date,
@@ -503,6 +543,7 @@ class ForecastingEngine:
             "forecasts": forecasts,
             "part_i_suggested_action": action,
             "suggested_action": final_action,
+            "final_decision_reasoning": final_decision_reasoning,
             "risk_level": risk,
             "risk_warning": _risk_warning(risk),
             "decision_view": {
@@ -513,6 +554,8 @@ class ForecastingEngine:
                 "tactical_plan": chapter_18_tactical_problem.get("trade_plan", {}),
                 "llm_review": chapter_18_tactical_problem.get("llm_review", {}),
                 "llm_safety_gate": chapter_18_tactical_problem.get("llm_safety_gate", {}),
+                "long_term_context": long_term_context or {},
+                "final_decision_reasoning": final_decision_reasoning,
             },
             "portfolio_view": {
                 "mark_to_market": chapter_18_tactical_problem.get("mark_to_market", {}),
@@ -577,6 +620,7 @@ class ForecastingEngine:
                 "chapter_18_tactical_problem": chapter_18_tactical_problem,
                 "chapter_18_tactical_plan": chapter_18_tactical_problem.get("trade_plan", {}),
                 "chapter_18_llm_review": chapter_18_tactical_problem.get("llm_review", {}),
+                "long_term_source_context": long_term_context or {},
                 "technical_history_quality": technical_history_quality,
                 "support_resistance_by_timeframe": support_resistance_by_timeframe,
                 "chart_metadata": _default_chart_metadata(
@@ -641,6 +685,7 @@ class ForecastingEngine:
                     "chapter_15_major_trendlines": chapter_15_major_trendlines.get("technical_method_card", {}),
                     "chapter_16_market_context": chapter_16_market_context.get("technical_method_card", {}),
                     "chapter_17_governance_context": chapter_17_governance_context.get("technical_method_card", {}),
+                    "long_term_source_context": (long_term_context or {}).get("technical_method_card", {}),
                 },
                 "tactical_method_cards": {
                     "chapter_18_tactical_problem": chapter_18_tactical_problem.get("technical_method_card", {}),
@@ -652,6 +697,7 @@ class ForecastingEngine:
                 "discipline_method_cards": {},
                 "model_cards": model_cards,
                 "security_metadata": security_metadata,
+                "long_term_source_context": long_term_context or {},
             },
             "diagnostics": {
                 "chapter_1_ml4t_workflow": chapter_1_ml4t_workflow,
@@ -708,6 +754,7 @@ class ForecastingEngine:
                 "chapter_18_tactical_problem": chapter_18_tactical_problem,
                 "chapter_18_tactical_plan": chapter_18_tactical_problem.get("trade_plan", {}),
                 "chapter_18_llm_review": chapter_18_tactical_problem.get("llm_review", {}),
+                "long_term_source_context": long_term_context or {},
                 "data_quality": data_quality_report,
                 "decision_diagnostics": decision_diagnostics,
                 "dow_action_filter": dow_action_filter,
@@ -818,6 +865,8 @@ class ForecastingEngine:
             purge_window=horizon if self.config.purge_window is None else self.config.purge_window,
             embargo_window=self.config.embargo_window,
             final_holdout_fraction=self.config.final_holdout_fraction,
+            validation_workers=self.config.validation_workers,
+            progress_callback=self.progress_callback,
         )
         ml4t_selection_adjustment = apply_ml4t_selection_adjustments(
             validation_results,
@@ -1043,6 +1092,8 @@ class ForecastingEngine:
             purge_window=horizon if self.config.purge_window is None else self.config.purge_window,
             embargo_window=self.config.embargo_window,
             final_holdout_fraction=self.config.final_holdout_fraction,
+            validation_workers=self.config.validation_workers,
+            progress_callback=self.progress_callback,
         )
         _, selected_summary, _ = select_candidate(validation_results, selection_metric=self.config.selection_metric)
         return selected_summary
@@ -1106,18 +1157,141 @@ def _safe_float(value: Any) -> float:
     return number if np.isfinite(number) else 0.0
 
 
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _final_decision_reasoning(
+    *,
+    final_action: str,
+    part_i_action: str,
+    raw_action: str,
+    risk_level: str,
+    decision_diagnostics: dict[str, Any],
+    chapter_18_tactical_problem: dict[str, Any],
+    forecasts: list[dict[str, Any]],
+    long_term_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    llm_review = chapter_18_tactical_problem.get("llm_review", {}) or {}
+    safety_gate = chapter_18_tactical_problem.get("llm_safety_gate", {}) or {}
+    preferred_forecast = chapter_18_tactical_problem.get("preferred_forecast") or (forecasts[0] if forecasts else {})
+    raw_json = llm_review.get("raw_json") if isinstance(llm_review.get("raw_json"), dict) else {}
+    rationale = llm_review.get("rationale") or raw_json.get("rationale")
+    final_advice = raw_json.get("final_advice") if isinstance(raw_json.get("final_advice"), dict) else None
+    if final_advice is None:
+        final_advice = _fallback_final_advice(chapter_18_tactical_problem)
+    risk_notes = llm_review.get("risk_notes") or raw_json.get("risk_notes") or []
+    if not isinstance(risk_notes, list):
+        risk_notes = [str(risk_notes)]
+
+    long_term = long_term_context or {}
+    provider_summaries = long_term.get("provider_summaries", {}) if isinstance(long_term.get("provider_summaries"), dict) else {}
+    decision_relevance = long_term.get("decision_relevance", {}) if isinstance(long_term.get("decision_relevance"), dict) else {}
+    conflicts = long_term.get("conflicts", []) if isinstance(long_term.get("conflicts"), list) else []
+    stale_fields = long_term.get("stale_fields", []) if isinstance(long_term.get("stale_fields"), list) else []
+
+    return {
+        "final_action": final_action,
+        "decision_source": "llm_review_with_safety_gate" if llm_review.get("status") == "executed" else "rule_based_tactical_gate",
+        "llm_status": llm_review.get("status"),
+        "llm_model": llm_review.get("model"),
+        "llm_recommended_action": llm_review.get("recommended_action"),
+        "llm_rationale": rationale,
+        "final_advice": final_advice,
+        "llm_risk_notes": risk_notes[:8],
+        "safety_gate_status": safety_gate.get("status"),
+        "safety_gate_reason": safety_gate.get("reason"),
+        "rule_based_action": chapter_18_tactical_problem.get("rule_based_action"),
+        "part_i_action": part_i_action,
+        "raw_model_action": raw_action,
+        "risk_level": risk_level,
+        "hold_reason": decision_diagnostics.get("hold_reason"),
+        "blocking_reasons": list(decision_diagnostics.get("blocking_reasons", []) or [])[:12],
+        "supporting_reasons": list(decision_diagnostics.get("supporting_reasons", []) or [])[:12],
+        "preferred_forecast": {
+            "horizon_days": preferred_forecast.get("horizon_days"),
+            "expected_direction": preferred_forecast.get("expected_direction"),
+            "expected_return": preferred_forecast.get("expected_return"),
+            "directional_confidence": preferred_forecast.get("directional_confidence"),
+            "predicted_price": preferred_forecast.get("predicted_price"),
+        },
+        "long_term_sources": {
+            "status": long_term.get("status"),
+            "providers_requested": long_term.get("providers_requested", []),
+            "provider_status": {
+                provider: summary.get("status")
+                for provider, summary in provider_summaries.items()
+                if isinstance(summary, dict)
+            },
+            "decision_relevance": decision_relevance,
+            "conflict_count": len(conflicts),
+            "stale_field_count": len(stale_fields),
+            "summary": long_term.get("summary") or long_term.get("consolidated_summary"),
+        },
+        "audit_note": (
+            "Final action is determined by the Chapter 18 tactical safety gate. "
+            "Executed LLM review may downgrade or support the rule-based action, but cannot bypass hard blockers."
+        ),
+    }
+
+
+def _fallback_final_advice(chapter_18_tactical_problem: dict[str, Any]) -> dict[str, Any]:
+    trade_plan = chapter_18_tactical_problem.get("trade_plan", {}) or {}
+    action = str(chapter_18_tactical_problem.get("final_action") or trade_plan.get("rule_based_action") or "Hold")
+    current_price = _finite_or_none(trade_plan.get("current_price"))
+    stop_plan = trade_plan.get("stop_plan", {}) if isinstance(trade_plan.get("stop_plan"), dict) else {}
+    target_plan = trade_plan.get("target_plan", {}) if isinstance(trade_plan.get("target_plan"), dict) else {}
+    stop = _finite_or_none(stop_plan.get("level"))
+    target = _finite_or_none(target_plan.get("level"))
+    if action == "Buy":
+        headline = f"Buy only if execution is near the current tactical level; target {target}, stop {stop}."
+        action_now = "buy_now"
+        why_not_buy_now = ""
+        why_not_sell_now = "The governed action is Buy, not Sell."
+    elif action == "Sell":
+        headline = f"Sell or reduce exposure near the current tactical level; downside objective {target}, invalidation {stop}."
+        action_now = "sell_now"
+        why_not_buy_now = "The governed action is Sell, so adding exposure is blocked."
+        why_not_sell_now = ""
+    else:
+        headline = "Hold. Wait for a better risk/reward setup before adding or exiting."
+        action_now = "hold"
+        why_not_buy_now = "The governed tactical action is Hold; no active buy commitment passed the gate."
+        why_not_sell_now = "The governed tactical action is Hold; no active sell commitment passed the gate."
+    return {
+        "headline": headline,
+        "action_now": action_now,
+        "buy_now_price": current_price if action == "Buy" else None,
+        "buy_lower_price": None,
+        "buy_above_breakout_price": None,
+        "sell_or_trim_price": current_price if action == "Sell" else None,
+        "take_profit_price": target if action == "Buy" else None,
+        "stop_loss_price": stop,
+        "invalidation_price": stop,
+        "expected_base_case": trade_plan.get("entry_policy") or "Follow the governed tactical action until a fresh forecast changes the setup.",
+        "why_not_buy_now": why_not_buy_now,
+        "why_not_sell_now": why_not_sell_now,
+    }
+
+
 def run_forecast(
     prices: pd.DataFrame,
     config: ForecastConfig,
     data_manifest: dict[str, Any] | None = None,
     data_quality_report: dict[str, Any] | None = None,
     security_metadata: dict[str, Any] | None = None,
+    long_term_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return ForecastingEngine(config).run(
         prices,
         data_manifest=data_manifest,
         data_quality_report=data_quality_report,
         security_metadata=security_metadata,
+        long_term_context=long_term_context,
     )
 
 
@@ -1288,6 +1462,8 @@ def _empirical_forecast_interval(
         upper_residual = float(z * residual_std)
         method = "normal_residual_fallback"
 
+    lower_residual = min(lower_residual, 0.0)
+    upper_residual = max(upper_residual, 0.0)
     lower_log_return = expected_log_return + lower_residual
     upper_log_return = expected_log_return + upper_residual
     if lower_log_return > upper_log_return:

@@ -25,6 +25,12 @@ STARTUP_DELAY_SECONDS="${STARTUP_DELAY_SECONDS:-0}"
 ACTIVE_TIMEZONE="${ACTIVE_TIMEZONE:-Europe/Amsterdam}"
 ACTIVE_START_LOCAL_TIME="${ACTIVE_START_LOCAL_TIME:-}"
 STOP_AFTER_LOCAL_TIME="${STOP_AFTER_LOCAL_TIME:-}"
+VALIDATION_WORKERS="${VALIDATION_WORKERS:-0}"
+STRATEGY_KNOWLEDGE_DISABLED="${STRATEGY_KNOWLEDGE_DISABLED:-0}"
+STRATEGY_KNOWLEDGE_CORPUS_DIR="${STRATEGY_KNOWLEDGE_CORPUS_DIR:-automated_forecasting_engine/strategy_knowledge/corpus}"
+STRATEGY_KNOWLEDGE_INDEX="${STRATEGY_KNOWLEDGE_INDEX:-automated_forecasting_engine/strategy_knowledge/indexes/strategy_knowledge.faiss}"
+STRATEGY_KNOWLEDGE_MAX_CHUNKS="${STRATEGY_KNOWLEDGE_MAX_CHUNKS:-8}"
+STRATEGY_KNOWLEDGE_REBUILD_INDEX="${STRATEGY_KNOWLEDGE_REBUILD_INDEX:-0}"
 
 if [[ "$STATE_DIR" = /* ]]; then
   STATE_ROOT="$STATE_DIR"
@@ -78,8 +84,19 @@ WATCH_ARGS=(
   --llm-env-file "$LLM_ENV_FILE"
   --calendar "$CALENDAR"
   --live-price-provider "$LIVE_PRICE_PROVIDER"
+  --validation-workers "$VALIDATION_WORKERS"
+  --strategy-knowledge-corpus-dir "$STRATEGY_KNOWLEDGE_CORPUS_DIR"
+  --strategy-knowledge-index "$STRATEGY_KNOWLEDGE_INDEX"
+  --strategy-knowledge-max-chunks "$STRATEGY_KNOWLEDGE_MAX_CHUNKS"
   --once
 )
+
+if [[ "$STRATEGY_KNOWLEDGE_DISABLED" == "1" || "$STRATEGY_KNOWLEDGE_DISABLED" == "true" || "$STRATEGY_KNOWLEDGE_DISABLED" == "TRUE" ]]; then
+  WATCH_ARGS+=(--disable-strategy-knowledge)
+fi
+if [[ "$STRATEGY_KNOWLEDGE_REBUILD_INDEX" == "1" || "$STRATEGY_KNOWLEDGE_REBUILD_INDEX" == "true" || "$STRATEGY_KNOWLEDGE_REBUILD_INDEX" == "TRUE" ]]; then
+  WATCH_ARGS+=(--strategy-knowledge-rebuild-index)
+fi
 
 if [[ -n "$ENTRY_PRICE" ]]; then
   WATCH_ARGS+=(--entry-price "$ENTRY_PRICE")

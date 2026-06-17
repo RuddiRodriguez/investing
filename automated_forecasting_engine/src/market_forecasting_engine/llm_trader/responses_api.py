@@ -20,6 +20,7 @@ def response_payload(
     item,
     use_web_search,
     search_context_size,
+    require_web_search=False,
 ):
     tools = []
     if use_web_search:
@@ -27,6 +28,7 @@ def response_payload(
             {
                 "type": "web_search",
                 "search_context_size": search_context_size,
+                "external_web_access": True,
                 "user_location": {
                     "type": "approximate",
                     "country": "US",
@@ -36,7 +38,7 @@ def response_payload(
         ]
     payload = {
         "model": model,
-        "tool_choice": "auto",
+        "tool_choice": "required" if use_web_search and require_web_search else "auto",
         "text": {"format": json_schema, "verbosity": "medium"},
         "input": [
             {
@@ -51,6 +53,8 @@ def response_payload(
         "store": False,
         "tools": tools,
     }
+    if use_web_search:
+        payload["include"] = ["web_search_call.action.sources"]
     if is_reasoning_model(model):
         payload["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
     return payload
@@ -72,6 +76,7 @@ def call_response(
     provider="openai",
     reasoning_effort=DEFAULT_REASONING_EFFORT,
     usage_context=None,
+    require_web_search=False,
 ):
     payload = response_payload(
         model=model,
@@ -82,6 +87,7 @@ def call_response(
         item=item,
         use_web_search=use_web_search,
         search_context_size=search_context_size,
+        require_web_search=require_web_search,
     )
     result = default_llm_handler(openai_client=client if provider == "openai" else None).predict(
         LLMRequest(provider=provider, model=model, payload=payload, usage_context=usage_context or {})

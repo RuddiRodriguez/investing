@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from market_forecasting_engine.portfolio_overrides import (
+    apply_open_position_overrides,
+    load_portfolio_overrides,
+)
+
 
 DEFAULT_REPORT = Path("automated_forecasting_engine/trade_republic_exports/investment_report_latest.json")
 DEFAULT_STATE_DIR = "automated_forecasting_engine/runs/watch_agent_state"
@@ -88,6 +93,8 @@ def build_agent_plans(
     max_holdings: int | None = None,
 ) -> list[dict[str, Any]]:
     plans = []
+    overrides = load_portfolio_overrides(project_dir / state_dir / "portfolio_overrides.json")
+    report = apply_open_position_overrides(report, overrides)
     summary = report.get("summary", {})
     holdings = [holding for holding in report.get("holdings", []) if _watch_ticker(holding)]
     if max_holdings is not None:
@@ -121,6 +128,12 @@ def build_agent_plans(
             "ACTIVE_START_LOCAL_TIME": str(active_start_local_time),
             "STOP_AFTER_LOCAL_TIME": str(stop_after_local_time),
             "OPENAI_USAGE_PROCESS_NAME": "watch_agent",
+            "VALIDATION_WORKERS": "0",
+            "STRATEGY_KNOWLEDGE_DISABLED": "0",
+            "STRATEGY_KNOWLEDGE_CORPUS_DIR": "automated_forecasting_engine/strategy_knowledge/corpus",
+            "STRATEGY_KNOWLEDGE_INDEX": "automated_forecasting_engine/strategy_knowledge/indexes/strategy_knowledge.faiss",
+            "STRATEGY_KNOWLEDGE_MAX_CHUNKS": "8",
+            "STRATEGY_KNOWLEDGE_REBUILD_INDEX": "0",
         }
         plans.append(
             {

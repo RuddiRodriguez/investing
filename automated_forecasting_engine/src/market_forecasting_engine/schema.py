@@ -15,6 +15,7 @@ class ForecastConfig:
     validation_window: int = 45
     step_size: int = 20
     max_splits: int = 8
+    validation_workers: int = 0
     selection_metric: str = "mae"
     confidence_level: float = 0.80
     purge_window: int | None = None
@@ -41,6 +42,8 @@ class ForecastConfig:
     llm_reasoning_effort: str = "none"
     llm_timeout_seconds: int = 30
     llm_env_file: str | None = None
+    enable_long_term_sources: bool = False
+    long_term_source_providers: tuple[str, ...] = ()
     enable_bayesian_heavy: bool = False
     bayesian_mcmc_draws: int = 300
     bayesian_mcmc_tune: int = 300
@@ -52,6 +55,7 @@ class ForecastConfig:
         data = asdict(self)
         data["horizons"] = list(self.horizons)
         data["optuna_families"] = list(self.optuna_families)
+        data["long_term_source_providers"] = list(self.long_term_source_providers)
         return data
 
 

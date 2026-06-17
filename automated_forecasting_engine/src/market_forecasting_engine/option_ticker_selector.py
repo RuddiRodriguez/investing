@@ -81,6 +81,7 @@ class OptionTickerSelectorConfig:
     min_selector_score: float = 55.0
     min_abs_forecast_return: float = 0.001
     min_intraday_rows: int = 120
+    max_underlying_price: float | None = None
     enable_llm_selection: bool = False
     llm_provider: str = "openai"
     llm_model: str = "gpt-4o-mini"
@@ -144,6 +145,9 @@ def evaluate_option_ticker(
     asset = _safe_asset(broker, ticker, reasons)
     prices = _safe_load_prices(ticker=ticker, config=config, now=now, reasons=reasons)
     price_metrics = _price_metrics(prices)
+    latest_price = _float_or_none(price_metrics.get("latest_price"))
+    if config.max_underlying_price is not None and latest_price is not None and latest_price > float(config.max_underlying_price):
+        reasons.append("underlying_price_above_selector_max")
     plan: dict[str, Any] | None = None
     forecast: dict[str, Any] | None = None
     trade_plan: dict[str, Any] | None = None
@@ -453,6 +457,7 @@ def _hard_blocking_reasons(reasons: list[str]) -> list[str]:
         "market_regime_blocks_directional_entry",
         "no_contract_passed_execution_gates",
         "position_size_below_one_contract",
+        "underlying_price_above_selector_max",
     }
     return [reason for reason in reasons if reason in exact or any(reason.startswith(prefix) for prefix in prefixes)]
 
@@ -488,6 +493,7 @@ def _trade_plan_summary(trade_plan: dict[str, Any]) -> dict[str, Any]:
             key: selected.get(key)
             for key in ("symbol", "name", "option_type", "expiration_date", "dte", "strike", "bid", "ask", "mid", "spread_pct", "delta", "open_interest", "premium", "score")
         },
+        "trade_quality": trade_plan.get("trade_quality") or selected.get("trade_quality"),
         "order": {key: order.get(key) for key in ("symbol", "side", "type", "qty", "limit_price", "time_in_force")},
         "risk": trade_plan.get("risk"),
     }

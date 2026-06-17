@@ -33,7 +33,47 @@ def test_autonomous_trader_payload_uses_responses_api_shape_and_web_search() -> 
     assert payload["input"][0]["role"] == "developer"
     assert payload["input"][1]["role"] == "user"
     assert payload["tools"][0]["type"] == "web_search"
+    assert payload["tools"][0]["external_web_access"] is True
+    assert payload["include"] == ["web_search_call.action.sources"]
     assert "AAPL" in payload["input"][1]["content"][0]["text"]
+
+
+def test_autonomous_trader_payload_can_require_web_search_with_json_schema() -> None:
+    payload = response_payload(
+        model="gpt-5.4-mini-2026-03-17",
+        system_message=autonomous_trader.system_message,
+        user_message=autonomous_trader.user_message,
+        json_schema=autonomous_trader.json_schema,
+        reasoning_effort="none",
+        item={
+            "today": "2026-06-15",
+            "ticker": "NVDA",
+            "trader_name": "test_trader",
+            "trader_profile_json": "{}",
+            "portfolio_context_json": "{}",
+            "technical_packet_json": "{}",
+        },
+        use_web_search=True,
+        search_context_size="medium",
+        require_web_search=True,
+    )
+
+    assert payload["tool_choice"] == "required"
+    assert payload["tools"] == [
+        {
+            "type": "web_search",
+            "search_context_size": "medium",
+            "external_web_access": True,
+            "user_location": {
+                "type": "approximate",
+                "country": "US",
+                "timezone": "Europe/Amsterdam",
+            },
+        }
+    ]
+    assert payload["text"]["format"]["type"] == "json_schema"
+    assert payload["text"]["format"]["name"] == "autonomous_trader_decision"
+    assert payload["include"] == ["web_search_call.action.sources"]
 
 
 def test_nontechnical_summary_payload_uses_second_prompt_without_web_search() -> None:
@@ -152,6 +192,10 @@ def test_build_technical_packet_extracts_decision_and_risk_controls() -> None:
         "decision_view": {
             "production_gate": {"allowed_forecast_count": 0},
             "mean_reversion_dip_buy": {"best_setup": {"entry_price": 95.0}},
+            "strategy_knowledge_context": {
+                "status": "executed",
+                "synthesis": {"entry_rules": ["Prefer disciplined entries."]},
+            },
             "chapter_18_tactical_problem": {
                 "final_action": "Hold",
                 "rule_based_action": "Hold",
@@ -203,7 +247,15 @@ def test_build_technical_packet_extracts_decision_and_risk_controls() -> None:
     assert packet["decision_governance"]["chapter_19_status"] == "pass"
     assert packet["decision_governance"]["production_gate"]["allowed_forecast_count"] == 0
     assert packet["decision_governance"]["mean_reversion_dip_buy"]["best_setup"]["entry_price"] == 95.0
+    assert packet["decision_governance"]["strategy_knowledge_context"]["status"] == "executed"
     assert packet["decision_governance"]["trade_risk_commitment"]["commitment_type"] == "active_review_no_new_commitment"
     assert packet["decision_governance"]["portfolio_capital_gate"]["allocation_status"] == "not_applicable"
     assert packet["options_decision"]["best_trade"]["action"] == "buy_call"
     assert packet["trend"]["chapter_13_support"]["center"] == 95.0
+
+
+def test_autonomous_trader_schema_requires_strategy_knowledge_read() -> None:
+    analysis_schema = autonomous_trader.json_schema["schema"]["properties"]["analysis"]
+
+    assert "strategy_knowledge_read" in analysis_schema["properties"]
+    assert "strategy_knowledge_read" in analysis_schema["required"]

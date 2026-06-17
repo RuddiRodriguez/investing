@@ -26,6 +26,12 @@ from market_forecasting_engine.data_providers import DataRequest, load_prices_wi
 from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.dip_buy import annotate_mean_reversion_dip_buy, historical_reversal_stats
 from market_forecasting_engine.governance import write_audit_bundle
+from market_forecasting_engine.long_term_enrichment import (
+    DEFAULT_LONG_TERM_SOURCE_PROVIDERS,
+    enrich_prices_with_long_term_sources,
+    long_term_context_manifest_entry,
+    parse_long_term_source_providers,
+)
 from market_forecasting_engine.llm_trader.prompts import autonomous_trader
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import call_response, response_payload
@@ -75,7 +81,8 @@ def main() -> None:
     parser.add_argument("--options-min-edge-pct", type=float, default=None, help="Minimum expected value over ask for options candidates; defaults from risk profile.")
     parser.add_argument("--options-max-spread-pct", type=float, default=None, help="Maximum bid/ask spread over mid for options candidates; defaults from risk profile.")
     parser.add_argument("--options-min-probability-breakeven", type=float, default=None, help="Minimum probability of finishing beyond option breakeven; defaults from risk profile.")
-    parser.add_argument("--enable-llm-decision", action="store_true", help="Run the autonomous LLM trader as a final governed decision layer.")
+    parser.add_argument("--enable-llm-decision", action="store_true", default=True, help="Run the autonomous LLM trader as a final governed decision layer. Enabled by default.")
+    parser.add_argument("--disable-llm-decision", action="store_false", dest="enable_llm_decision", help="Disable the default autonomous LLM decision layer for this run.")
     parser.add_argument("--llm-dry-run", action="store_true", help="Build the LLM decision packet without calling the LLM.")
     parser.add_argument("--llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai")
     parser.add_argument("--llm-model", default=None, help=f"Defaults to OPENAI_MODEL or {DEFAULT_OPENAI_MODEL}.")
@@ -84,6 +91,15 @@ def main() -> None:
     parser.add_argument("--llm-env-file", default=None)
     parser.add_argument("--llm-no-web-search", action="store_true")
     parser.add_argument("--llm-search-context-size", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument("--disable-long-term-sources", action="store_true", help="Disable default long-term source enrichment for this run.")
+    parser.add_argument(
+        "--long-term-source-providers",
+        default=",".join(DEFAULT_LONG_TERM_SOURCE_PROVIDERS),
+        help="Comma-separated long-term source providers to call.",
+    )
+    parser.add_argument("--long-term-source-env-file", default=None, help="Optional .env file for long-term source API keys.")
+    parser.add_argument("--long-term-source-output-dir", default=None, help="Optional artifact directory for raw long-term source payloads.")
+    parser.add_argument("--long-term-source-snapshot-dir", default=None, help="Durable directory for point-in-time long-term source snapshots.")
     parser.add_argument("--trader-name", default="daily_intraday_trader")
     parser.add_argument("--holding-status", choices=("not_owned", "owned"), default="not_owned")
     parser.add_argument("--entry-price", type=float, default=None)
@@ -159,6 +175,8 @@ def main() -> None:
         )
     if args.enable_llm_decision:
         report["llm_trader"] = _run_daily_llm_decision(report, args, dry_run=bool(args.llm_dry_run))
+    report.setdefault("decision_view", {})["final_decision_reasoning"] = _daily_final_decision_reasoning(report, args)
+    report["final_decision_reasoning"] = report["decision_view"]["final_decision_reasoning"]
     if output_dir is not None and not args.no_plot:
         report.setdefault("artifacts", {}).update(write_plot_artifacts(report, prices, output_dir, target_column=args.target_column))
         report["artifacts"].update(_write_hour_named_validation_aliases(report, output_dir))
@@ -248,6 +266,28 @@ def _run_advanced_hourly_forecast(
     provider_metadata: dict,
     forecast_hours: tuple[float, ...],
 ) -> dict:
+    output_dir = _resolve_output_dir(args.output_dir, args.output)
+    long_term_context = None
+    long_term_snapshot_metadata = None
+    if not args.disable_long_term_sources:
+        long_term_output_dir = (
+            Path(args.long_term_source_output_dir)
+            if args.long_term_source_output_dir
+            else ((output_dir / "long_term_sources") if output_dir else None)
+        )
+        prices, long_term_context, long_term_snapshot_metadata = enrich_prices_with_long_term_sources(
+            ticker=args.ticker,
+            prices=prices,
+            target_column=args.target_column,
+            enabled=True,
+            providers=parse_long_term_source_providers(args.long_term_source_providers),
+            env_file=args.long_term_source_env_file or args.llm_env_file,
+            output_dir=long_term_output_dir,
+            snapshot_dir=args.long_term_source_snapshot_dir,
+            data_store=None,
+            start_date=args.start,
+            end_date=args.end,
+        )
     interval_minutes = trade_report.get("interval_minutes") or infer_bar_interval_minutes(prices.index) or _interval_to_minutes(args.interval)
     if interval_minutes is None:
         interval_minutes = 5.0
@@ -269,6 +309,11 @@ def _run_advanced_hourly_forecast(
         security_metadata=security_metadata,
         calendar_summary=calendar_summary,
     )
+    if long_term_context:
+        data_manifest["long_term_sources"] = long_term_context_manifest_entry(
+            long_term_context,
+            long_term_snapshot_metadata,
+        )
     config = ForecastConfig(
         ticker=args.ticker,
         horizons=horizons,
@@ -285,6 +330,8 @@ def _run_advanced_hourly_forecast(
         tactical_profile="short_term",
         forecast_interval=args.interval,
         forecast_interval_minutes=float(interval_minutes),
+        enable_long_term_sources=not args.disable_long_term_sources,
+        long_term_source_providers=parse_long_term_source_providers(args.long_term_source_providers),
     )
     try:
         report = ForecastingEngine(config).run(
@@ -292,6 +339,7 @@ def _run_advanced_hourly_forecast(
             data_manifest=data_manifest,
             data_quality_report=data_quality_report,
             security_metadata=security_metadata,
+            long_term_context=long_term_context,
         )
     except Exception as exc:
         report = _run_compact_intraday_model_report(
@@ -654,6 +702,60 @@ def _run_daily_llm_decision(report: dict, args: argparse.Namespace, *, dry_run: 
         "llm_prompt_payload": payload,
         "llm_raw_response": raw_response,
         "policy": "LLM decision is advisory/governed context. Deterministic risk and broker gates still control execution.",
+    }
+
+
+def _daily_final_decision_reasoning(report: dict, args: argparse.Namespace) -> dict[str, Any]:
+    llm = report.get("llm_trader") if isinstance(report.get("llm_trader"), dict) else {}
+    decision = llm.get("decision") if isinstance(llm.get("decision"), dict) else {}
+    production_gate = report.get("decision_view", {}).get("production_gate", {})
+    dip_buy = report.get("decision_view", {}).get("mean_reversion_dip_buy", {})
+    long_term_context = report.get("decision_view", {}).get("long_term_context", {})
+    provider_summaries = (
+        long_term_context.get("provider_summaries", {})
+        if isinstance(long_term_context.get("provider_summaries"), dict)
+        else {}
+    )
+    return {
+        "final_action": decision.get("decision") or report.get("suggested_action"),
+        "decision_source": "autonomous_llm_trader" if llm.get("status") == "executed" else "deterministic_daily_gate",
+        "llm_status": llm.get("status") or ("disabled" if not getattr(args, "enable_llm_decision", False) else None),
+        "llm_model": llm.get("model"),
+        "llm_confidence": decision.get("confidence"),
+        "llm_technical_read": decision.get("technical_read"),
+        "llm_market_context_read": decision.get("market_context_read"),
+        "llm_decision_reasoning": decision.get("decision_reasoning"),
+        "llm_sentiment": decision.get("sentiment"),
+        "final_advice": decision.get("final_advice") or {},
+        "entry_plan": decision.get("entry_plan") or {},
+        "portfolio_plan": decision.get("portfolio_plan") or {},
+        "rule_blocks": decision.get("rule_blocks") or [],
+        "risks": decision.get("risks") or [],
+        "change_triggers": decision.get("change_triggers") or [],
+        "production_gate": {
+            "allowed_forecast_count": production_gate.get("allowed_forecast_count"),
+            "provider_quality_warning": production_gate.get("provider_quality_warning"),
+            "policy": production_gate.get("policy"),
+        },
+        "mean_reversion_dip_buy": {
+            "status": dip_buy.get("status"),
+            "best_setup": dip_buy.get("best_setup"),
+            "policy": dip_buy.get("policy"),
+        },
+        "long_term_sources": {
+            "status": long_term_context.get("status"),
+            "providers_requested": long_term_context.get("providers_requested", []),
+            "provider_status": {
+                provider: summary.get("status")
+                for provider, summary in provider_summaries.items()
+                if isinstance(summary, dict)
+            },
+            "decision_relevance": long_term_context.get("decision_relevance", {}),
+        },
+        "audit_note": (
+            "The autonomous LLM receives the technical packet, portfolio context, news/sentiment, "
+            "long-term sources, and dip-buy context. Deterministic broker/risk gates still control execution."
+        ),
     }
 
 

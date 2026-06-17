@@ -10,6 +10,7 @@ import pandas as pd
 
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
 from market_forecasting_engine.openai_responses import call_response
+from market_forecasting_engine.long_term_sources import compact_long_term_context_for_llm
 
 
 VALID_ACTIONS = {"Buy", "Hold", "Sell"}
@@ -62,6 +63,7 @@ def analyze_chapter_18_tactical_problem(
     llm_env_file: str | None = None,
     llm_review_override: dict[str, Any] | None = None,
     target_column: str = "close",
+    long_term_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the Chapter 18 tactical plan and optional governed LLM review."""
 
@@ -123,6 +125,7 @@ def analyze_chapter_18_tactical_problem(
         rule_gate=rule_gate,
         mark_to_market=mark_to_market,
         chapter_17_llm_packet=chapter_17_llm_packet or {},
+        long_term_context=long_term_context,
     )
     llm_review = _llm_review_override_or_execute(
         override=llm_review_override,
@@ -161,6 +164,7 @@ def analyze_chapter_18_tactical_problem(
         "llm_safety_gate": safety_gate,
         "llm_review_packet": llm_packet,
         "mark_to_market": mark_to_market,
+        "long_term_context": compact_long_term_context_for_llm(long_term_context),
         "decision_policy": {
             "mode": "rule_first_optional_llm_review",
             "influences_final_action": True,
@@ -542,6 +546,7 @@ def _llm_review_packet(
     rule_gate: dict[str, Any],
     mark_to_market: dict[str, Any],
     chapter_17_llm_packet: dict[str, Any],
+    long_term_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "task": "Review a rule-based tactical trade plan. Return JSON only.",
@@ -567,10 +572,25 @@ def _llm_review_packet(
         "rule_gate": rule_gate,
         "mark_to_market": mark_to_market,
         "chapter_17_context": chapter_17_llm_packet,
+        "long_term_context": compact_long_term_context_for_llm(long_term_context),
         "required_json_schema": {
             "recommended_action": "Buy|Hold|Sell",
             "confidence": "number from 0 to 1",
             "rationale": "short explanation",
+            "final_advice": {
+                "headline": "actionable final advice",
+                "action_now": "buy_now|sell_now|hold|wait|avoid|trim_or_reduce",
+                "buy_now_price": "number|null",
+                "buy_lower_price": "number|null",
+                "buy_above_breakout_price": "number|null",
+                "sell_or_trim_price": "number|null",
+                "take_profit_price": "number|null",
+                "stop_loss_price": "number|null",
+                "invalidation_price": "number|null",
+                "expected_base_case": "what to expect if the decision is right",
+                "why_not_buy_now": "specific blocker when not buying now",
+                "why_not_sell_now": "specific reason when not selling now",
+            },
             "risk_notes": ["short risk note"],
             "rule_consistency": "consistent|downgrade|invalid_override_request",
         },
@@ -726,6 +746,38 @@ def _openai_tactical_review_schema() -> dict[str, Any]:
                 "final_action": {"type": "string", "enum": ["Buy", "Hold", "Sell"]},
                 "confidence": {"type": "number"},
                 "rationale": {"type": "string"},
+                "final_advice": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "headline": {"type": "string"},
+                        "action_now": {"type": "string", "enum": ["buy_now", "sell_now", "hold", "wait", "avoid", "trim_or_reduce"]},
+                        "buy_now_price": {"type": ["number", "null"]},
+                        "buy_lower_price": {"type": ["number", "null"]},
+                        "buy_above_breakout_price": {"type": ["number", "null"]},
+                        "sell_or_trim_price": {"type": ["number", "null"]},
+                        "take_profit_price": {"type": ["number", "null"]},
+                        "stop_loss_price": {"type": ["number", "null"]},
+                        "invalidation_price": {"type": ["number", "null"]},
+                        "expected_base_case": {"type": "string"},
+                        "why_not_buy_now": {"type": "string"},
+                        "why_not_sell_now": {"type": "string"},
+                    },
+                    "required": [
+                        "headline",
+                        "action_now",
+                        "buy_now_price",
+                        "buy_lower_price",
+                        "buy_above_breakout_price",
+                        "sell_or_trim_price",
+                        "take_profit_price",
+                        "stop_loss_price",
+                        "invalidation_price",
+                        "expected_base_case",
+                        "why_not_buy_now",
+                        "why_not_sell_now",
+                    ],
+                },
                 "risk_notes": {"type": "array", "items": {"type": "string"}},
                 "rule_consistency": {"type": "string"},
             },
@@ -734,6 +786,7 @@ def _openai_tactical_review_schema() -> dict[str, Any]:
                 "final_action",
                 "confidence",
                 "rationale",
+                "final_advice",
                 "risk_notes",
                 "rule_consistency",
             ],

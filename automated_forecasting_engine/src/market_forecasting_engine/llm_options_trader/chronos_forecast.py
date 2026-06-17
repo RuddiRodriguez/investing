@@ -70,7 +70,6 @@ def _build_chronos_forecast_uncached(
     num_samples: int,
 ) -> dict[str, Any]:
     import torch
-    from chronos import ChronosPipeline
 
     closes = [_float_or_none(row.get("close")) for row in price_bars]
     timestamps = [_parse_timestamp(row.get("timestamp")) for row in price_bars]
@@ -85,10 +84,20 @@ def _build_chronos_forecast_uncached(
     prediction_length = max(horizon_steps.values())
     context = torch.tensor([float(close) for _, close in series], dtype=torch.float32)
     pipeline = _pipeline(model_name)
-    samples = pipeline.predict(context, prediction_length=prediction_length, num_samples=max(8, int(num_samples)))
-    if samples.ndim == 3:
-        samples = samples[0]
-    quantiles = torch.quantile(samples.float(), torch.tensor([0.1, 0.5, 0.9]), dim=0)
+    if "chronos-bolt" in model_name.lower() or "chronos-2" in model_name.lower():
+        samples = pipeline.predict(context, prediction_length=prediction_length)
+        if samples.ndim == 3:
+            samples = samples[0]
+        samples = samples.float()
+        if samples.shape[0] >= 3:
+            quantiles = samples[:3]
+        else:
+            quantiles = torch.vstack([samples[0], samples[0], samples[-1]])
+    else:
+        samples = pipeline.predict(context, prediction_length=prediction_length, num_samples=max(8, int(num_samples)))
+        if samples.ndim == 3:
+            samples = samples[0]
+        quantiles = torch.quantile(samples.float(), torch.tensor([0.1, 0.5, 0.9]), dim=0)
     forecast_path = []
     for step in range(1, prediction_length + 1):
         forecast_path.append(
@@ -150,14 +159,16 @@ def _pipeline(model_name: str):
     if model_name in _PIPELINE_CACHE:
         return _PIPELINE_CACHE[model_name]
     import torch
-    from chronos import ChronosPipeline
+    from chronos import ChronosBoltPipeline, ChronosPipeline
 
     kwargs = {"device_map": "cpu"}
     try:
         kwargs["dtype"] = torch.float32
-        pipeline = ChronosPipeline.from_pretrained(model_name, **kwargs)
+        pipeline_class = ChronosBoltPipeline if "chronos-bolt" in model_name.lower() or "chronos-2" in model_name.lower() else ChronosPipeline
+        pipeline = pipeline_class.from_pretrained(model_name, **kwargs)
     except TypeError:
-        pipeline = ChronosPipeline.from_pretrained(model_name)
+        pipeline_class = ChronosBoltPipeline if "chronos-bolt" in model_name.lower() or "chronos-2" in model_name.lower() else ChronosPipeline
+        pipeline = pipeline_class.from_pretrained(model_name)
     _PIPELINE_CACHE[model_name] = pipeline
     return pipeline
 

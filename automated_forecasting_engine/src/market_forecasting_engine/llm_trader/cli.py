@@ -4,6 +4,7 @@ from pathlib import Path
 
 from market_forecasting_engine.llm_trader.run import run_autonomous_trader
 from market_forecasting_engine.openai_models import DEFAULT_OPENAI_MODEL, DEFAULT_REASONING_EFFORT
+from market_forecasting_engine.strategy_knowledge import DEFAULT_STRATEGY_CORPUS_DIR, DEFAULT_STRATEGY_INDEX_PATH
 
 
 def build_parser():
@@ -19,6 +20,12 @@ def build_parser():
     parser.add_argument("--horizons", default="1,5,30")
     parser.add_argument("--selection-metric", default="mae")
     parser.add_argument("--confidence-level", type=float, default=0.80)
+    parser.add_argument(
+        "--validation-workers",
+        type=int,
+        default=0,
+        help="Parallel workers for CPU-safe model validation. 0=auto bounded parallelism; -1=serial. Deep-learning/GPU candidates run serially.",
+    )
     parser.add_argument("--calendar", default="XNYS")
     parser.add_argument("--chart-scale", choices=("log", "linear"), default="log")
     parser.add_argument("--no-lightgbm", action="store_true")
@@ -48,6 +55,23 @@ def build_parser():
     parser.add_argument("--no-web-search", action="store_true")
     parser.add_argument("--no-summary", action="store_true")
     parser.add_argument("--search-context-size", choices=("low", "medium", "high"), default="medium")
+    parser.add_argument(
+        "--disable-strategy-knowledge",
+        action="store_true",
+        help="Disable default FAISS-backed book/strategy knowledge retrieval for the CEO LLM.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-corpus-dir",
+        default=str(DEFAULT_STRATEGY_CORPUS_DIR),
+        help="Directory containing book/strategy documents for CEO retrieval.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-index",
+        default=str(DEFAULT_STRATEGY_INDEX_PATH),
+        help="FAISS index path for book/strategy knowledge.",
+    )
+    parser.add_argument("--strategy-knowledge-max-chunks", type=int, default=8)
+    parser.add_argument("--strategy-knowledge-rebuild-index", action="store_true")
     parser.add_argument(
         "--prompt",
         default=str(Path(__file__).parent / "prompts" / "autonomous_trader.py"),

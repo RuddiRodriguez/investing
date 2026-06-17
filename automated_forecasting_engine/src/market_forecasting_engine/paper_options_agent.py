@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import time
@@ -9,6 +10,7 @@ from uuid import uuid4
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -21,8 +23,10 @@ from market_forecasting_engine.alpaca_options_trader import (
     submit_option_order,
 )
 from market_forecasting_engine.daily_trade import DailyTradeConfig, build_daily_trade_plan
+from market_forecasting_engine.daily_trade_cli import _annotate_production_decision, _run_advanced_hourly_forecast
 from market_forecasting_engine.data import normalize_price_frame
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine.llm_options_trader.chronos_forecast import build_chronos_forecast
 from market_forecasting_engine.risk_profiles import risk_profile_for_name
 
 
@@ -135,6 +139,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", default="1m")
     parser.add_argument("--lookback-days", type=int, default=20)
     parser.add_argument("--forecast-hours", default="0.25,0.5,0.75,1", help="Forecast horizons in hours. Defaults match the ETH-style 15m/30m/45m/1h dashboard path; trading uses the shortest horizon first.")
+    parser.add_argument("--forecast-engine", choices=("advanced", "rule_based", "chronos"), default="advanced", help="advanced uses validated intraday models; chronos uses an Amazon Chronos time-series model as the forecast source; rule_based uses only recent drift plus signal tilt.")
+    parser.add_argument("--selection-metric", default="mae", help="Model selection metric for the advanced intraday forecasting engine.")
+    parser.add_argument(
+        "--search-level",
+        choices=("realtime", "fast", "expanded", "medium", "broad"),
+        default="realtime",
+        help="Candidate breadth for the advanced intraday forecasting engine. `realtime` keeps validated models light enough for autonomous loops.",
+    )
+    parser.add_argument("--no-lightgbm", action="store_true", help="Disable LightGBM candidates in the advanced intraday forecasting engine.")
+    parser.add_argument("--no-statistical-models", action="store_true", help="Disable statistical candidates in the advanced intraday forecasting engine.")
+    parser.add_argument("--transaction-cost-bps", type=float, default=2.0)
+    parser.add_argument("--chronos-model", default="amazon/chronos-bolt-tiny", help="Amazon Chronos model name used when --forecast-engine chronos.")
+    parser.add_argument("--chronos-context-rows", type=int, default=512)
+    parser.add_argument("--chronos-num-samples", type=int, default=40)
+    parser.add_argument("--chronos-refresh-seconds", type=int, default=300)
     parser.add_argument("--check-interval-seconds", type=int, default=60)
     parser.add_argument("--forecast-refresh-seconds", type=int, default=900)
     parser.add_argument("--max-training-rows", type=int, default=3500)
@@ -170,6 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit-price-offset-pct", type=float, default=0.03)
     parser.add_argument("--entry-order-policy", choices=("auto", "limit"), default="auto")
     parser.add_argument("--exit-order-policy", choices=("auto", "stop_limit", "trailing_stop", "take_profit"), default="auto")
+    parser.add_argument("--option-strategy-mode", choices=("directional", "auto", "long_straddle", "short_iron_butterfly", "long_call_calendar", "long_put_calendar"), default="directional", help="directional buys one call/put; auto may choose supported paper multi-leg strategies; explicit modes force one strategy.")
+    parser.add_argument("--enable-multi-leg", action=argparse.BooleanOptionalAction, default=False, help="Allow Alpaca paper multi-leg option entry orders.")
+    parser.add_argument("--enable-short-option-strategies", action=argparse.BooleanOptionalAction, default=False, help="Allow defined-risk multi-leg strategies that contain short option legs. Paper only unless live approval and risk controls are reviewed.")
+    parser.add_argument("--max-legs", type=int, default=2, help="Maximum legs allowed in a multi-leg paper option entry.")
+    parser.add_argument("--straddle-max-debit-multiplier", type=float, default=1.0, help="Multiplier applied to max-total-debit for a two-leg long straddle.")
+    parser.add_argument("--iron-butterfly-wing-width-pct", type=float, default=0.05, help="Approximate wing distance from the center strike as a fraction of underlying price.")
+    parser.add_argument("--calendar-near-min-dte", type=int, default=1)
+    parser.add_argument("--calendar-near-max-dte", type=int, default=7)
+    parser.add_argument("--calendar-far-min-dte", type=int, default=8)
+    parser.add_argument("--calendar-far-max-dte", type=int, default=35)
     parser.add_argument("--stop-loss-pct", type=float, default=None)
     parser.add_argument("--take-profit-pct", type=float, default=None)
     parser.add_argument("--profit-lock-trigger-pct", type=float, default=None, help="When an option is up by this fraction, raise the stop to protect part of the open profit.")
@@ -274,16 +303,8 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     now = datetime.now(UTC)
     prices: pd.DataFrame | None = None
     if forecast_bundle is None or _forecast_is_stale(forecast_bundle, now, int(args.forecast_refresh_seconds)):
-        prices = _load_prices(args)
-        plan = build_daily_trade_plan(
-            prices,
-            DailyTradeConfig(
-                ticker=args.ticker.upper(),
-                interval=args.interval,
-                forecast_hours=tuple(float(value.strip()) for value in args.forecast_hours.split(",") if value.strip()),
-                minimum_score_to_trade=1.5 if args.risk_profile == "aggressive" else 2.0,
-            ),
-        )
+        prices, provider_metadata = _load_prices_with_metadata(args)
+        plan = build_options_forecast_plan(args=args, prices=prices, provider_metadata=provider_metadata)
         forecast = _primary_forecast(plan)
         forecast["account_equity"] = _float_or_none(account.get("equity"))
         forecast_bundle = {
@@ -339,6 +360,16 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
         abandon_entry_after_seconds=int(args.abandon_entry_after_seconds),
         entry_order_policy=args.entry_order_policy,
         exit_order_policy=args.exit_order_policy,
+        option_strategy_mode=args.option_strategy_mode,
+        enable_multi_leg=bool(args.enable_multi_leg),
+        enable_short_option_strategies=bool(args.enable_short_option_strategies),
+        max_legs=int(args.max_legs),
+        straddle_max_debit_multiplier=float(args.straddle_max_debit_multiplier),
+        iron_butterfly_wing_width_pct=float(args.iron_butterfly_wing_width_pct),
+        calendar_near_min_dte=int(args.calendar_near_min_dte),
+        calendar_near_max_dte=int(args.calendar_near_max_dte),
+        calendar_far_min_dte=int(args.calendar_far_min_dte),
+        calendar_far_max_dte=int(args.calendar_far_max_dte),
     )
     trade_plan = build_real_option_trade_plan(
         broker=broker,
@@ -627,6 +658,11 @@ def _client_symbol_part(symbol: str) -> str:
 
 
 def _load_prices(args: argparse.Namespace) -> pd.DataFrame:
+    prices, _ = _load_prices_with_metadata(args)
+    return prices
+
+
+def _load_prices_with_metadata(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
     start = (datetime.now(UTC) - timedelta(days=int(args.lookback_days))).isoformat().replace("+00:00", "Z")
     feed = str(getattr(args, "alpaca_data_feed", "") or "").strip().lower()
     env_feed = feed if str(args.provider).lower() == "alpaca" and feed and feed != "auto" else None
@@ -641,7 +677,246 @@ def _load_prices(args: argparse.Namespace) -> pd.DataFrame:
     prices = normalize_price_frame(result.frame, target_column="close")
     if args.max_training_rows and len(prices) > int(args.max_training_rows):
         prices = prices.tail(int(args.max_training_rows))
-    return prices
+    return prices, dict(result.metadata or {})
+
+
+def build_options_forecast_plan(
+    *,
+    args: argparse.Namespace,
+    prices: pd.DataFrame,
+    provider_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    forecast_hours = tuple(float(value.strip()) for value in str(args.forecast_hours).split(",") if value.strip())
+    rule_based = build_daily_trade_plan(
+        prices,
+        DailyTradeConfig(
+            ticker=args.ticker.upper(),
+            interval=args.interval,
+            forecast_hours=forecast_hours,
+            minimum_score_to_trade=1.5 if args.risk_profile == "aggressive" else 2.0,
+            transaction_cost_bps=float(getattr(args, "transaction_cost_bps", 2.0)),
+        ),
+    )
+    rule_based["data_provider"] = provider_metadata
+    if str(getattr(args, "forecast_engine", "advanced")) == "rule_based":
+        rule_based["forecast_engine"] = {
+            "selected": "rule_based",
+            "method": "recent_intraday_drift_plus_signal_tilt",
+            "reason": "Explicit --forecast-engine rule_based.",
+        }
+        return rule_based
+    if str(getattr(args, "forecast_engine", "advanced")) == "chronos":
+        return _build_chronos_options_forecast_plan(args=args, prices=prices, provider_metadata=provider_metadata, rule_based=rule_based)
+
+    advanced_args = SimpleNamespace(
+        ticker=args.ticker.upper(),
+        target_column="close",
+        interval=args.interval,
+        selection_metric=getattr(args, "selection_metric", "mae"),
+        transaction_cost_bps=float(getattr(args, "transaction_cost_bps", 2.0)),
+        no_lightgbm=bool(getattr(args, "no_lightgbm", False)),
+        no_statistical_models=bool(getattr(args, "no_statistical_models", False)),
+        search_level=_normalize_advanced_search_level(getattr(args, "search_level", "realtime")),
+        risk_profile=getattr(args, "risk_profile", "aggressive"),
+    )
+    advanced = _run_advanced_hourly_forecast(
+        prices=prices,
+        trade_report=rule_based,
+        args=advanced_args,
+        provider_metadata=provider_metadata,
+        forecast_hours=forecast_hours,
+    )
+    try:
+        _annotate_production_decision(
+            advanced,
+            prices,
+            "close",
+            risk_profile_name=str(getattr(args, "risk_profile", "aggressive")),
+        )
+    except Exception as exc:
+        advanced.setdefault("diagnostics", {})["production_decision_annotation_error"] = str(exc)
+    return _normalize_advanced_forecast_for_options(advanced, rule_based)
+
+
+def _build_chronos_options_forecast_plan(
+    *,
+    args: argparse.Namespace,
+    prices: pd.DataFrame,
+    provider_metadata: dict[str, Any],
+    rule_based: dict[str, Any],
+) -> dict[str, Any]:
+    forecast_hours = tuple(float(value.strip()) for value in str(args.forecast_hours).split(",") if value.strip())
+    price_bars = _prices_to_chronos_bars(prices)
+    chronos = build_chronos_forecast(
+        price_bars=price_bars,
+        forecast_hours=forecast_hours,
+        data_interval=str(args.interval),
+        model_name=str(getattr(args, "chronos_model", "amazon/chronos-bolt-tiny")),
+        context_rows=int(getattr(args, "chronos_context_rows", 512)),
+        num_samples=int(getattr(args, "chronos_num_samples", 40)),
+        refresh_seconds=int(getattr(args, "chronos_refresh_seconds", 300)),
+        enabled=True,
+    )
+    latest_price = _float_or_none(chronos.get("as_of_price")) or _float_or_none(rule_based.get("latest_price"))
+    horizon_points = chronos.get("preferred_horizon_points") or chronos.get("horizon_points") or []
+    forecasts: list[dict[str, Any]] = []
+    for point in horizon_points:
+        predicted = _float_or_none(point.get("predicted_price"))
+        hours = _float_or_none(point.get("horizon_hours"))
+        if predicted is None or hours is None:
+            continue
+        expected_return = (predicted / latest_price - 1.0) if latest_price else 0.0
+        direction = "Upward" if expected_return > 0 else "Downward" if expected_return < 0 else "Flat"
+        forecasts.append(
+            {
+                "horizon_hours": hours,
+                "forecast_timestamp": point.get("timestamp"),
+                "forecast_date": point.get("timestamp"),
+                "predicted_price": predicted,
+                "lower_price": _float_or_none(point.get("lower_price")),
+                "upper_price": _float_or_none(point.get("upper_price")),
+                "expected_return": expected_return,
+                "expected_log_return": None if expected_return <= -1 else math.log1p(expected_return),
+                "expected_direction": direction,
+                "directional_confidence": _chronos_directional_confidence(point, latest_price),
+                "selected_model": chronos.get("model"),
+                "selected_model_family": "amazon_chronos_time_series_foundation_model",
+                "method": chronos.get("preferred_source") or "chronos_forecast",
+                "trade_allowed": chronos.get("status") == "ok" and direction in {"Upward", "Downward"},
+                "validation_gate": {
+                    "trade_allowed": chronos.get("status") == "ok",
+                    "status": "pass" if chronos.get("status") == "ok" else "blocked",
+                    "reasons": [] if chronos.get("status") == "ok" else [chronos.get("reason") or "chronos_forecast_unavailable"],
+                    "source": "chronos_zero_shot_forecast_no_local_candidate_comparison",
+                },
+                "chronos_signal": point,
+            }
+        )
+    plan = {
+        **rule_based,
+        "mode": "chronos_time_series_forecast",
+        "latest_price": latest_price,
+        "as_of": chronos.get("as_of_timestamp") or rule_based.get("as_of"),
+        "forecasts": forecasts,
+        "forecast_hours": list(forecast_hours),
+        "data_provider": provider_metadata,
+        "chronos_forecast": chronos,
+        "forecast_engine": {
+            "selected": "chronos",
+            "model": chronos.get("model"),
+            "status": chronos.get("status"),
+            "preferred_source": chronos.get("preferred_source"),
+            "fallback_from_full_engine": False,
+            "policy": "Chronos-only paper options run: no comparison against the advanced candidate pool.",
+        },
+        "config": {
+            **(rule_based.get("config") or {}),
+            "forecast_engine": "chronos",
+            "chronos_model": chronos.get("model"),
+        },
+    }
+    if not forecasts:
+        plan["forecasts"] = [
+            {
+                "horizon_hours": forecast_hours[0] if forecast_hours else 0.25,
+                "forecast_timestamp": chronos.get("as_of_timestamp") or rule_based.get("as_of"),
+                "forecast_date": chronos.get("as_of_timestamp") or rule_based.get("as_of"),
+                "predicted_price": latest_price,
+                "lower_price": latest_price,
+                "upper_price": latest_price,
+                "expected_return": 0.0,
+                "expected_log_return": 0.0,
+                "expected_direction": "Flat",
+                "selected_model": chronos.get("model"),
+                "selected_model_family": "amazon_chronos_time_series_foundation_model",
+                "method": "chronos_unavailable_hold",
+                "trade_allowed": False,
+                "validation_gate": {
+                    "trade_allowed": False,
+                    "status": "blocked",
+                    "reasons": [chronos.get("reason") or "chronos_forecast_unavailable"],
+                    "source": "chronos_zero_shot_forecast_no_local_candidate_comparison",
+                },
+            }
+        ]
+    return plan
+
+
+def _prices_to_chronos_bars(prices: pd.DataFrame) -> list[dict[str, Any]]:
+    bars: list[dict[str, Any]] = []
+    for timestamp, row in prices.iterrows():
+        close = _float_or_none(row.get("close"))
+        if close is None:
+            continue
+        bars.append(
+            {
+                "timestamp": pd.Timestamp(timestamp).isoformat(),
+                "open": _float_or_none(row.get("open")) or close,
+                "high": _float_or_none(row.get("high")) or close,
+                "low": _float_or_none(row.get("low")) or close,
+                "close": close,
+                "volume": _float_or_none(row.get("volume")),
+            }
+        )
+    return bars
+
+
+def _chronos_directional_confidence(point: dict[str, Any], latest_price: float | None) -> float:
+    predicted = _float_or_none(point.get("predicted_price"))
+    lower = _float_or_none(point.get("lower_price"))
+    upper = _float_or_none(point.get("upper_price"))
+    if latest_price is None or predicted is None or lower is None or upper is None:
+        return 0.5
+    band = max(abs(upper - lower), abs(latest_price) * 0.0001, 1e-9)
+    move = abs(predicted - latest_price)
+    return max(0.5, min(0.95, 0.5 + move / band))
+
+
+def _normalize_advanced_search_level(value: Any) -> str:
+    normalized = str(value or "realtime").strip().lower()
+    if normalized in {"medium", "broad"}:
+        return "expanded"
+    if normalized in {"realtime", "fast", "expanded"}:
+        return normalized
+    return "realtime"
+
+
+def _normalize_advanced_forecast_for_options(advanced: dict[str, Any], rule_based: dict[str, Any]) -> dict[str, Any]:
+    latest_price = _float_or_none(advanced.get("current_price")) or _float_or_none(rule_based.get("latest_price"))
+    if latest_price is not None:
+        advanced["latest_price"] = latest_price
+    advanced["as_of"] = advanced.get("as_of_timestamp") or rule_based.get("as_of")
+    advanced["vwap"] = rule_based.get("vwap")
+    advanced["opening_range"] = rule_based.get("opening_range")
+    advanced["signals"] = rule_based.get("signals")
+    advanced["trade_plan"] = rule_based.get("trade_plan")
+    advanced["requires_intraday_data"] = True
+    advanced["has_intraday_data"] = rule_based.get("has_intraday_data")
+    advanced["interval_minutes"] = advanced.get("forecast_interval_minutes") or rule_based.get("interval_minutes")
+    advanced["source_rows"] = rule_based.get("source_rows")
+    advanced["session_rows"] = rule_based.get("session_rows")
+    advanced["data_warning"] = rule_based.get("data_warning")
+    advanced["config"] = {
+        **(rule_based.get("config") or {}),
+        "forecast_engine": "advanced",
+        "advanced_mode": advanced.get("mode"),
+    }
+    for forecast in advanced.get("forecasts", []) or []:
+        forecast.setdefault("forecast_timestamp", forecast.get("forecast_date"))
+        forecast.setdefault("method", forecast.get("selected_model") or advanced.get("mode") or "advanced_intraday_hourly_forecast")
+        expected_direction = str(forecast.get("expected_direction") or "")
+        if expected_direction == "Up":
+            forecast["expected_direction"] = "Upward"
+        elif expected_direction == "Down":
+            forecast["expected_direction"] = "Downward"
+    advanced["forecast_engine"] = {
+        "selected": "advanced",
+        "mode": advanced.get("mode"),
+        "fallback_from_full_engine": bool((advanced.get("diagnostics") or {}).get("fallback_from_full_engine")),
+        "fallback_reason": (advanced.get("diagnostics") or {}).get("fallback_reason"),
+        "policy": "Paper options use the validated intraday forecast pipeline by default; rule-based daily_trade_view is context/fallback only.",
+    }
+    return advanced
 
 
 @contextmanager
@@ -688,6 +963,7 @@ def execution_block_reasons(
     if max_exposure is not None and max_exposure > 0 and current_exposure + planned_debit > max_exposure:
         reasons.append("max_open_option_exposure_reached")
     planned_symbol = ((trade_plan.get("order") or {}).get("symbol") or "").upper()
+    planned_leg_symbols = [str(leg.get("symbol") or "").upper() for leg in ((trade_plan.get("order") or {}).get("legs") or [])]
     planned_option_type = _option_type_from_symbol(planned_symbol)
     if planned_option_type and not bool(getattr(args, "allow_mixed_option_direction", False)):
         existing_types = {
@@ -702,6 +978,10 @@ def execution_block_reasons(
             if str(order.get("symbol") or "").upper() == planned_symbol:
                 reasons.append("same_contract_order_already_open")
                 break
+    if planned_leg_symbols and not args.allow_duplicate_contract_order:
+        open_symbols = {str(order.get("symbol") or "").upper() for order in open_orders}
+        if any(symbol in open_symbols for symbol in planned_leg_symbols):
+            reasons.append("same_contract_leg_order_already_open")
     return list(dict.fromkeys(reasons))
 
 
@@ -750,6 +1030,16 @@ def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
         "max_open_option_exposure": float(args.max_open_option_exposure),
         "max_realized_loss_per_day": float(args.max_realized_loss_per_day),
         "allow_mixed_option_direction": bool(getattr(args, "allow_mixed_option_direction", False)),
+        "option_strategy_mode": getattr(args, "option_strategy_mode", "directional"),
+        "enable_multi_leg": bool(getattr(args, "enable_multi_leg", False)),
+        "enable_short_option_strategies": bool(getattr(args, "enable_short_option_strategies", False)),
+        "max_legs": int(getattr(args, "max_legs", 2)),
+        "straddle_max_debit_multiplier": float(getattr(args, "straddle_max_debit_multiplier", 1.0)),
+        "iron_butterfly_wing_width_pct": float(getattr(args, "iron_butterfly_wing_width_pct", 0.05)),
+        "calendar_near_min_dte": int(getattr(args, "calendar_near_min_dte", 1)),
+        "calendar_near_max_dte": int(getattr(args, "calendar_near_max_dte", 7)),
+        "calendar_far_min_dte": int(getattr(args, "calendar_far_min_dte", 8)),
+        "calendar_far_max_dte": int(getattr(args, "calendar_far_max_dte", 35)),
     }
 
 
@@ -771,6 +1061,11 @@ def _option_position_exposure(option_positions: list[dict[str, Any]]) -> float:
 
 def _planned_option_debit(trade_plan: dict[str, Any]) -> float:
     order = trade_plan.get("order") or {}
+    if order.get("order_class") == "mleg":
+        qty = _int_float(order.get("strategy_qty") or 1)
+        limit_price = _float_or_none(order.get("limit_price"))
+        if limit_price is not None:
+            return round(abs(limit_price * max(qty, 1.0) * 100.0), 2)
     qty = _int_float(order.get("qty"))
     if qty <= 0:
         return 0.0
@@ -1100,22 +1395,19 @@ def _manage_total_unrealized_loss(
         if not symbol or qty <= 0 or current_price is None:
             actions.append({"action": "total_loss_close_skipped_missing_price_or_qty", "symbol": symbol, "qty": qty})
             continue
-        sell_orders = [
-            order
-            for order in open_orders
-            if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == "sell"
-        ]
-        close_limit = _profit_close_limit_price(current_price, float(args.profit_close_limit_offset_pct))
+        close_side = _position_close_side(position)
+        close_orders = _matching_close_orders(open_orders, symbol=symbol, close_side=close_side)
+        close_limit = _close_limit_price(current_price, float(args.profit_close_limit_offset_pct), close_side)
         actions.extend(
             _replace_sell_orders(
                 broker=broker,
                 args=args,
                 symbol=symbol,
                 qty=qty,
-                sell_orders=sell_orders,
+                sell_orders=close_orders,
                 replacement={
                     "symbol": symbol,
-                    "side": "sell",
+                    "side": close_side,
                     "order_type": "limit",
                     "qty": qty,
                     "limit_price": close_limit,
@@ -1126,6 +1418,7 @@ def _manage_total_unrealized_loss(
                     "action": "total_loss_position_close_triggered",
                     "symbol": symbol,
                     "qty": qty,
+                    "side": close_side,
                     "current_price": round(float(current_price), 4),
                     "close_limit_price": close_limit,
                     "position_unrealized_pl": _float_or_none(position.get("unrealized_pl")),
@@ -1177,22 +1470,19 @@ def _manage_total_unrealized_profit(
         if not symbol or qty <= 0 or current_price is None:
             actions.append({"action": "total_profit_close_skipped_missing_price_or_qty", "symbol": symbol, "qty": qty})
             continue
-        sell_orders = [
-            order
-            for order in open_orders
-            if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == "sell"
-        ]
-        close_limit = _profit_close_limit_price(current_price, float(args.profit_close_limit_offset_pct))
+        close_side = _position_close_side(position)
+        close_orders = _matching_close_orders(open_orders, symbol=symbol, close_side=close_side)
+        close_limit = _close_limit_price(current_price, float(args.profit_close_limit_offset_pct), close_side)
         actions.extend(
             _replace_sell_orders(
                 broker=broker,
                 args=args,
                 symbol=symbol,
                 qty=qty,
-                sell_orders=sell_orders,
+                sell_orders=close_orders,
                 replacement={
                     "symbol": symbol,
-                    "side": "sell",
+                    "side": close_side,
                     "order_type": "limit",
                     "qty": qty,
                     "limit_price": close_limit,
@@ -1203,6 +1493,7 @@ def _manage_total_unrealized_profit(
                     "action": "total_profit_position_close_triggered",
                     "symbol": symbol,
                     "qty": qty,
+                    "side": close_side,
                     "current_price": round(float(current_price), 4),
                     "close_limit_price": close_limit,
                     "position_unrealized_pl": _float_or_none(position.get("unrealized_pl")),
@@ -1416,21 +1707,18 @@ def _close_position_with_limit(
     current_price = _current_option_price(position)
     if not symbol or qty <= 0 or current_price is None:
         return [{"action": f"{reason}_skipped_missing_price_or_qty", "symbol": symbol, "qty": qty}]
-    sell_orders = [
-        order
-        for order in open_orders
-        if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == "sell"
-    ]
-    close_limit = _profit_close_limit_price(current_price, float(limit_offset_pct))
+    close_side = _position_close_side(position)
+    close_orders = _matching_close_orders(open_orders, symbol=symbol, close_side=close_side)
+    close_limit = _close_limit_price(current_price, float(limit_offset_pct), close_side)
     return _replace_sell_orders(
         broker=broker,
         args=args,
         symbol=symbol,
         qty=qty,
-        sell_orders=sell_orders,
+        sell_orders=close_orders,
         replacement={
             "symbol": symbol,
-            "side": "sell",
+            "side": close_side,
             "order_type": "limit",
             "qty": qty,
             "limit_price": close_limit,
@@ -1441,6 +1729,7 @@ def _close_position_with_limit(
             "action": reason,
             "symbol": symbol,
             "qty": qty,
+            "side": close_side,
             "current_price": round(float(current_price), 4),
             "close_limit_price": close_limit,
             "position_unrealized_pl": _float_or_none(position.get("unrealized_pl")),
@@ -1579,22 +1868,19 @@ def _liquidate_option_positions(
         if not symbol or qty <= 0 or current_price is None:
             actions.append({"action": "manual_liquidation_skipped_missing_price_or_qty", "symbol": symbol, "qty": qty})
             continue
-        sell_orders = [
-            order
-            for order in open_orders
-            if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == "sell"
-        ]
-        close_limit = _profit_close_limit_price(current_price, float(args.liquidation_limit_offset_pct))
+        close_side = _position_close_side(position)
+        close_orders = _matching_close_orders(open_orders, symbol=symbol, close_side=close_side)
+        close_limit = _close_limit_price(current_price, float(args.liquidation_limit_offset_pct), close_side)
         actions.extend(
             _replace_sell_orders(
                 broker=broker,
                 args=args,
                 symbol=symbol,
                 qty=qty,
-                sell_orders=sell_orders,
+                sell_orders=close_orders,
                 replacement={
                     "symbol": symbol,
-                    "side": "sell",
+                    "side": close_side,
                     "order_type": "limit",
                     "qty": qty,
                     "limit_price": close_limit,
@@ -1605,6 +1891,7 @@ def _liquidate_option_positions(
                     "action": "manual_liquidation_position_close_triggered",
                     "symbol": symbol,
                     "qty": qty,
+                    "side": close_side,
                     "current_price": round(float(current_price), 4),
                     "close_limit_price": close_limit,
                     "position_unrealized_pl": _float_or_none(position.get("unrealized_pl")),
@@ -2168,6 +2455,29 @@ def _current_option_price(position: dict[str, Any]) -> float | None:
     return abs(market_value) / (abs(qty) * 100.0)
 
 
+def _signed_position_qty(position: dict[str, Any]) -> float:
+    return _float_or_none(position.get("qty")) or 0.0
+
+
+def _position_close_side(position: dict[str, Any]) -> str:
+    return "buy" if _signed_position_qty(position) < 0 else "sell"
+
+
+def _matching_close_orders(open_orders: list[dict[str, Any]], *, symbol: str, close_side: str) -> list[dict[str, Any]]:
+    return [
+        order
+        for order in open_orders
+        if str(order.get("symbol") or "") == symbol and str(order.get("side") or "").lower() == close_side
+    ]
+
+
+def _close_limit_price(current_price: float, offset_pct: float, close_side: str) -> float:
+    offset = max(0.0, float(offset_pct))
+    if str(close_side).lower() == "buy":
+        return round(max(0.01, float(current_price) * (1.0 + offset)), 2)
+    return _profit_close_limit_price(current_price, offset)
+
+
 def _profit_close_limit_price(current_price: float, offset_pct: float) -> float:
     return round(max(0.01, float(current_price) * (1.0 - max(0.0, float(offset_pct)))), 2)
 
@@ -2229,16 +2539,24 @@ def _summary(record: dict[str, Any]) -> dict[str, Any]:
     trade_plan = record.get("option_trade_plan") or {}
     selected = trade_plan.get("selected_contract") or {}
     order = trade_plan.get("order") or {}
+    forecast_plan = record.get("forecast_plan") or {}
+    forecast_engine = forecast_plan.get("forecast_engine") or {}
     return {
         "market_is_open": (record.get("market_clock") or {}).get("is_open"),
         "forecast_direction": (record.get("selected_forecast") or {}).get("expected_direction"),
         "forecast_price": (record.get("selected_forecast") or {}).get("predicted_price"),
+        "forecast_engine": forecast_engine.get("selected") or forecast_plan.get("mode"),
+        "forecast_model": (record.get("selected_forecast") or {}).get("selected_model") or (record.get("selected_forecast") or {}).get("method"),
+        "forecast_fallback": forecast_engine.get("fallback_from_full_engine"),
         "action": trade_plan.get("action"),
         "reason": trade_plan.get("reason"),
+        "strategy": trade_plan.get("strategy") or trade_plan.get("option_type"),
         "contract": selected.get("symbol"),
         "contract_name": selected.get("name"),
         "limit_price": order.get("limit_price"),
         "estimated_debit": (trade_plan.get("risk") or {}).get("estimated_debit"),
+        "trade_quality_score": (trade_plan.get("trade_quality") or selected.get("trade_quality") or {}).get("score"),
+        "trade_quality_grade": (trade_plan.get("trade_quality") or selected.get("trade_quality") or {}).get("grade"),
         "order_submitted": (record.get("order_result") or {}).get("submitted"),
     }
 

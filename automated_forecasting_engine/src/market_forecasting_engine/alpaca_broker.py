@@ -147,9 +147,20 @@ class AlpacaPaperBroker:
         selected_feed = feed or os.getenv("ALPACA_DATA_FEED")
         if selected_feed:
             params["feed"] = selected_feed
-        payload = self._data_request("GET", f"/v2/stocks/{quote(symbol.upper(), safe='')}/bars?" + urlencode(params))
-        rows = payload.get("bars", []) if isinstance(payload, dict) else []
-        return rows if isinstance(rows, list) else []
+        rows: list[dict[str, Any]] = []
+        next_page_token: str | None = None
+        while True:
+            page_params = dict(params)
+            if next_page_token:
+                page_params["page_token"] = next_page_token
+            payload = self._data_request("GET", f"/v2/stocks/{quote(symbol.upper(), safe='')}/bars?" + urlencode(page_params))
+            page_rows = payload.get("bars", []) if isinstance(payload, dict) else []
+            if isinstance(page_rows, list):
+                rows.extend(page_rows)
+            next_page_token = payload.get("next_page_token") if isinstance(payload, dict) else None
+            if not next_page_token:
+                break
+        return rows
 
     def submit_order(
         self,
@@ -211,6 +222,43 @@ class AlpacaPaperBroker:
             client_order_id=client_order_id,
             time_in_force=time_in_force,
         )
+
+    def submit_multileg_option_order(
+        self,
+        *,
+        legs: list[dict[str, Any]],
+        order_type: str = "limit",
+        qty: int = 1,
+        limit_price: float | None = None,
+        time_in_force: str = "day",
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if order_type not in {"limit", "market"}:
+            raise ValueError("Multi-leg option orders support limit or market order types.")
+        if int(qty) <= 0:
+            raise ValueError("Multi-leg option orders require positive qty.")
+        if not legs:
+            raise ValueError("Multi-leg option orders require at least one leg.")
+        body: dict[str, Any] = {
+            "type": order_type,
+            "time_in_force": time_in_force,
+            "order_class": "mleg",
+            "qty": str(int(qty)),
+            "legs": [
+                {
+                    "side": str(leg["side"]),
+                    "position_intent": str(leg.get("position_intent") or ("buy_to_open" if leg["side"] == "buy" else "sell_to_close")),
+                    "symbol": str(leg["symbol"]),
+                    "ratio_qty": str(int(leg.get("ratio_qty") or 1)),
+                }
+                for leg in legs
+            ],
+        }
+        if limit_price is not None:
+            body["limit_price"] = str(round(float(limit_price), 2))
+        if client_order_id:
+            body["client_order_id"] = client_order_id[:48]
+        return self._request("POST", "/v2/orders", body)
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         return self._json_request(method, f"{self.base_url}{path}", body)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +21,27 @@ from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.data_store import MarketDataStore, request_key
 from market_forecasting_engine.alternative_data import AlternativeNewsRequest, collect_alternative_news_features
 from market_forecasting_engine.governance import write_audit_bundle
+from market_forecasting_engine.long_term_enrichment import (
+    DEFAULT_LONG_TERM_SOURCE_PROVIDERS,
+    enrich_prices_with_long_term_sources,
+    long_term_context_manifest_entry,
+    long_term_context_source_entry,
+    parse_long_term_source_providers,
+)
+from market_forecasting_engine.llm_trader.prompts import autonomous_trader
+from market_forecasting_engine.llm_trader.profiles import trader_profiles
+from market_forecasting_engine.llm_trader.responses_api import call_response, response_payload
+from market_forecasting_engine.llm_trader.run import (
+    build_technical_packet,
+    load_env,
+    openai_client_for_provider,
+    resolve_llm_model,
+    resolve_llm_provider,
+)
+from market_forecasting_engine.llm_trader.source_synthesis import (
+    attach_long_term_source_synthesis,
+    run_long_term_source_synthesis,
+)
 from market_forecasting_engine.panel import (
     build_cross_sectional_panel_features,
     build_panel_frame,
@@ -34,6 +56,68 @@ from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.plots import write_forecast_log_plot_artifacts, write_plot_artifacts
 from market_forecasting_engine.schema import ForecastConfig
 from market_forecasting_engine.security_master import load_security_master, resolve_security_metadata
+from market_forecasting_engine.strategy_knowledge import (
+    DEFAULT_STRATEGY_CORPUS_DIR,
+    DEFAULT_STRATEGY_INDEX_PATH,
+    StrategyKnowledgeRequest,
+    attach_strategy_knowledge_context,
+    build_strategy_knowledge_context,
+)
+
+
+class TerminalProgress:
+    """Small terminal progress reporter for long forecast runs."""
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+
+    def step(self, message: str) -> None:
+        if self.enabled:
+            print(f"[forecast] {datetime.now().strftime('%H:%M:%S')} {message}", flush=True)
+
+    def __call__(self, event: dict[str, object]) -> None:
+        if not self.enabled:
+            return
+        name = str(event.get("event") or "")
+        horizon = event.get("horizon_days")
+        if name == "horizon_started":
+            self.step(f"horizon {horizon}d: started")
+        elif name == "horizon_completed":
+            self.step(
+                "horizon "
+                f"{horizon}d: selected {event.get('selected_model')} "
+                f"direction={event.get('expected_direction')} "
+                f"confidence={_format_number(event.get('directional_confidence'))}"
+            )
+        elif name == "validation_started":
+            self.step(
+                "horizon "
+                f"{horizon}d: validating {event.get('candidate_count')} candidates "
+                f"with {event.get('workers')} worker(s)"
+            )
+        elif name == "candidate_completed":
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or 0)
+            succeeded = "ok" if event.get("succeeded") else "failed"
+            bar = _progress_bar(completed, total)
+            self.step(
+                "horizon "
+                f"{horizon}d: {bar} {completed}/{total} "
+                f"{event.get('candidate')} ({event.get('family')}) {succeeded}"
+            )
+        elif name == "validation_completed":
+            self.step(
+                "horizon "
+                f"{horizon}d: validation complete, "
+                f"{event.get('successful_candidate_count')} successful candidates"
+            )
+
+
+def _progress_bar(completed: int, total: int, *, width: int = 20) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = max(0, min(width, round(width * completed / total)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
 def main() -> None:
@@ -54,11 +138,22 @@ def main() -> None:
     parser.add_argument("--horizons", default="1,5,30", help="Comma-separated forecast horizons in trading days.")
     parser.add_argument("--selection-metric", default="mae", help="mae, rmse, bic, aic, directional_accuracy, or composite.")
     parser.add_argument("--confidence-level", type=float, default=0.80, help="Confidence interval level.")
+    parser.add_argument("--min-training-rows", type=int, default=180, help="Minimum price rows required before model validation starts.")
+    parser.add_argument("--validation-window", type=int, default=45, help="Rows in each walk-forward validation window.")
+    parser.add_argument("--step-size", type=int, default=20, help="Rows advanced between validation splits.")
+    parser.add_argument("--max-splits", type=int, default=8, help="Maximum walk-forward validation splits.")
+    parser.add_argument(
+        "--validation-workers",
+        type=int,
+        default=0,
+        help="Parallel workers for CPU-safe model validation. 0=auto bounded parallelism; -1=serial. Deep-learning/GPU candidates run serially.",
+    )
     parser.add_argument("--purge-window", type=int, default=None, help="Rows to purge before each validation window. Defaults to horizon.")
     parser.add_argument("--embargo-window", type=int, default=0, help="Extra rows to embargo before each validation window.")
     parser.add_argument("--final-holdout-fraction", type=float, default=0.15, help="Final untouched holdout fraction for post-selection diagnostics.")
     parser.add_argument("--transaction-cost-bps", type=float, default=5.0, help="Backtest transaction cost in basis points per signal change.")
     parser.add_argument("--output-dir", default=None, help="Directory for forecast_report.json and governance artifacts.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable terminal progress updates during long forecast stages.")
     parser.add_argument("--chart-scale", choices=("log", "linear"), default="log", help="Technical chart price scale.")
     parser.add_argument("--data-dir", default=None, help="Optional local data lake root for raw, normalized, panel, and metadata files.")
     parser.add_argument("--no-data-cache", action="store_true", help="Disable reading cached normalized provider data.")
@@ -101,7 +196,29 @@ def main() -> None:
         default="intermediate",
         help="Chapter 18 tactical profile for stops, reward/risk gates, and holding horizon.",
     )
-    parser.add_argument("--enable-llm-review", action="store_true", help="Enable the optional governed LLM tactical reviewer.")
+    parser.add_argument("--enable-llm-review", action="store_true", default=False, help="Enable the optional Chapter 18 LLM tactical reviewer.")
+    parser.add_argument("--disable-llm-review", action="store_false", dest="enable_llm_review", help="Disable the optional Chapter 18 LLM tactical reviewer.")
+    parser.add_argument(
+        "--enable-autonomous-llm-decision",
+        action="store_true",
+        default=True,
+        help="Run the full autonomous trader LLM as the final advice layer. Enabled by default.",
+    )
+    parser.add_argument(
+        "--disable-autonomous-llm-decision",
+        action="store_false",
+        dest="enable_autonomous_llm_decision",
+        help="Disable the default autonomous trader LLM final advice layer.",
+    )
+    parser.add_argument("--llm-dry-run", action="store_true", help="Build the autonomous LLM payload without calling the model.")
+    parser.add_argument("--trader-profile", choices=("aggressive", "medium", "conservative"), default="medium", help="Trader profile for autonomous LLM final advice.")
+    parser.add_argument("--trader-name", default="forecast_autonomous_trader", help="Trader name for autonomous LLM final advice artifacts.")
+    parser.add_argument("--holding-status", choices=("not_owned", "owned"), default="not_owned", help="Optional position context for autonomous final advice.")
+    parser.add_argument("--entry-price", type=float, default=None, help="Optional owned-position average entry/cost basis.")
+    parser.add_argument("--quantity", type=float, default=None, help="Optional owned-position quantity.")
+    parser.add_argument("--position-value", type=float, default=None, help="Optional owned-position market value.")
+    parser.add_argument("--account-equity", type=float, default=None, help="Optional account equity for sizing context.")
+    parser.add_argument("--portfolio-notes", default="", help="Optional portfolio notes for the autonomous final advice layer.")
     parser.add_argument("--llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai", help="LLM provider for optional tactical review. Defaults to OpenAI.")
     parser.add_argument(
         "--llm-model",
@@ -116,6 +233,25 @@ def main() -> None:
     )
     parser.add_argument("--llm-timeout", type=int, default=30, help="Timeout in seconds for optional LLM review.")
     parser.add_argument("--llm-env-file", default=None, help="Optional .env file containing OPENAI_API_KEY and optionally OPENAI_MODEL.")
+    parser.add_argument("--llm-no-web-search", action="store_true", help="Disable autonomous LLM web search.")
+    parser.add_argument("--llm-search-context-size", choices=("low", "medium", "high"), default="medium", help="Web-search context size for autonomous LLM final advice.")
+    parser.add_argument(
+        "--disable-strategy-knowledge",
+        action="store_true",
+        help="Disable default FAISS-backed durable strategy knowledge retrieval for the CEO LLM.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-corpus-dir",
+        default=str(DEFAULT_STRATEGY_CORPUS_DIR),
+        help="Directory containing strategy knowledge documents to embed and retrieve for the CEO LLM.",
+    )
+    parser.add_argument(
+        "--strategy-knowledge-index",
+        default=str(DEFAULT_STRATEGY_INDEX_PATH),
+        help="FAISS index path for durable strategy knowledge.",
+    )
+    parser.add_argument("--strategy-knowledge-max-chunks", type=int, default=8, help="Maximum retrieved strategy chunks passed into CEO context.")
+    parser.add_argument("--strategy-knowledge-rebuild-index", action="store_true", help="Force rebuild of the strategy FAISS index before retrieval.")
     parser.add_argument("--enable-bayesian-heavy", action="store_true", help="Enable optional PyMC/MCMC Bayesian diagnostics. Disabled by default.")
     parser.add_argument("--bayesian-mcmc-draws", type=int, default=300, help="MCMC draws for optional heavy Bayesian diagnostics.")
     parser.add_argument("--bayesian-mcmc-tune", type=int, default=300, help="MCMC tuning draws for optional heavy Bayesian diagnostics.")
@@ -128,7 +264,8 @@ def main() -> None:
     parser.add_argument("--macro-release-lag-days", type=int, default=0, help="Business-day lag before macro CSV observations are model-available.")
     parser.add_argument("--rates-release-lag-days", type=int, default=0, help="Business-day lag before rates CSV observations are model-available.")
     parser.add_argument("--events-release-lag-days", type=int, default=0, help="Business-day lag before event CSV rows are model-available.")
-    parser.add_argument("--enable-alt-news", action="store_true", help="Download/scrape alternative news and add rolling sentiment features.")
+    parser.add_argument("--enable-alt-news", action="store_true", default=True, help="Download/scrape alternative news and add rolling sentiment features. Enabled by default.")
+    parser.add_argument("--disable-alt-news", action="store_false", dest="enable_alt_news", help="Disable default alternative news collection for this run.")
     parser.add_argument("--alt-news-provider", default="yahoo_rss", help="Alternative news provider: yahoo_rss, yahoo_news, or openai_web.")
     parser.add_argument("--alt-news-lookback-days", type=int, default=30, help="Lookback window for downloaded/scraped news.")
     parser.add_argument("--alt-news-max-items", type=int, default=40, help="Maximum downloaded/scraped news items.")
@@ -160,19 +297,62 @@ def main() -> None:
         default=None,
         help="Optional JSON object of finance-domain prototype labels to text descriptions for Chapter 16 similarity features.",
     )
+    parser.add_argument(
+        "--enable-long-term-sources",
+        action="store_true",
+        default=True,
+        help="Call and consolidate all configured long-term data sources into the governed decision context.",
+    )
+    parser.add_argument(
+        "--disable-long-term-sources",
+        action="store_false",
+        dest="enable_long_term_sources",
+        help="Disable default long-term source collection for this run.",
+    )
+    parser.add_argument(
+        "--long-term-source-providers",
+        default=",".join(DEFAULT_LONG_TERM_SOURCE_PROVIDERS),
+        help="Comma-separated long-term source providers to call. Default calls all supported providers.",
+    )
+    parser.add_argument(
+        "--long-term-source-output-dir",
+        default=None,
+        help="Optional artifact directory for raw long-term source payloads. Defaults under --output-dir when supplied.",
+    )
+    parser.add_argument(
+        "--long-term-source-env-file",
+        default=None,
+        help="Optional .env file for long-term source API keys. Defaults to --llm-env-file or process env.",
+    )
+    parser.add_argument(
+        "--long-term-source-snapshot-dir",
+        default=None,
+        help="Durable directory for point-in-time long-term source snapshots used as leak-safe model features.",
+    )
     parser.add_argument("--universe-csv", default=None, help="Optional universe CSV with ticker/symbol column for panel metadata.")
     parser.add_argument("--universe-tickers", default=None, help="Optional comma-separated universe tickers for panel metadata.")
     parser.add_argument("--build-panel", action="store_true", help="Fetch and store a date/ticker panel for the supplied universe.")
     parser.add_argument("--rank-universe", action="store_true", help="Rank supplied universe members using market-action and cross-sectional evidence.")
     parser.add_argument("--universe-top-n", type=int, default=25, help="Maximum universe ranking rows to include.")
     args = parser.parse_args()
+    progress = TerminalProgress(enabled=not args.no_progress)
 
     horizons = tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip())
     forecast_interval_minutes = _interval_to_minutes(args.interval)
+    long_term_source_providers = parse_long_term_source_providers(args.long_term_source_providers)
+    progress.step(
+        f"starting forecast ticker={args.ticker.upper()} horizons={','.join(str(value) for value in horizons)} "
+        f"provider={args.provider or ('csv' if args.csv else 'yahoo')}"
+    )
     config = ForecastConfig(
         ticker=args.ticker,
         horizons=horizons,
         target_column=args.target_column.lower(),
+        min_training_rows=args.min_training_rows,
+        validation_window=args.validation_window,
+        step_size=args.step_size,
+        max_splits=args.max_splits,
+        validation_workers=args.validation_workers,
         selection_metric=args.selection_metric,
         confidence_level=args.confidence_level,
         purge_window=args.purge_window,
@@ -197,6 +377,8 @@ def main() -> None:
         llm_reasoning_effort=args.llm_reasoning_effort,
         llm_timeout_seconds=args.llm_timeout,
         llm_env_file=args.llm_env_file,
+        enable_long_term_sources=args.enable_long_term_sources,
+        long_term_source_providers=long_term_source_providers,
         enable_bayesian_heavy=args.enable_bayesian_heavy,
         bayesian_mcmc_draws=args.bayesian_mcmc_draws,
         bayesian_mcmc_tune=args.bayesian_mcmc_tune,
@@ -218,6 +400,7 @@ def main() -> None:
         adjustment_policy=args.adjustment_policy,
         source_path=args.csv,
     )
+    progress.step(f"loading primary price data from {provider_name}")
     primary_result = load_prices_with_provider(
         provider_name,
         request,
@@ -227,11 +410,14 @@ def main() -> None:
     )
     prices = primary_result.frame
     prices = _filter_prices_as_of(prices, args.as_of, target_column=config.target_column)
+    progress.step(f"primary price data loaded rows={len(prices)} columns={len(prices.columns)}")
     data_artifacts: dict[str, object] = {"primary": primary_result.metadata.get("artifacts", {})}
     context_sources: list[dict[str, object]] = []
     indicator_sources: list[dict[str, object]] = []
     event_sources: list[dict[str, object]] = []
     alternative_sources: list[dict[str, object]] = []
+    long_term_context: dict[str, object] | None = None
+    long_term_snapshot_feature_metadata: dict[str, object] | None = None
 
     yahoo_context = {}
     if args.benchmark:
@@ -242,6 +428,7 @@ def main() -> None:
         yahoo_context["volatility"] = args.vix
 
     for label, ticker in yahoo_context.items():
+        progress.step(f"loading context ticker {ticker} for {label}")
         context_result = load_prices_with_provider(
             "yahoo",
             DataRequest(
@@ -271,14 +458,17 @@ def main() -> None:
         )
 
     if args.rates_csv:
+        progress.step("loading rates indicator CSV")
         rates = load_indicator_csv(args.rates_csv, prefix="rates", release_lag_days=args.rates_release_lag_days)
         prices = prices.join(rates, how="left")
         indicator_sources.append(_csv_source("rates", args.rates_csv, args.rates_release_lag_days, rates))
     if args.macro_csv:
+        progress.step("loading macro indicator CSV")
         macro = load_indicator_csv(args.macro_csv, prefix="macro", release_lag_days=args.macro_release_lag_days)
         prices = prices.join(macro, how="left")
         indicator_sources.append(_csv_source("macro", args.macro_csv, args.macro_release_lag_days, macro))
     if args.events_csv:
+        progress.step("loading event indicator CSV")
         events = load_event_indicators(
             args.events_csv,
             prices.index,
@@ -288,6 +478,10 @@ def main() -> None:
         prices = prices.join(events, how="left")
         event_sources.append(_csv_source("event", args.events_csv, args.events_release_lag_days, events))
     if args.enable_alt_news:
+        progress.step(
+            f"collecting alternative news provider={args.alt_news_provider} "
+            f"sentiment={args.alt_news_sentiment_mode} topic={args.alt_news_topic_mode}"
+        )
         alt_features, alt_metadata = collect_alternative_news_features(
             AlternativeNewsRequest(
                 ticker=args.ticker,
@@ -313,8 +507,38 @@ def main() -> None:
         )
         prices = prices.join(alt_features, how="left")
         alternative_sources.append(alt_metadata)
+        progress.step(f"alternative news features added columns={len(alt_features.columns)}")
 
+    if args.enable_long_term_sources:
+        progress.step(f"collecting long-term sources providers={','.join(long_term_source_providers)}")
+        long_term_output_dir = (
+            Path(args.long_term_source_output_dir)
+            if args.long_term_source_output_dir
+            else ((output_dir / "long_term_sources") if output_dir else None)
+        )
+        prices, long_term_context, long_term_snapshot_feature_metadata = enrich_prices_with_long_term_sources(
+            ticker=args.ticker,
+            prices=prices,
+            target_column=config.target_column,
+            enabled=True,
+            providers=long_term_source_providers,
+            env_file=args.long_term_source_env_file or args.llm_env_file,
+            output_dir=long_term_output_dir,
+            snapshot_dir=args.long_term_source_snapshot_dir,
+            data_store=data_store,
+            start_date=args.start,
+            end_date=args.end,
+        )
+        source_entry = long_term_context_source_entry(long_term_context, long_term_snapshot_feature_metadata)
+        if source_entry:
+            context_sources.append(source_entry)
+        provider_status = (long_term_context or {}).get("provider_status", {}) if isinstance(long_term_context, dict) else {}
+        progress.step(f"long-term sources complete status={json.dumps(provider_status, sort_keys=True)}")
+
+    progress.step("finalizing enriched feature frame")
     prices = _finalize_enriched_prices(prices, target_column=config.target_column)
+    progress.step(f"feature frame ready rows={len(prices)} columns={len(prices.columns)}")
+    progress.step("building optional universe/panel features")
     universe_summary, panel_artifacts, panel_sources, panel_features, universe_ranking = _build_panel_if_requested(
         args=args,
         primary_prices=prices,
@@ -323,7 +547,9 @@ def main() -> None:
     )
     if not panel_features.empty:
         prices = _finalize_enriched_prices(prices.join(panel_features, how="left"), target_column=config.target_column)
+        progress.step(f"panel features added columns={len(panel_features.columns)}")
 
+    progress.step("building security metadata and data-quality report")
     security_master = load_security_master(args.security_master_csv) if args.security_master_csv else None
     security_metadata = resolve_security_metadata(
         ticker=args.ticker,
@@ -358,6 +584,11 @@ def main() -> None:
         calendar_summary=calendar_summary,
         universe=universe_summary,
     )
+    if long_term_context:
+        data_manifest["long_term_sources"] = long_term_context_manifest_entry(
+            long_term_context,
+            long_term_snapshot_feature_metadata,
+        )
     if data_store is not None:
         data_store.write_json(
             "manifests",
@@ -367,12 +598,15 @@ def main() -> None:
             data_manifest,
         )
 
-    report = ForecastingEngine(config).run(
+    progress.step("running forecast engine: feature analysis, model validation, selection, tactical gates")
+    report = ForecastingEngine(config, progress_callback=progress).run(
         prices,
         data_manifest=data_manifest,
         data_quality_report=data_quality_report,
         security_metadata=security_metadata,
+        long_term_context=long_term_context,
     )
+    progress.step(f"forecast engine complete initial_action={report.get('suggested_action')} risk={report.get('risk_level')}")
     if universe_ranking:
         report.setdefault("diagnostics", {})["universe_ranking"] = universe_ranking
         report.setdefault("technical_view", {})["universe_ranking"] = universe_ranking
@@ -386,6 +620,7 @@ def main() -> None:
     report.setdefault("technical_view", {}).setdefault("chart_metadata", {})["actual_scale"] = args.chart_scale
     report["technical_view"]["chart_metadata"]["chart_artifact_timeframes"] = ["daily", "weekly", "monthly"]
     if output_dir:
+        progress.step("writing plots, governance bundle, validation, trade-risk, and portfolio-risk views")
         plot_artifacts = write_plot_artifacts(
             report,
             prices,
@@ -418,9 +653,22 @@ def main() -> None:
             target_column=config.target_column,
         )
         apply_chapter_39_43_discipline_governance(report)
-        report["artifacts"].update(write_audit_bundle(report, output_dir))
+        progress.step("plots and governance views complete")
+    if args.enable_autonomous_llm_decision:
+        progress.step("running CEO LLM final decision layer")
+        autonomous = _run_autonomous_llm_decision(report, args, dry_run=bool(args.llm_dry_run), progress=progress)
+        _apply_autonomous_llm_to_report(report, autonomous)
+        progress.step(
+            "CEO LLM complete "
+            f"status={autonomous.get('status')} "
+            f"decision={(autonomous.get('decision') or {}).get('decision') if isinstance(autonomous.get('decision'), dict) else None}"
+        )
+    if output_dir:
+        progress.step("writing final audit bundle")
+        report.setdefault("artifacts", {}).update(write_audit_bundle(report, output_dir))
     forecast_log_path = _forecast_log_path(args, output_dir)
     if forecast_log_path is not None:
+        progress.step("updating forecast log and forecast-log chart")
         report.setdefault("artifacts", {})["forecast_log"] = str(forecast_log_path)
         _append_forecast_log(report, forecast_log_path)
         report["artifacts"].update(
@@ -431,7 +679,9 @@ def main() -> None:
             )
         )
 
+    progress.step("forecast run complete")
     print(_summary(report))
+    print(_final_ceo_decision_block(report))
     print(
         json.dumps(
             {
@@ -439,6 +689,11 @@ def main() -> None:
                 "part_i_suggested_action": report.get("part_i_suggested_action"),
                 "risk_level": report["risk_level"],
                 "llm_review_status": report.get("decision_view", {}).get("llm_review", {}).get("status"),
+                "autonomous_llm_status": report.get("autonomous_llm_trader", {}).get("status"),
+                "autonomous_llm_decision": (report.get("autonomous_llm_trader", {}).get("decision") or {}).get("decision"),
+                "autonomous_execution_allowed": report.get("decision_view", {})
+                .get("autonomous_execution_gate", {})
+                .get("execution_allowed"),
                 "chapter_19_validation_status": report.get("operations_view", {})
                 .get("chapter_19_validation", {})
                 .get("status"),
@@ -465,6 +720,224 @@ def main() -> None:
             indent=2,
         )
     )
+
+
+def _run_autonomous_llm_decision(
+    report: dict,
+    args: argparse.Namespace,
+    *,
+    dry_run: bool,
+    progress: TerminalProgress | None = None,
+) -> dict:
+    if progress is not None:
+        progress.step("CEO source synthesis: started")
+    source_synthesis = run_long_term_source_synthesis(
+        report=report,
+        llm_provider=getattr(args, "llm_provider", None),
+        llm_model=args.llm_model,
+        reasoning_effort=args.llm_reasoning_effort,
+        llm_env_file=args.llm_env_file,
+        timeout_seconds=float(args.llm_timeout),
+        dry_run=dry_run,
+    )
+    attach_long_term_source_synthesis(report, source_synthesis)
+    if progress is not None:
+        progress.step(f"CEO source synthesis: status={source_synthesis.get('status')}")
+    if not getattr(args, "disable_strategy_knowledge", False):
+        if progress is not None:
+            progress.step("CEO strategy knowledge retrieval: started")
+        strategy_context = build_strategy_knowledge_context(
+            report,
+            StrategyKnowledgeRequest(
+                ticker=str(report.get("ticker") or args.ticker).upper(),
+                corpus_dir=args.strategy_knowledge_corpus_dir,
+                index_path=args.strategy_knowledge_index,
+                llm_env_file=args.llm_env_file,
+                max_chunks=args.strategy_knowledge_max_chunks,
+                rebuild_index=args.strategy_knowledge_rebuild_index,
+                timeout_seconds=int(args.llm_timeout),
+            ),
+        )
+        if progress is not None:
+            progress.step(
+                "CEO strategy knowledge retrieval: "
+                f"status={strategy_context.get('status')} "
+                f"chunks={len(strategy_context.get('retrieved_chunks', []) or [])}"
+            )
+    else:
+        strategy_context = {
+            "status": "disabled",
+            "reason": "disabled by --disable-strategy-knowledge",
+            "decision_policy": {
+                "feeds_ceo_llm": False,
+                "overrides_model_validation": False,
+                "overrides_risk_gates": False,
+            },
+        }
+    attach_strategy_knowledge_context(report, strategy_context)
+    profile = trader_profiles[args.trader_profile]
+    portfolio_context = {
+        "holding_status": args.holding_status,
+        "entry_price": args.entry_price,
+        "quantity": args.quantity,
+        "position_value": args.position_value,
+        "account_equity": args.account_equity,
+        "notes": args.portfolio_notes,
+    }
+    item = {
+        "today": datetime.now(UTC).date().isoformat(),
+        "ticker": str(report.get("ticker") or args.ticker).upper(),
+        "trader_name": args.trader_name,
+        "trader_profile_json": json.dumps(profile, indent=2, sort_keys=True),
+        "portfolio_context_json": json.dumps(portfolio_context, indent=2, sort_keys=True),
+        "technical_packet_json": json.dumps(build_technical_packet(report), indent=2, sort_keys=True, default=str),
+    }
+    provider = resolve_llm_provider(getattr(args, "llm_provider", None))
+    model = resolve_llm_model(args.llm_model, provider=provider)
+    if progress is not None:
+        progress.step(f"CEO payload build: provider={provider} model={model}")
+    payload = response_payload(
+        model=model,
+        system_message=autonomous_trader.system_message,
+        user_message=autonomous_trader.user_message,
+        json_schema=autonomous_trader.json_schema,
+        reasoning_effort=args.llm_reasoning_effort,
+        item=item,
+        use_web_search=not args.llm_no_web_search and provider == "openai",
+        search_context_size=args.llm_search_context_size,
+        require_web_search=not args.llm_no_web_search and provider == "openai",
+    )
+    if dry_run:
+        if progress is not None:
+            progress.step("CEO LLM call skipped: dry run")
+        return {
+            "status": "dry_run",
+            "model": model,
+            "provider": provider,
+            "decision": None,
+            "portfolio_context": portfolio_context,
+            "long_term_source_synthesis": source_synthesis,
+            "strategy_knowledge_context": strategy_context,
+            "llm_prompt_payload": payload,
+            "reason": "Autonomous LLM decision packet was built but no model call was made.",
+        }
+    try:
+        if progress is not None:
+            progress.step("CEO LLM call: started")
+        load_env(args.llm_env_file)
+        client = openai_client_for_provider(provider, timeout=float(args.llm_timeout))
+        payload, raw_response, decision = call_response(
+            client=client,
+            provider=provider,
+            model=model,
+            system_message=autonomous_trader.system_message,
+            user_message=autonomous_trader.user_message,
+            json_schema=autonomous_trader.json_schema,
+            reasoning_effort=args.llm_reasoning_effort,
+            item=item,
+            use_web_search=not args.llm_no_web_search and provider == "openai",
+            search_context_size=args.llm_search_context_size,
+            require_web_search=not args.llm_no_web_search and provider == "openai",
+            usage_context={
+                "purpose": "forecast_cli_autonomous_final_decision",
+                "ticker": str(report.get("ticker") or args.ticker).upper(),
+                "profile": args.trader_profile,
+                "provider": provider,
+            },
+        )
+        if progress is not None:
+            progress.step("CEO LLM call: completed")
+    except Exception as exc:
+        if progress is not None:
+            progress.step(f"CEO LLM call: error={exc}")
+        return {
+            "status": "error",
+            "model": model,
+            "provider": provider,
+            "decision": None,
+            "portfolio_context": portfolio_context,
+            "long_term_source_synthesis": source_synthesis,
+            "strategy_knowledge_context": strategy_context,
+            "llm_prompt_payload": payload,
+            "reason": str(exc),
+        }
+    return {
+        "status": "executed",
+        "model": model,
+        "provider": provider,
+        "decision": decision,
+        "portfolio_context": portfolio_context,
+        "long_term_source_synthesis": source_synthesis,
+        "strategy_knowledge_context": strategy_context,
+        "llm_prompt_payload": payload,
+        "llm_raw_response": raw_response,
+        "policy": (
+            "Autonomous LLM is the final advice/action layer for the forecast report. "
+            "Deterministic risk, validation, market-hours, and broker gates are reported as execution constraints."
+        ),
+    }
+
+
+def _apply_autonomous_llm_to_report(report: dict, autonomous: dict) -> None:
+    decision = autonomous.get("decision") if isinstance(autonomous.get("decision"), dict) else {}
+    execution_gate = _autonomous_execution_gate(report, decision)
+    report["autonomous_llm_trader"] = autonomous
+    report.setdefault("decision_view", {})["autonomous_llm_trader"] = autonomous
+    report["decision_view"]["autonomous_execution_gate"] = execution_gate
+    if autonomous.get("status") == "executed" and decision.get("decision") in {"Buy", "Hold", "Sell"}:
+        report["suggested_action"] = decision["decision"]
+        report["decision_view"]["final_governed_action"] = decision["decision"]
+        report["llm_final_decision"] = decision
+        report["final_advice"] = decision.get("final_advice", {})
+        reasoning = report.setdefault("final_decision_reasoning", {})
+        reasoning.update(
+            {
+                "final_action": decision["decision"],
+                "decision_source": "autonomous_llm_trader",
+                "autonomous_llm_status": autonomous.get("status"),
+                "autonomous_llm_model": autonomous.get("model"),
+                "autonomous_llm_confidence": decision.get("confidence"),
+                "autonomous_llm_analysis": decision.get("analysis"),
+                "autonomous_llm_rationale": decision.get("llm_rationale") or decision.get("decision_reasoning"),
+                "llm_technical_read": decision.get("technical_read"),
+                "llm_market_context_read": decision.get("market_context_read"),
+                "llm_sentiment": decision.get("sentiment"),
+                "final_advice": decision.get("final_advice", {}),
+                "execution_gate": execution_gate,
+            }
+        )
+    else:
+        report["decision_view"].setdefault("final_governed_action", report.get("suggested_action"))
+        report.setdefault("final_decision_reasoning", {})["autonomous_llm_status"] = autonomous.get("status")
+        report["final_decision_reasoning"]["autonomous_llm_error"] = autonomous.get("reason")
+
+
+def _autonomous_execution_gate(report: dict, decision: dict) -> dict:
+    action = str(decision.get("decision") or "").title()
+    blocks: list[str] = []
+    warnings: list[str] = []
+    chapter_18 = report.get("decision_view", {}).get("chapter_18_tactical_problem", {})
+    rule_gate = chapter_18.get("rule_gate", {}) if isinstance(chapter_18.get("rule_gate"), dict) else {}
+    blocks.extend(str(item) for item in rule_gate.get("hard_blockers", []) or [])
+    diagnostics = report.get("technical_view", {}).get("decision_diagnostics", {})
+    if action in {"Buy", "Sell"}:
+        blocks.extend(str(item) for item in diagnostics.get("blocking_reasons", []) or [])
+    chapter_19 = report.get("operations_view", {}).get("chapter_19_validation", {})
+    if chapter_19.get("status") == "fail":
+        blocks.append("Chapter 19 validation failed; execution is blocked even though autonomous advice is final.")
+    portfolio_gate = report.get("portfolio_view", {}).get("chapter_31_42_portfolio_capital_risk", {}).get("portfolio_capital_gate", {})
+    allocation_status = portfolio_gate.get("allocation_status")
+    if allocation_status in {"blocked", "not_allowed"}:
+        blocks.append(f"Portfolio capital gate blocks execution: {allocation_status}.")
+    if report.get("risk_level") == "High" and action in {"Buy", "Sell"}:
+        warnings.append("Overall risk is High; execution should require explicit confirmation.")
+    return {
+        "advice_action": action or None,
+        "execution_allowed": not blocks,
+        "execution_blocks": blocks,
+        "warnings": warnings,
+        "policy": "Autonomous LLM decision is final advice. This gate only states whether execution is blocked by deterministic safety constraints.",
+    }
 
 
 def _summary(report: dict) -> str:
@@ -512,6 +985,10 @@ def _summary(report: dict) -> str:
     chapter_18_plan = chapter_18.get("trade_plan", {})
     chapter_18_llm = chapter_18.get("llm_review", {})
     chapter_18_safety = chapter_18.get("llm_safety_gate", {})
+    autonomous = report.get("autonomous_llm_trader", {})
+    autonomous_decision = autonomous.get("decision", {}) if isinstance(autonomous.get("decision"), dict) else {}
+    final_advice = autonomous_decision.get("final_advice", {}) if isinstance(autonomous_decision.get("final_advice"), dict) else {}
+    autonomous_gate = decision_view.get("autonomous_execution_gate", {})
     chapter_19 = report.get("operations_view", {}).get("chapter_19_validation", {})
     chapter_19_gate = chapter_19.get("action_gate", {})
     chapter_20 = report.get("selection_view", {}).get("chapter_20_ticker_suitability", {})
@@ -576,6 +1053,23 @@ def _summary(report: dict) -> str:
         f"Chapter 18 Reward/Risk: {_format_number(chapter_18_plan.get('reward_to_risk'))}",
         f"Chapter 18 LLM Review: {chapter_18_llm.get('status', 'Unavailable')} safety={chapter_18_safety.get('status', 'Unavailable')}",
         (
+            "Autonomous LLM CEO: "
+            f"{autonomous.get('status', 'Unavailable')} "
+            f"decision={autonomous_decision.get('decision', 'Unavailable')} "
+            f"confidence={_format_number(autonomous_decision.get('confidence'))}"
+        ),
+        f"Autonomous Advice: {final_advice.get('headline', 'Unavailable')}",
+        (
+            "Autonomous Levels: "
+            f"buy_now={_format_price(final_advice.get('buy_now_price'))} "
+            f"buy_lower={_format_price(final_advice.get('buy_lower_price'))} "
+            f"buy_above={_format_price(final_advice.get('buy_above_breakout_price'))} "
+            f"sell_trim={_format_price(final_advice.get('sell_or_trim_price'))} "
+            f"take_profit={_format_price(final_advice.get('take_profit_price'))} "
+            f"stop={_format_price(final_advice.get('stop_loss_price'))}"
+        ),
+        f"Execution Allowed: {autonomous_gate.get('execution_allowed', 'Unavailable')}",
+        (
             "Chapter 19 Validation: "
             f"{chapter_19.get('status', 'Unavailable')} "
             f"action={chapter_19_gate.get('input_action', 'Unknown')} -> {chapter_19_gate.get('validated_action', 'Unknown')}"
@@ -610,6 +1104,7 @@ def _summary(report: dict) -> str:
         f"Risk Level: {report['risk_level']}",
         "",
     ]
+    lines.extend(_autonomous_llm_reasoning_lines(autonomous_decision, autonomous))
     if decision.get("hold_reason"):
         lines.extend([f"Hold Reason: {decision['hold_reason']}", ""])
     blockers = decision.get("blocking_reasons", [])
@@ -631,6 +1126,103 @@ def _summary(report: dict) -> str:
             ]
         )
     return "\n".join(lines).strip()
+
+
+def _autonomous_llm_reasoning_lines(decision: dict, autonomous: dict) -> list[str]:
+    if not decision:
+        return []
+    source_synthesis = autonomous.get("long_term_source_synthesis", {}) if isinstance(autonomous.get("long_term_source_synthesis"), dict) else {}
+    synthesis_payload = source_synthesis.get("synthesis", {}) if isinstance(source_synthesis.get("synthesis"), dict) else {}
+    strategy_context = autonomous.get("strategy_knowledge_context", {}) if isinstance(autonomous.get("strategy_knowledge_context"), dict) else {}
+    strategy_synthesis = strategy_context.get("synthesis", {}) if isinstance(strategy_context.get("synthesis"), dict) else {}
+    lines = ["Autonomous LLM Reasoning:"]
+    if source_synthesis:
+        lines.append(
+            "Source Synthesis: "
+            f"status={source_synthesis.get('status', 'Unavailable')} "
+            f"model={source_synthesis.get('model', 'Unavailable')} "
+            f"coverage_all_passed={source_synthesis.get('llm_evidence_manifest', {}).get('all_scraped_sections_passed', 'Unavailable')}"
+        )
+        if synthesis_payload:
+            lines.extend(
+                [
+                    _json_block("Source Synthesis Output", synthesis_payload),
+                ]
+            )
+    if strategy_context:
+        index_status = strategy_context.get("index_status", {}) if isinstance(strategy_context.get("index_status"), dict) else {}
+        lines.append(
+            "Strategy Knowledge: "
+            f"status={strategy_context.get('status', 'Unavailable')} "
+            f"backend={index_status.get('backend', 'Unavailable')} "
+            f"chunks={len(strategy_context.get('retrieved_chunks', []) or [])}"
+        )
+        if strategy_synthesis:
+            lines.append(_json_block("Strategy Knowledge Synthesis", strategy_synthesis))
+    analysis = decision.get("analysis")
+    if analysis:
+        lines.append(_json_block("CEO Analysis", analysis))
+    rationale = decision.get("llm_rationale")
+    if rationale:
+        lines.extend(["CEO LLM Rationale:", str(rationale)])
+    reasoning = decision.get("decision_reasoning")
+    if reasoning:
+        lines.extend(["CEO Decision Reasoning:", str(reasoning)])
+    final_advice = decision.get("final_advice")
+    if final_advice:
+        lines.append(_json_block("CEO Final Advice", final_advice))
+    lines.append("")
+    return lines
+
+
+def _final_ceo_decision_block(report: dict) -> str:
+    autonomous = report.get("autonomous_llm_trader", {})
+    decision = report.get("llm_final_decision")
+    if not isinstance(decision, dict):
+        decision = autonomous.get("decision") if isinstance(autonomous.get("decision"), dict) else {}
+    final_advice = decision.get("final_advice", {}) if isinstance(decision.get("final_advice"), dict) else {}
+    gate = report.get("decision_view", {}).get("autonomous_execution_gate", {})
+    reasoning = decision.get("decision_reasoning") or report.get("final_decision_reasoning", {}).get("autonomous_llm_rationale")
+    rationale = decision.get("llm_rationale")
+    analysis = decision.get("analysis")
+    lines = [
+        "",
+        "=" * 72,
+        "CEO FINAL DECISION",
+        "=" * 72,
+        f"Status: {autonomous.get('status', 'Unavailable')}",
+        f"Model: {autonomous.get('model', 'Unavailable')}",
+        f"Decision: {decision.get('decision', report.get('suggested_action', 'Unavailable'))}",
+        f"Confidence: {_format_number(decision.get('confidence'))}",
+        f"Risk Level: {report.get('risk_level', 'Unavailable')}",
+        f"Execution Allowed: {gate.get('execution_allowed', 'Unavailable')}",
+    ]
+    blocks = gate.get("execution_blocks") if isinstance(gate, dict) else None
+    if blocks:
+        lines.append("Execution Blocks:")
+        lines.extend(f"- {item}" for item in blocks)
+    warnings = gate.get("warnings") if isinstance(gate, dict) else None
+    if warnings:
+        lines.append("Execution Warnings:")
+        lines.extend(f"- {item}" for item in warnings)
+    if analysis:
+        lines.append(_json_block("Analysis", analysis))
+    if rationale:
+        lines.extend(["Rationale:", str(rationale)])
+    if reasoning:
+        lines.extend(["Decision Reasoning:", str(reasoning)])
+    if final_advice:
+        lines.append(_json_block("Final Advice", final_advice))
+    else:
+        fallback_advice = report.get("final_decision_reasoning", {}).get("final_advice")
+        if fallback_advice:
+            lines.append(_json_block("Final Advice", fallback_advice))
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+def _json_block(title: str, payload: object) -> str:
+    return f"{title}:\n{json.dumps(payload, indent=2, sort_keys=True, default=str)}"
 
 
 def _filter_prices_as_of(prices: pd.DataFrame, as_of: str | None, target_column: str) -> pd.DataFrame:

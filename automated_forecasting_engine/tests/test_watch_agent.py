@@ -225,6 +225,35 @@ def test_watch_dashboard_shows_portfolio_placeholders_before_first_log(tmp_path)
     assert row["portfolio_entry_price"] == 195.8304
 
 
+def test_watch_dashboard_filters_sold_portfolio_override_from_logs_and_placeholders(tmp_path) -> None:
+    log_dir = tmp_path / "logs"
+    context_dir = tmp_path / "portfolio_contexts"
+    log_dir.mkdir()
+    context_dir.mkdir()
+    (tmp_path / "portfolio_overrides.json").write_text(
+        json.dumps({"sold": {"1YD.DE": {"status": "sold", "reason": "sold by user"}}}),
+        encoding="utf-8",
+    )
+    (log_dir / "1YD.DE_medium_20260611.jsonl").write_text(
+        json.dumps({"ticker": "1YD.DE", "profile": "medium", "checked_at": "2026-06-11T10:00:00+00:00", "action": "SELL"}) + "\n",
+        encoding="utf-8",
+    )
+    (log_dir / "ASML.AS_medium_20260611.jsonl").write_text(
+        json.dumps({"ticker": "ASML.AS", "profile": "medium", "checked_at": "2026-06-11T10:00:00+00:00", "action": "HOLD"}) + "\n",
+        encoding="utf-8",
+    )
+    (context_dir / "1yd.de_medium.json").write_text(
+        json.dumps({"ticker": "1YD.DE", "position": {"holding_status": "owned"}}),
+        encoding="utf-8",
+    )
+
+    state = read_watch_logs(log_dir)
+
+    assert [row["ticker"] for row in state["latest"]] == ["ASML.AS"]
+    assert "1YD.DE_medium" not in state["histories"]
+    assert all("1YD.DE" not in path for path in state["log_files"])
+
+
 def test_watch_agent_alerts_buy_when_not_owned_and_breakout_reached() -> None:
     action, reason = decide_action(_decision(), price=1660.0, holding_status="not_owned")
 
@@ -248,6 +277,24 @@ def test_watch_agent_alerts_sell_when_owned_and_stop_is_reached() -> None:
 
 def test_watch_agent_alerts_sell_when_owned_and_take_profit_is_reached() -> None:
     action, reason = decide_action(_decision(), price=1800.0, holding_status="owned")
+
+    assert action == "SELL"
+    assert reason == "TAKE_PROFIT_REACHED"
+
+
+def test_watch_agent_does_not_take_profit_when_owned_position_is_not_profitable() -> None:
+    args = Namespace(entry_price=1900.0, portfolio_context={})
+
+    action, reason = decide_action(_decision(), price=1800.0, holding_status="owned", args=args)
+
+    assert action == "HOLD"
+    assert reason == "TECHNICAL_TAKE_PROFIT_REACHED_BUT_POSITION_NOT_PROFITABLE"
+
+
+def test_watch_agent_take_profit_uses_portfolio_cost_basis_when_owned_position_is_profitable() -> None:
+    args = Namespace(entry_price=None, portfolio_context={"position": {"avg_cost": 1700.0}})
+
+    action, reason = decide_action(_decision(), price=1800.0, holding_status="owned", args=args)
 
     assert action == "SELL"
     assert reason == "TAKE_PROFIT_REACHED"

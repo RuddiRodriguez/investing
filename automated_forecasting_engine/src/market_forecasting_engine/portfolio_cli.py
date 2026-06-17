@@ -13,6 +13,12 @@ from market_forecasting_engine.data_manifest import build_data_manifest
 from market_forecasting_engine.data_providers import DataRequest, ProviderResult, load_prices_with_provider
 from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.data_store import MarketDataStore, request_key
+from market_forecasting_engine.long_term_enrichment import (
+    DEFAULT_LONG_TERM_SOURCE_PROVIDERS,
+    enrich_prices_with_long_term_sources,
+    long_term_context_manifest_entry,
+    parse_long_term_source_providers,
+)
 from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.portfolio import (
     PortfolioHolding,
@@ -59,6 +65,14 @@ def main() -> None:
         default="lightgbm,xgboost,elastic_net,random_forest,extra_trees,gradient_boosting",
         help="Comma-separated Optuna model families to tune.",
     )
+    parser.add_argument("--disable-long-term-sources", action="store_true", help="Disable default long-term source enrichment for portfolio forecasts.")
+    parser.add_argument(
+        "--long-term-source-providers",
+        default=",".join(DEFAULT_LONG_TERM_SOURCE_PROVIDERS),
+        help="Comma-separated long-term source providers to call.",
+    )
+    parser.add_argument("--long-term-source-env-file", default=None, help="Optional .env file for long-term source API keys.")
+    parser.add_argument("--long-term-source-snapshot-dir", default=None, help="Durable directory for point-in-time long-term source snapshots.")
     args = parser.parse_args()
 
     horizons = tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip())
@@ -183,6 +197,22 @@ def _run_symbol_forecast(
     horizons: tuple[int, ...],
     data_store: MarketDataStore,
 ) -> dict[str, Any]:
+    long_term_context = None
+    long_term_snapshot_metadata = None
+    if not args.disable_long_term_sources:
+        prices, long_term_context, long_term_snapshot_metadata = enrich_prices_with_long_term_sources(
+            ticker=symbol,
+            prices=prices,
+            target_column="close",
+            enabled=True,
+            providers=parse_long_term_source_providers(args.long_term_source_providers),
+            env_file=args.long_term_source_env_file,
+            output_dir=data_store.root / "long_term_sources",
+            snapshot_dir=args.long_term_source_snapshot_dir,
+            data_store=data_store,
+            start_date=args.start,
+            end_date=args.end,
+        )
     config = ForecastConfig(
         ticker=symbol,
         horizons=horizons,
@@ -205,6 +235,8 @@ def _run_symbol_forecast(
         optuna_timeout_seconds=args.optuna_timeout,
         optuna_inner_splits=args.optuna_inner_splits,
         optuna_families=tuple(value.strip() for value in args.optuna_families.split(",") if value.strip()),
+        enable_long_term_sources=not args.disable_long_term_sources,
+        long_term_source_providers=parse_long_term_source_providers(args.long_term_source_providers),
     )
     security_metadata = resolve_security_metadata(
         ticker=symbol,
@@ -223,6 +255,11 @@ def _run_symbol_forecast(
         security_metadata=security_metadata,
         calendar_summary=summarize_calendar_alignment(prices),
     )
+    if long_term_context:
+        data_manifest["long_term_sources"] = long_term_context_manifest_entry(
+            long_term_context,
+            long_term_snapshot_metadata,
+        )
     data_store.write_json(
         "manifests",
         "yahoo",
@@ -235,6 +272,7 @@ def _run_symbol_forecast(
         data_manifest=data_manifest,
         data_quality_report=data_quality_report,
         security_metadata=security_metadata,
+        long_term_context=long_term_context,
     )
 
 

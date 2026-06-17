@@ -24,13 +24,15 @@ def build_dashboard_state(
     report, report_path = read_latest_report(state_dir, ticker)
     state, state_path = read_state(state_dir, ticker)
     history, log_path = read_history(state_dir, ticker, max_history=max_history)
-    trade_plan = report.get("option_trade_plan") or {}
+    display_report = _display_report_with_cached_forecast(report, state)
+    trade_plan = display_report.get("option_trade_plan") or {}
     selected = trade_plan.get("selected_contract") or {}
     order = trade_plan.get("order") or {}
     exit_plan = trade_plan.get("exit_plan") or {}
     position_pl = summarize_position_pl(report.get("option_positions") or [])
+    performance = summarize_performance(history=history, report=report, position_pl=position_pl)
     option_type = _option_type_label(trade_plan.get("option_type"), selected.get("symbol") or order.get("symbol"))
-    chart = build_stock_chart_payload(report=report, history=history, ticker=ticker, include_live_bars=include_live_bars)
+    chart = build_stock_chart_payload(report=display_report, history=history, ticker=ticker, include_live_bars=include_live_bars)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "ticker": ticker.upper(),
@@ -44,11 +46,13 @@ def build_dashboard_state(
             "checked_at": report.get("checked_at"),
             "market_is_open": (report.get("market_clock") or {}).get("is_open"),
             "next_open": (report.get("market_clock") or {}).get("next_open"),
-            "forecast_cache_status": report.get("forecast_cache_status"),
-            "forecast_direction": (report.get("selected_forecast") or {}).get("expected_direction"),
-            "spot": (report.get("selected_forecast") or {}).get("spot"),
-            "predicted_price": (report.get("selected_forecast") or {}).get("predicted_price"),
-            "action": trade_plan.get("action"),
+            "forecast_cache_status": display_report.get("forecast_cache_status"),
+            "forecast_direction": (display_report.get("selected_forecast") or {}).get("expected_direction"),
+            "spot": (display_report.get("selected_forecast") or {}).get("spot"),
+            "predicted_price": (display_report.get("selected_forecast") or {}).get("predicted_price"),
+            "action": trade_plan.get("action") or report.get("command"),
+            "strategy": trade_plan.get("strategy") or trade_plan.get("option_type"),
+            "strategy_reason": trade_plan.get("strategy_reason") or _strategy_reason_text(trade_plan.get("strategy") or trade_plan.get("option_type"), trade_plan, display_report),
             "option_type": trade_plan.get("option_type"),
             "option_type_label": option_type,
             "contract": selected.get("symbol"),
@@ -56,6 +60,7 @@ def build_dashboard_state(
             "greeks": selected.get("greeks") or {},
             "spread_pct": selected.get("spread_pct"),
             "open_interest": selected.get("open_interest"),
+            "trade_quality": trade_plan.get("trade_quality") or selected.get("trade_quality") or {},
             "entry_type": order.get("type"),
             "entry_limit": order.get("limit_price"),
             "take_profit": (exit_plan.get("take_profit") or {}).get("limit_price"),
@@ -67,10 +72,48 @@ def build_dashboard_state(
             "order_submitted": (report.get("order_result") or {}).get("submitted"),
             "order_result": report.get("order_result"),
             "position_pl": position_pl,
+            "performance": performance,
         },
         "history": history,
         "chart": chart,
     }
+
+
+def _display_report_with_cached_forecast(report: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    if report.get("forecast_plan") and report.get("selected_forecast"):
+        return report
+    forecast_bundle = state.get("last_forecast") if isinstance(state.get("last_forecast"), dict) else {}
+    forecast_plan = forecast_bundle.get("forecast_plan") if isinstance(forecast_bundle.get("forecast_plan"), dict) else {}
+    selected_forecast = forecast_bundle.get("selected_forecast") if isinstance(forecast_bundle.get("selected_forecast"), dict) else {}
+    if not forecast_plan and not selected_forecast:
+        return report
+    display = dict(report)
+    display.setdefault("forecast_created_at_utc", forecast_bundle.get("created_at_utc"))
+    display.setdefault("forecast_cache_status", "cached_from_state_after_stop_record")
+    display["forecast_plan"] = forecast_plan
+    display["selected_forecast"] = selected_forecast
+    summary = state.get("last_record_summary") if isinstance(state.get("last_record_summary"), dict) else {}
+    if summary and not display.get("option_trade_plan"):
+        selected_contract_symbol = summary.get("contract")
+        display["option_trade_plan"] = {
+            "action": summary.get("action"),
+            "reason": summary.get("reason"),
+            "strategy": summary.get("strategy"),
+            "selected_contract": {
+                "symbol": selected_contract_symbol,
+                "name": summary.get("contract_name"),
+                "trade_quality": {
+                    "score": summary.get("trade_quality_score"),
+                    "grade": summary.get("trade_quality_grade"),
+                },
+            },
+            "order": {
+                "symbol": selected_contract_symbol,
+                "limit_price": summary.get("limit_price"),
+            },
+            "risk": {"estimated_debit": summary.get("estimated_debit")},
+        }
+    return display
 
 
 def build_stock_chart_payload(
@@ -81,12 +124,22 @@ def build_stock_chart_payload(
     include_live_bars: bool = True,
 ) -> dict[str, Any]:
     broker_points = _recent_stock_bar_points(ticker or str(report.get("ticker") or "")) if include_live_bars else []
-    actual_points = broker_points if broker_points else _history_actual_points(history)
-    latest_actual = actual_points[-1] if actual_points else {}
+    history_points = _history_actual_points(history)
     forecast_plan = report.get("forecast_plan") or {}
     selected_forecast = report.get("selected_forecast") or {}
     as_of = forecast_plan.get("as_of") or report.get("forecast_created_at_utc") or report.get("checked_at")
     as_of_price = _to_float(forecast_plan.get("latest_price")) or _to_float(selected_forecast.get("spot"))
+    broker_points_are_stale = _points_are_stale_for_as_of(broker_points, as_of)
+    if broker_points and not broker_points_are_stale:
+        actual_points = broker_points
+        source = "alpaca_stock_bars"
+    elif history_points:
+        actual_points = history_points
+        source = "agent_history_stale_broker_bars" if broker_points_are_stale else "agent_history"
+    else:
+        actual_points = broker_points
+        source = "alpaca_stock_bars_stale" if broker_points_are_stale else "alpaca_stock_bars"
+    latest_actual = actual_points[-1] if actual_points else {}
     forecasts = forecast_plan.get("forecasts") or []
     if not forecasts and selected_forecast:
         forecasts = [selected_forecast]
@@ -106,12 +159,12 @@ def build_stock_chart_payload(
             }
         )
     return {
-        "actual_points": actual_points[-240:],
+        "actual_points": actual_points[-10000:],
         "forecast_points": forecast_points,
         "as_of": as_of,
         "as_of_price": as_of_price,
         "latest_actual": latest_actual,
-        "source": "alpaca_stock_bars" if broker_points else "agent_history",
+        "source": source,
     }
 
 
@@ -133,12 +186,35 @@ def _history_actual_points(history: list[dict[str, Any]]) -> list[dict[str, Any]
     return actual_points
 
 
+def _points_are_stale_for_as_of(points: list[dict[str, Any]], as_of: Any, *, max_gap_hours: float = 24.0) -> bool:
+    if not points or not as_of:
+        return False
+    latest = _parse_timestamp(points[-1].get("timestamp"))
+    anchor = _parse_timestamp(as_of)
+    if latest is None or anchor is None:
+        return False
+    return abs((anchor - latest).total_seconds()) > max_gap_hours * 3600.0
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _recent_stock_bar_points(ticker: str) -> list[dict[str, Any]]:
     symbol = str(ticker or "").upper().strip()
     if not symbol or "/" in symbol or "-" in symbol:
         return []
     end = datetime.now(UTC)
-    start = end - pd.Timedelta(hours=8)
+    start = end - pd.Timedelta(days=183)
     broker = AlpacaPaperBroker()
     rows: list[dict[str, Any]] = []
     for feed in (None, "iex"):
@@ -147,9 +223,9 @@ def _recent_stock_bar_points(ticker: str) -> list[dict[str, Any]]:
                 symbol,
                 start=start.isoformat().replace("+00:00", "Z"),
                 end=end.isoformat().replace("+00:00", "Z"),
-                timeframe="1Min",
+                timeframe="5Min",
                 feed=feed,
-                limit=1000,
+                limit=10000,
             )
             if rows:
                 break
@@ -159,8 +235,22 @@ def _recent_stock_bar_points(ticker: str) -> list[dict[str, Any]]:
     for row in rows:
         timestamp = row.get("t") or row.get("timestamp")
         close = _to_float(row.get("c") or row.get("close"))
+        open_price = _to_float(row.get("o") or row.get("open"))
+        high = _to_float(row.get("h") or row.get("high"))
+        low = _to_float(row.get("l") or row.get("low"))
+        volume = _to_float(row.get("v") or row.get("volume"))
         if timestamp and close is not None:
-            points.append({"timestamp": str(timestamp), "price": close})
+            points.append(
+                {
+                    "timestamp": str(timestamp),
+                    "price": close,
+                    "open": open_price if open_price is not None else close,
+                    "high": high if high is not None else close,
+                    "low": low if low is not None else close,
+                    "close": close,
+                    "volume": volume,
+                }
+            )
     return points
 
 
@@ -215,6 +305,215 @@ def summarize_position_pl(positions: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_performance(
+    *, history: list[dict[str, Any]], report: dict[str, Any], position_pl: dict[str, Any]
+) -> dict[str, Any]:
+    metrics = ((report.get("entry_guard") or {}).get("metrics") or {}).copy()
+    if not metrics:
+        for row in reversed(history):
+            metrics = ((row.get("entry_guard") or {}).get("metrics") or {}).copy()
+            if metrics:
+                break
+    realized = _to_float(metrics.get("realized_pnl_today")) or 0.0
+    open_pl = _to_float(position_pl.get("total_unrealized_pl")) or 0.0
+    open_exposure = _to_float(position_pl.get("total_cost")) or 0.0
+    round_trips = int(_to_float(metrics.get("round_trips_today")) or 0)
+    entries = int(_to_float(metrics.get("buy_entries_today")) or 0)
+    consecutive_losses = int(_to_float(metrics.get("consecutive_losses")) or 0)
+    submitted_orders = 0
+    blocked_cycles = 0
+    hold_cycles = 0
+    buy_cycles = 0
+    realized_deltas: list[float] = []
+    previous_round_trips: int | None = None
+    previous_realized: float | None = None
+    for row in history:
+        if (row.get("order_result") or {}).get("submitted"):
+            submitted_orders += 1
+        if row.get("execution_blocks"):
+            blocked_cycles += 1
+        action = str((row.get("option_trade_plan") or {}).get("action") or "")
+        if action == "hold":
+            hold_cycles += 1
+        if action == "buy_option":
+            buy_cycles += 1
+        row_metrics = (row.get("entry_guard") or {}).get("metrics") or {}
+        row_round_trips = int(_to_float(row_metrics.get("round_trips_today")) or 0)
+        row_realized = _to_float(row_metrics.get("realized_pnl_today"))
+        if row_realized is None:
+            continue
+        if previous_round_trips is not None and row_round_trips > previous_round_trips and previous_realized is not None:
+            realized_deltas.append(round(row_realized - previous_realized, 2))
+        previous_round_trips = row_round_trips
+        previous_realized = row_realized
+    wins = sum(1 for value in realized_deltas if value > 0)
+    losses = sum(1 for value in realized_deltas if value < 0)
+    scored_round_trips = wins + losses
+    win_rate = (wins / scored_round_trips) if scored_round_trips else None
+    total = realized + open_pl
+    status = "flat"
+    if total > 0:
+        status = "winning"
+    elif total < 0:
+        status = "losing"
+    return {
+        "status": status,
+        "realized_pnl_today": round(realized, 2),
+        "open_pnl": round(open_pl, 2),
+        "total_pnl": round(total, 2),
+        "open_exposure": round(open_exposure, 2),
+        "entries_today": entries,
+        "round_trips_today": round_trips,
+        "consecutive_losses": consecutive_losses,
+        "win_count_from_log": wins,
+        "loss_count_from_log": losses,
+        "win_rate_from_log": round(win_rate, 4) if win_rate is not None else None,
+        "submitted_orders_in_view": submitted_orders,
+        "blocked_cycles_in_view": blocked_cycles,
+        "hold_cycles_in_view": hold_cycles,
+        "buy_cycles_in_view": buy_cycles,
+        "last_filled_order_at": metrics.get("last_filled_order_at"),
+        "last_losing_trade_exit_at": metrics.get("last_losing_trade_exit_at"),
+    }
+
+
+def summarize_all_agents(state_dir: Path, tickers: set[str] | None = None, run_prefixes: set[str] | None = None) -> dict[str, Any]:
+    allowed = {ticker.upper().strip() for ticker in tickers or set() if ticker.strip()}
+    allowed_prefixes = {str(prefix).strip() for prefix in run_prefixes or set() if str(prefix).strip()}
+    root = state_dir.parent
+    current_date = datetime.now(UTC).date()
+    controller_report = _read_json(root / "daily_target_options_controller_report.json")
+    controller_active_tickers = {
+        str(ticker).upper()
+        for ticker in controller_report.get("active_tickers", []) or []
+        if str(ticker).strip()
+    }
+    controller_valuation = controller_report.get("valuation_after") or controller_report.get("valuation_before") or {}
+    controller_exposed_tickers = {
+        str(ticker).upper()
+        for ticker in [
+            *(controller_valuation.get("open_position_underlyings") or []),
+            *(controller_valuation.get("open_order_underlyings") or []),
+        ]
+        if str(ticker).strip()
+    }
+    controller_visible_daily_tickers = controller_active_tickers | controller_exposed_tickers
+    candidate_patterns = (
+        "alpaca_options_*",
+        "alpaca_hybrid_options_paper_*",
+        "alpaca_daily_target_options_*",
+        "alpaca_chronos_options_*",
+    )
+    candidates = sorted({path for pattern in candidate_patterns for path in root.glob(pattern)}, key=lambda path: str(path))
+    if allowed_prefixes:
+        candidates = [path for path in candidates if any(path.name.startswith(prefix) for prefix in allowed_prefixes)]
+    if not candidates:
+        candidates = [state_dir]
+    latest_by_ticker: dict[str, tuple[Path, Path]] = {}
+    for candidate in candidates:
+        report_paths = sorted(candidate.glob("*_options_agent_report.json"))
+        for report_path in report_paths:
+            ticker = report_path.name.removesuffix("_options_agent_report.json").upper()
+            if allowed and ticker not in allowed:
+                continue
+            if (
+                candidate.name.startswith("alpaca_daily_target_options_")
+                and not allowed
+                and controller_visible_daily_tickers
+                and ticker not in controller_visible_daily_tickers
+            ):
+                continue
+            current = latest_by_ticker.get(ticker)
+            if current is None or report_path.stat().st_mtime > current[1].stat().st_mtime:
+                latest_by_ticker[ticker] = (candidate, report_path)
+
+    rows: list[dict[str, Any]] = []
+    totals = {
+        "realized_pnl_today": 0.0,
+        "open_pnl": 0.0,
+        "total_pnl": 0.0,
+        "open_exposure": 0.0,
+        "entries_today": 0,
+        "round_trips_today": 0,
+        "submitted_orders_in_view": 0,
+    }
+    for ticker, (candidate, report_path) in sorted(latest_by_ticker.items()):
+        report = _read_json(report_path)
+        history, _ = read_history(candidate, ticker, max_history=200)
+        position_pl = summarize_position_pl(report.get("option_positions") or [])
+        performance = summarize_performance(history=history, report=report, position_pl=position_pl)
+        checked_date = _parse_timestamp(report.get("checked_at"))
+        is_stale_closed_report = (
+            checked_date is not None
+            and checked_date.date() != current_date
+            and float(performance.get("open_exposure") or 0.0) <= 0.0
+            and float(performance.get("open_pnl") or 0.0) == 0.0
+        )
+        if is_stale_closed_report:
+            continue
+        latest_blocks = report.get("execution_blocks") or []
+        trade_plan = report.get("option_trade_plan") or {}
+        latest_action = trade_plan.get("action") or "-"
+        selected_contract = trade_plan.get("selected_contract") or {}
+        strategy = trade_plan.get("strategy") or trade_plan.get("option_type") or "-"
+        row = {
+            "ticker": ticker,
+            "state_dir": str(candidate),
+            "report_path": str(report_path),
+            "checked_at": report.get("checked_at"),
+            "action": latest_action,
+            "forecast_engine": (trade_plan.get("forecast_engine") or (report.get("forecast_plan") or {}).get("forecast_engine") or {}).get("selected")
+            or (report.get("forecast_plan") or {}).get("mode"),
+            "forecast_model": ((report.get("selected_forecast") or {}).get("selected_model") or (report.get("selected_forecast") or {}).get("method")),
+            "forecast_fallback": ((report.get("forecast_plan") or {}).get("forecast_engine") or {}).get("fallback_from_full_engine"),
+            "strategy": strategy,
+            "strategy_reason": trade_plan.get("strategy_reason") or _strategy_reason_text(strategy, trade_plan, report),
+            "blocks": latest_blocks,
+            "forecast_direction": (report.get("selected_forecast") or {}).get("expected_direction"),
+            "spot": (report.get("selected_forecast") or {}).get("spot"),
+            "contract": selected_contract.get("symbol"),
+            "trade_quality": trade_plan.get("trade_quality") or selected_contract.get("trade_quality") or {},
+            "performance": performance,
+        }
+        rows.append(row)
+        totals["realized_pnl_today"] += performance["realized_pnl_today"]
+        totals["open_pnl"] += performance["open_pnl"]
+        totals["total_pnl"] += performance["total_pnl"]
+        totals["open_exposure"] += performance["open_exposure"]
+        totals["entries_today"] += performance["entries_today"]
+        totals["round_trips_today"] += performance["round_trips_today"]
+        totals["submitted_orders_in_view"] += performance["submitted_orders_in_view"]
+    for key in ("realized_pnl_today", "open_pnl", "total_pnl", "open_exposure"):
+        totals[key] = round(totals[key], 2)
+    totals["agent_count"] = len(rows)
+    totals["status"] = "winning" if totals["total_pnl"] > 0 else "losing" if totals["total_pnl"] < 0 else "flat"
+    rows.sort(key=lambda row: row.get("ticker") or "")
+    return {"totals": totals, "rows": rows}
+
+
+def _strategy_reason_text(strategy: Any, trade_plan: dict[str, Any], report: dict[str, Any]) -> str:
+    strategy_name = str(strategy or "").lower()
+    forecast = report.get("selected_forecast") or {}
+    direction = str(forecast.get("expected_direction") or "").lower()
+    market_regime = trade_plan.get("market_regime") or {}
+    regime = str(market_regime.get("regime") or "").lower()
+    if strategy_name == "call":
+        return "Directional call: forecast and contract filters currently favor an upward move."
+    if strategy_name == "put":
+        return "Directional put: forecast and contract filters currently favor a downward move."
+    if strategy_name == "long_straddle":
+        return "Long straddle: direction is less certain, but the plan expects a large enough move to justify buying both sides."
+    if strategy_name == "short_iron_butterfly":
+        return "Short iron butterfly: price appears range-bound/choppy, so the plan sells defined-risk premium around the center strike."
+    if strategy_name == "long_call_calendar":
+        return "Call calendar spread: bullish thesis looks slower, using near/far expiry structure instead of a single call."
+    if strategy_name == "long_put_calendar":
+        return "Put calendar spread: bearish thesis looks slower, using near/far expiry structure instead of a single put."
+    if regime:
+        return f"Strategy selected from market regime '{regime}' and {direction or 'flat'} forecast."
+    return "Strategy selected from forecast, live option quotes, spread, Greeks, liquidity, and risk budget."
+
+
 def read_latest_report(state_dir: Path, ticker: str) -> tuple[dict[str, Any], Path | None]:
     path = state_dir / f"{ticker.upper()}_options_agent_report.json"
     if not path.exists():
@@ -248,29 +547,30 @@ def dashboard_html(refresh_seconds: int) -> str:
   <title>Options Agent Dashboard</title>
   <style>
     :root {{
-      --bg: #f5f7fa;
-      --panel: #ffffff;
-      --text: #17202a;
-      --muted: #637083;
-      --line: #d9dee8;
-      --buy: #067647;
-      --hold: #7c5c00;
-      --blocked: #b42318;
-      --accent: #2563eb;
+      --bg: #0b1119;
+      --panel: #111a26;
+      --panel2: #0f1722;
+      --text: #e7eef8;
+      --muted: #9fb1c8;
+      --line: #263548;
+      --buy: #2ed48f;
+      --hold: #f6b84b;
+      --blocked: #ff5c74;
+      --accent: #6aa2ff;
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }}
-    header {{ display: flex; justify-content: space-between; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }}
+    header {{ display: flex; justify-content: space-between; gap: 16px; padding: 22px 32px; border-bottom: 1px solid var(--line); background: #0c141f; position: sticky; top: 0; z-index: 2; }}
     h1 {{ margin: 0; font-size: 20px; }}
     main {{ max-width: 1280px; margin: 0 auto; padding: 18px 22px 30px; }}
     .meta, .small {{ color: var(--muted); font-size: 13px; }}
     .cards {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }}
-    .card, .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }}
+    .card, .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: 0 18px 50px rgba(0,0,0,.16); }}
     .label {{ color: var(--muted); font-size: 12px; margin-bottom: 5px; }}
     .value {{ font-size: 22px; font-weight: 750; overflow-wrap: anywhere; }}
-    .badge {{ display: inline-block; border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 750; color: white; background: var(--hold); text-transform: uppercase; }}
-    .badge.buy_option {{ background: var(--buy); }}
-    .badge.blocked {{ background: var(--blocked); }}
+    .badge {{ display: inline-block; border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 750; color: #09111c; background: var(--hold); text-transform: uppercase; }}
+    .badge.buy_option {{ background: var(--buy); color:#06130e; }}
+    .badge.blocked {{ background: var(--blocked); color:#1d0509; }}
     .win {{ color: var(--buy); }}
     .loss {{ color: var(--blocked); }}
     .grid2 {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 0.8fr); gap: 14px; }}
@@ -279,13 +579,17 @@ def dashboard_html(refresh_seconds: int) -> str:
     .legend {{ display: flex; gap: 14px; flex-wrap: wrap; }}
     .key {{ display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }}
     .swatch {{ width: 18px; height: 0; border-top: 2px solid currentColor; display: inline-block; }}
-    .swatch.actual {{ color: #111827; }}
-    .swatch.forecast {{ color: #dc2626; border-top-style: dashed; }}
-    svg#stockChart {{ width: 100%; min-width: 820px; height: 360px; display: block; }}
+    .swatch.actual {{ color: #dbe7f6; }}
+    .swatch.forecast {{ color: #ff5c74; border-top-style: dashed; }}
+    .chartControls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:10px 0 12px; }}
+    .chartControls button,.chartControls label {{ border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:6px; padding:7px 10px; font-size:12px; }}
+    .chartControls button.active {{ background:var(--accent); color:#04111f; font-weight:800; }}
+    .chartControls label {{ display:flex; gap:6px; align-items:center; cursor:pointer; }}
+    svg#stockChart {{ width: 100%; min-width: 920px; height: 520px; display: block; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ padding: 8px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 650; }}
-    pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }}
+    pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; color:#d9e4f2; }}
     .blocks {{ color: var(--blocked); font-weight: 650; }}
     @media (max-width: 900px) {{ header {{ flex-direction: column; }} .cards, .grid2 {{ grid-template-columns: 1fr; }} }}
   </style>
@@ -319,6 +623,7 @@ def dashboard_html(refresh_seconds: int) -> str:
     </section>
     <section class="cards">
       <div class="card"><div class="label">Order Result</div><div class="value" id="orderResult">-</div><div class="small" id="checkedAt">-</div></div>
+      <div class="card"><div class="label">Trade Quality</div><div class="value" id="tradeQuality">-</div><div class="small" id="tradeQualityMeta">-</div></div>
     </section>
     <section class="panel chart-panel">
       <div class="chart-head">
@@ -327,6 +632,22 @@ def dashboard_html(refresh_seconds: int) -> str:
           <span class="key"><span class="swatch actual"></span>Stock price</span>
           <span class="key"><span class="swatch forecast"></span>Forecast line</span>
         </div>
+      </div>
+      <div class="chartControls">
+        <button type="button" data-range="1h" class="active">1h</button>
+        <button type="button" data-range="1d">1d</button>
+        <button type="button" data-range="2d">2d</button>
+        <button type="button" data-range="1m">1m</button>
+        <button type="button" data-range="2m">2m</button>
+        <button type="button" data-range="3m">3m</button>
+        <button type="button" data-range="6m">6m</button>
+        <button type="button" id="forecastZoom">Forecast zoom</button>
+        <button type="button" id="zoomIn">Zoom in</button>
+        <button type="button" id="zoomOut">Zoom out</button>
+        <label><input type="checkbox" id="showLine" checked> line</label>
+        <label><input type="checkbox" id="showCandles" checked> candles</label>
+        <label><input type="checkbox" id="showSma9" checked> SMA 9</label>
+        <label><input type="checkbox" id="showSma21" checked> SMA 21</label>
       </div>
       <svg id="stockChart" role="img" aria-label="Stock price chart with forecast line"></svg>
     </section>
@@ -359,6 +680,8 @@ def dashboard_html(refresh_seconds: int) -> str:
   </main>
   <script>
     const refreshMs = {refresh_seconds * 1000};
+    const chartPrefs = {{ range: "1h", zoomFactor: 1, forecastZoom: false, showLine: true, showCandles: true, showSma9: true, showSma21: true }};
+    let lastDashboardData = null;
     const fmt = new Intl.NumberFormat(undefined, {{ maximumFractionDigits: 4 }});
     function price(v) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : fmt.format(Number(v)); }}
     function money(v) {{
@@ -384,6 +707,7 @@ def dashboard_html(refresh_seconds: int) -> str:
       }};
     }}
     function render(data) {{
+      lastDashboardData = data;
       const s = data.summary || {{}};
       set("source", `${{data.ticker}} / ${{data.state_dir}}`);
       set("updated", `Updated ${{time(data.generated_at)}}`);
@@ -407,6 +731,9 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("thetaMeta", `horizon decay $${{price(g.theta_decay_usd_for_horizon)}} | premium/day ${{price((g.theta_premium_pct_per_day || 0) * 100)}}%`);
       set("greekVega", price(g.vega));
       set("liquidityMeta", `spread ${{price((s.spread_pct || 0) * 100)}}% | open interest ${{price(s.open_interest)}}`);
+      const q = s.trade_quality || {{}};
+      set("tradeQuality", q.score === undefined ? "-" : `${{price(q.score)}} / 100`);
+      set("tradeQualityMeta", q.grade ? `${{q.grade}} | breakeven edge ${{price(q.forecast_breakeven_edge ?? q.expected_move_vs_debit_edge)}} | theta $${{price(q.theta_cost_for_horizon_usd)}}` : "-");
       set("takeProfit", price(s.take_profit));
       set("stopLoss", `${{price(s.stop_price)}} / ${{price(s.stop_limit)}}`);
       set("market", s.market_is_open ? "open" : "closed");
@@ -427,96 +754,214 @@ def dashboard_html(refresh_seconds: int) -> str:
     }}
     function renderStockChart(chart) {{
       const svg = document.getElementById("stockChart");
-      const width = Math.max(svg.clientWidth || 960, 820);
-      const height = 360;
-      const pad = {{ left: 62, right: 28, top: 20, bottom: 44 }};
+      const width = Math.max(svg.clientWidth || 1120, 920);
+      const height = 520;
+      const pad = {{ left: 86, right: 42, top: 34, bottom: 66 }};
       svg.setAttribute("viewBox", `0 0 ${{width}} ${{height}}`);
       svg.innerHTML = "";
-      const actual = (chart.actual_points || []).map(p => [parseTimestampMs(p.timestamp), Number(p.price)]).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-      const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: parseTimestampMs(p.timestamp), y: Number(p.predicted_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
-      const latestActual = actual.length ? actual[actual.length - 1] : null;
-      const latestActualTime = latestActual ? latestActual[0] : null;
-      const maturedCount = forecasts.filter(p => Number.isFinite(latestActualTime) && p.x <= latestActualTime).length;
+      const raw = (chart.actual_points || []).map(p => {{
+        const close = Number(p.close ?? p.price);
+        const hasOhlc = p.open !== undefined || p.high !== undefined || p.low !== undefined || p.close !== undefined;
+        return {{
+          t: parseTimestampMs(p.timestamp),
+          o: Number(p.open ?? close),
+          h: Number(p.high ?? close),
+          l: Number(p.low ?? close),
+          c: close,
+          v: Number(p.volume || 0),
+          hasOhlc
+        }};
+      }}).filter(p => Number.isFinite(p.t) && Number.isFinite(p.c));
+      const forecasts = (chart.forecast_points || []).map(p => ({{ ...p, x: parseTimestampMs(p.timestamp), y: Number(p.predicted_price), lo: Number(p.lower_price), hi: Number(p.upper_price) }})).filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+      const latest = raw.length ? raw.at(-1) : null;
+      const latestTime = latest ? latest.t : null;
+      const maturedCount = forecasts.filter(p => Number.isFinite(latestTime) && p.x <= latestTime).length;
       const pendingCount = forecasts.length - maturedCount;
-      set("chartMeta", `actual ${{actual.length}} | forecast ${{forecasts.length}} | matured ${{maturedCount}} | pending ${{pendingCount}} | source ${{chart.source || "-"}}`);
+      const rangeMs = rangeToMs(chartPrefs.range) / Math.max(chartPrefs.zoomFactor, 0.25);
       const asOfTime = chart.as_of ? parseTimestampMs(chart.as_of) : null;
       const asOfPrice = Number(chart.as_of_price);
-      const focusStart = Number.isFinite(asOfTime) ? asOfTime - 2 * 60 * 60 * 1000 : null;
-      const focusEnd = forecasts.length ? Math.max(...forecasts.map(p => p.x)) + 15 * 60 * 1000 : null;
-      const visibleActual = actual.filter(p => (!Number.isFinite(focusStart) || p[0] >= focusStart) && (!Number.isFinite(focusEnd) || p[0] <= focusEnd));
-      const plotActual = visibleActual.length >= 2 ? visibleActual : actual;
-      const xs = plotActual.map(p => p[0]).concat(forecasts.map(p => p.x)).concat(Number.isFinite(asOfTime) ? [asOfTime] : []);
-      const ys = plotActual.map(p => p[1]).concat(forecasts.flatMap(p => [p.y, p.lower_price, p.upper_price]).map(Number).filter(Number.isFinite)).concat(Number.isFinite(asOfPrice) ? [asOfPrice] : []);
+      const hasForecastContext = forecasts.length > 0 && Number.isFinite(asOfTime) && Number.isFinite(asOfPrice);
+      const maxForecastTime = forecasts.length ? Math.max(...forecasts.map(p => p.x)) : latestTime;
+      const endTime = chartPrefs.forecastZoom && forecasts.length && Number.isFinite(maxForecastTime) ? maxForecastTime + 10 * 60 * 1000 : latestTime;
+      const startTime = chartPrefs.forecastZoom && hasForecastContext ? asOfTime - Math.min(rangeMs, 90 * 60 * 1000) : (Number.isFinite(endTime) ? endTime - rangeMs : null);
+      const visibleRaw = raw.filter(p => (!Number.isFinite(startTime) || p.t >= startTime) && (!Number.isFinite(endTime) || p.t <= endTime));
+      const fallbackRaw = visibleRaw.length >= 2 ? visibleRaw : raw.slice(-240);
+      const candleMinutes = candleBucketMinutes(chartPrefs.range);
+      const hasRealOhlc = fallbackRaw.some(p => p.hasOhlc);
+      const sparseActual = !hasRealOhlc || String(chart.source || "").startsWith("agent_history");
+      const candles = sparseActual ? fallbackRaw.map(p => ({{ t: p.t, o: p.c, h: p.c, l: p.c, c: p.c, v: p.v || 0 }})) : aggregateCandles(fallbackRaw, candleMinutes);
+      const closePoints = candles.map(c => ({{ t: c.t, y: c.c }}));
+      const longSparseRange = sparseActual && ["1m", "2m", "3m", "6m"].includes(chartPrefs.range);
+      const sma9 = sparseActual ? [] : movingAverage(closePoints, 9);
+      const sma21 = sparseActual ? [] : movingAverage(closePoints, 21);
+      set("chartMeta", `actual ${{sparseActual ? "samples" : "bars"}} ${{raw.length}} | displayed ${{sparseActual ? "samples" : candleMinutes + "m candles"}} ${{candles.length}} | forecast ${{forecasts.length}} | matured ${{maturedCount}} | pending ${{pendingCount}} | range ${{chartPrefs.forecastZoom ? "forecast zoom" : chartPrefs.range}}${{longSparseRange ? " | sparse long range: dots only" : ""}} | source ${{chart.source || "-"}}`);
+      const xs = candles.map(p => p.t).concat(forecasts.map(p => p.x)).concat(hasForecastContext ? [asOfTime] : []);
+      const ys = candles.flatMap(p => [p.h, p.l]).concat(sma9.map(p => p.y), sma21.map(p => p.y), forecasts.flatMap(p => [p.y, p.lo, p.hi]).filter(Number.isFinite), hasForecastContext ? [asOfPrice] : []);
       if (!xs.length || !ys.length) {{
-        const text = el("text", {{ x: 20, y: 32, fill: "#637083", "font-size": 14 }});
+        const text = el("text", {{ x: 20, y: 32, fill: "#9fb1c8", "font-size": 14 }});
         text.textContent = "No stock price history available yet.";
         svg.appendChild(text);
         return;
       }}
-      let minX = Math.min(...xs), maxX = Math.max(...xs);
-      if (Number.isFinite(asOfTime) && forecasts.length) {{
-        minX = Math.min(minX, asOfTime - 90 * 60 * 1000);
-        maxX = Math.max(maxX, Math.max(...forecasts.map(p => p.x)) + 10 * 60 * 1000);
-      }}
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
       const minY0 = Math.min(...ys), maxY0 = Math.max(...ys);
-      const yPad = Math.max((maxY0 - minY0) * 0.08, 0.5);
+      const yPad = Math.max((maxY0 - minY0) * 0.12, 0.5);
       const minY = minY0 - yPad, maxY = maxY0 + yPad;
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       const x = v => pad.left + ((v - minX) / Math.max(maxX - minX, 1)) * plotW;
       const y = v => pad.top + (1 - ((v - minY) / Math.max(maxY - minY, 1))) * plotH;
-      svg.appendChild(el("rect", {{ x: 0, y: 0, width, height, fill: "#fff" }}));
+      svg.appendChild(el("rect", {{ x: 0, y: 0, width, height, fill: "#111a26" }}));
       for (let i = 0; i <= 4; i++) {{
         const yy = pad.top + i * plotH / 4;
-        svg.appendChild(el("line", {{ x1: pad.left, y1: yy, x2: width - pad.right, y2: yy, stroke: "#e5e7eb" }}));
+        svg.appendChild(el("line", {{ x1: pad.left, y1: yy, x2: width - pad.right, y2: yy, stroke: "#263548" }}));
         const label = minY + (1 - i / 4) * (maxY - minY);
-        const t = el("text", {{ x: 8, y: yy + 4, fill: "#637083", "font-size": 12 }});
-        t.textContent = price(label);
+        const t = el("text", {{ x: pad.left - 10, y: yy + 4, "text-anchor": "end", fill: "#9fb1c8", "font-size": 12 }});
+        t.textContent = `$${{price(label)}}`;
         svg.appendChild(t);
       }}
-      if (plotActual.length > 1) {{
-        svg.appendChild(el("path", {{ d: plotActual.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#111827", "stroke-width": 2 }}));
+      svg.appendChild(el("line", {{ x1: pad.left, y1: pad.top, x2: pad.left, y2: height - pad.bottom, stroke: "#304157" }}));
+      svg.appendChild(el("line", {{ x1: pad.left, y1: height - pad.bottom, x2: width - pad.right, y2: height - pad.bottom, stroke: "#304157" }}));
+      const candleWidth = Math.max(2, Math.min(12, plotW / Math.max(candles.length, 1) * .62));
+      if (chartPrefs.showCandles && !sparseActual) {{
+        candles.forEach(c => {{
+          const up = c.c >= c.o;
+          const color = up ? "#2ed48f" : "#ff5c74";
+          const cx = x(c.t);
+          const top = y(Math.max(c.o, c.c));
+          const bottom = y(Math.min(c.o, c.c));
+          svg.appendChild(el("line", {{ x1: cx, x2: cx, y1: y(c.h), y2: y(c.l), stroke: color, "stroke-width": 1.2 }}));
+          svg.appendChild(el("rect", {{ x: cx - candleWidth / 2, y: top, width: candleWidth, height: Math.max(1, bottom - top), fill: color, opacity: .78 }}));
+        }});
+      }}
+      if (sparseActual) {{
+        closePoints.forEach(p => {{
+          svg.appendChild(el("circle", {{ cx: x(p.t), cy: y(p.y), r: 3.8, fill: "#dbe7f6", opacity: .82 }}));
+        }});
+      }}
+      if (chartPrefs.showLine && closePoints.length > 1 && !longSparseRange) {{
+        segmentedLinePaths(closePoints, maxActualLineGapMs(chartPrefs.range, sparseActual)).forEach(segment => {{
+          if (segment.length > 1) svg.appendChild(el("path", {{ d: linePath(segment, x, y), fill: "none", stroke: "#dbe7f6", "stroke-width": 2, opacity: .86 }}));
+        }});
+      }}
+      if (chartPrefs.showSma9 && sma9.length) {{
+        svg.appendChild(el("path", {{ d: linePath(sma9, x, y), fill: "none", stroke: "#f6b84b", "stroke-width": 2 }}));
+        const label = el("text", {{ x: width - pad.right - 70, y: pad.top + 18, fill: "#f6b84b", "font-size": 12 }});
+        label.textContent = "SMA 9";
+        svg.appendChild(label);
+      }}
+      if (chartPrefs.showSma21 && sma21.length) {{
+        svg.appendChild(el("path", {{ d: linePath(sma21, x, y), fill: "none", stroke: "#2ed48f", "stroke-width": 2 }}));
+        const label = el("text", {{ x: width - pad.right - 70, y: pad.top + 36, fill: "#2ed48f", "font-size": 12 }});
+        label.textContent = "SMA 21";
+        svg.appendChild(label);
+      }}
+      if (hasForecastContext) {{
+        svg.appendChild(el("line", {{ x1: x(asOfTime), x2: x(asOfTime), y1: pad.top, y2: height - pad.bottom, stroke: "#6aa2ff", "stroke-width": 1.5, "stroke-dasharray": "3 4" }}));
+      }}
+      const band = forecasts.filter(p => Number.isFinite(p.lo) && Number.isFinite(p.hi));
+      if (band.length && hasForecastContext) {{
+        const upper = [{{t: asOfTime, y: asOfPrice}}].concat(band.map(p => ({{t: p.x, y: p.hi}})));
+        const lower = [{{t: asOfTime, y: asOfPrice}}].concat(band.map(p => ({{t: p.x, y: p.lo}}))).reverse();
+        svg.appendChild(el("path", {{ d: upper.concat(lower).map((p, i) => `${{i ? "L" : "M"}}${{x(p.t).toFixed(2)}},${{y(p.y).toFixed(2)}}`).join(" ") + "Z", fill: "rgba(255,92,116,0.18)", stroke: "none" }}));
       }}
       const forecastLine = [];
-      if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) forecastLine.push([asOfTime, asOfPrice]);
-      forecasts.forEach(p => forecastLine.push([p.x, p.y]));
-      if (forecasts.length && Number.isFinite(asOfTime)) {{
-        const band = forecasts.filter(p => Number.isFinite(Number(p.lower_price)) && Number.isFinite(Number(p.upper_price)));
-        if (band.length) {{
-          const upper = [[asOfTime, asOfPrice]].concat(band.map(p => [p.x, Number(p.upper_price)]));
-          const lower = [[asOfTime, asOfPrice]].concat(band.map(p => [p.x, Number(p.lower_price)])).reverse();
-          svg.appendChild(el("path", {{ d: upper.concat(lower).map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" ") + "Z", fill: "rgba(220,38,38,0.10)", stroke: "none" }}));
+      if (hasForecastContext) forecastLine.push({{ t: asOfTime, y: asOfPrice }});
+      forecasts.forEach(p => forecastLine.push({{ t: p.x, y: p.y }}));
+      if (forecastLine.length > 1) {{
+        svg.appendChild(el("path", {{ d: linePath(forecastLine, x, y), fill: "none", stroke: "#ff5c74", "stroke-width": 2.4, "stroke-dasharray": "7 5" }}));
+      }}
+      if (hasForecastContext) {{
+        svg.appendChild(el("circle", {{ cx: x(asOfTime), cy: y(asOfPrice), r: 5.5, fill: "#6aa2ff" }}));
+      }}
+      if (latest) {{
+        svg.appendChild(el("circle", {{ cx: x(latest.t), cy: y(latest.c), r: 4.5, fill: "#dbe7f6" }}));
+        const latestLabel = el("text", {{ x: Math.min(x(latest.t) + 8, width - pad.right - 110), y: y(latest.c) + 4, fill: "#dbe7f6", "font-size": 12 }});
+        latestLabel.textContent = `latest $${{price(latest.c)}}`;
+        svg.appendChild(latestLabel);
+      }}
+      forecasts.forEach((p, i) => {{
+        const matured = Number.isFinite(latestTime) && p.x <= latestTime;
+        const fill = matured ? "#ff5c74" : "#f59e0b";
+        svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5.5, fill }}));
+        const tx = Math.min(width - pad.right - 80, x(p.x) + 10);
+        const ty = y(p.y) + (i % 2 === 0 ? -24 : 26);
+        const label = el("text", {{ x: tx, y: ty, fill: "#aebbd0", "font-size": 12 }});
+        label.textContent = horizonLabel(p.horizon_hours);
+        svg.appendChild(label);
+        const value = el("text", {{ x: tx, y: ty + 17, fill: "#ffffff", "font-size": 12, "font-weight": 800 }});
+        value.textContent = `$${{price(p.y)}}${{matured ? " checked" : ""}}`;
+        svg.appendChild(value);
+      }});
+      const minLabel = el("text", {{ x: pad.left, y: height - 18, fill: "#9fb1c8", "font-size": 12 }});
+      minLabel.textContent = new Date(minX).toLocaleString();
+      svg.appendChild(minLabel);
+      const maxLabel = el("text", {{ x: width - pad.right, y: height - 18, "text-anchor": "end", fill: "#9fb1c8", "font-size": 12 }});
+      maxLabel.textContent = new Date(maxX).toLocaleString();
+      svg.appendChild(maxLabel);
+    }}
+    function linePath(points, x, y) {{
+      return points.map((p, i) => `${{i ? "L" : "M"}}${{x(p.t).toFixed(2)}},${{y(p.y).toFixed(2)}}`).join(" ");
+    }}
+    function segmentedLinePaths(points, maxGapMs) {{
+      if (!points.length) return [];
+      const segments = [[points[0]]];
+      for (let i = 1; i < points.length; i++) {{
+        const previous = points[i - 1];
+        const current = points[i];
+        if (Math.abs(current.t - previous.t) > maxGapMs) {{
+          segments.push([current]);
+        }} else {{
+          segments.at(-1).push(current);
         }}
       }}
-      if (forecastLine.length > 1) {{
-        svg.appendChild(el("path", {{ d: forecastLine.map((p, i) => `${{i ? "L" : "M"}}${{x(p[0]).toFixed(2)}},${{y(p[1]).toFixed(2)}}`).join(" "), fill: "none", stroke: "#dc2626", "stroke-width": 3, "stroke-dasharray": "7 5" }}));
+      return segments;
+    }}
+    function maxActualLineGapMs(range, sparseActual) {{
+      if (!sparseActual) return rangeToMs(range);
+      if (range === "1h") return 12 * 60 * 1000;
+      if (range === "1d") return 45 * 60 * 1000;
+      if (range === "2d") return 90 * 60 * 1000;
+      return 3 * 60 * 60 * 1000;
+    }}
+    function rangeToMs(range) {{
+      return ({{ "1h": 1, "1d": 24, "2d": 48, "1m": 24 * 30, "2m": 24 * 60, "3m": 24 * 90, "6m": 24 * 180 }}[range] || 1) * 3600000;
+    }}
+    function candleBucketMinutes(range) {{
+      if (range === "1h") return 5;
+      if (range === "1d" || range === "2d") return 15;
+      return 60;
+    }}
+    function aggregateCandles(rows, minutes) {{
+      const bucketMs = minutes * 60 * 1000;
+      const buckets = new Map();
+      for (const r of rows) {{
+        const key = Math.floor(r.t / bucketMs) * bucketMs;
+        const b = buckets.get(key);
+        if (!b) buckets.set(key, {{ t: key, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v || 0 }});
+        else {{
+          b.h = Math.max(b.h, r.h);
+          b.l = Math.min(b.l, r.l);
+          b.c = r.c;
+          b.v += r.v || 0;
+        }}
       }}
-      if (Number.isFinite(asOfTime) && Number.isFinite(asOfPrice)) {{
-        svg.appendChild(el("circle", {{ cx: x(asOfTime), cy: y(asOfPrice), r: 5, fill: "#2563eb" }}));
+      return Array.from(buckets.values()).sort((a, b) => a.t - b.t);
+    }}
+    function movingAverage(points, window) {{
+      const out = [];
+      for (let i = window - 1; i < points.length; i++) {{
+        const slice = points.slice(i - window + 1, i + 1);
+        out.push({{ t: points[i].t, y: slice.reduce((sum, p) => sum + p.y, 0) / window }});
       }}
-      if (latestActual) {{
-        svg.appendChild(el("circle", {{ cx: x(latestActual[0]), cy: y(latestActual[1]), r: 4, fill: "#111827" }}));
-        const latest = el("text", {{ x: Math.min(x(latestActual[0]) + 7, width - pad.right - 90), y: y(latestActual[1]) + 4, fill: "#111827", "font-size": 11 }});
-        latest.textContent = `latest $${{price(latestActual[1])}}`;
-        svg.appendChild(latest);
-      }}
-      forecasts.forEach(p => {{
-        const matured = Number.isFinite(latestActualTime) && p.x <= latestActualTime;
-        const fill = matured ? "#dc2626" : "#f59e0b";
-        const textFill = matured ? "#991b1b" : "#92400e";
-        svg.appendChild(el("circle", {{ cx: x(p.x), cy: y(p.y), r: 5, fill }}));
-        const t = el("text", {{ x: x(p.x) + 7, y: y(p.y) - 7, fill: textFill, "font-size": 11 }});
-        t.textContent = `${{Number(p.horizon_hours) === 0.25 ? "15m" : price(p.horizon_hours) + "h"}} ${{price(p.y)}}${{matured ? " checked" : ""}}`;
-        svg.appendChild(t);
-      }});
-      const axis = el("line", {{ x1: pad.left, y1: height - pad.bottom, x2: width - pad.right, y2: height - pad.bottom, stroke: "#9ca3af" }});
-      svg.appendChild(axis);
-      const minLabel = el("text", {{ x: pad.left, y: height - 14, fill: "#637083", "font-size": 12 }});
-      minLabel.textContent = new Date(minX).toLocaleTimeString();
-      svg.appendChild(minLabel);
-      const maxLabel = el("text", {{ x: width - pad.right - 90, y: height - 14, fill: "#637083", "font-size": 12 }});
-      maxLabel.textContent = new Date(maxX).toLocaleTimeString();
-      svg.appendChild(maxLabel);
+      return out;
+    }}
+    function horizonLabel(hours) {{
+      const h = Number(hours);
+      if (!Number.isFinite(h)) return "-";
+      const minutes = Math.round(h * 60);
+      if (minutes < 60) return `${{minutes}}m`;
+      return `${{Number.isInteger(h) ? h.toFixed(0) : h.toFixed(2)}}h`;
     }}
     function el(name, attrs) {{
       const node = document.createElementNS("http://www.w3.org/2000/svg", name);
@@ -554,6 +999,11 @@ def dashboard_html(refresh_seconds: int) -> str:
         rows.appendChild(tr);
       }}
     }}
+    function setMoneyWithClass(id, value) {{
+      const el = document.getElementById(id);
+      el.textContent = money(value);
+      el.className = `value ${{value > 0 ? "win" : value < 0 ? "loss" : ""}}`;
+    }}
     function optionTypeLabel(optionType, symbol) {{
       const raw = String(optionType || "").toLowerCase();
       if (raw === "call") return "CALL";
@@ -574,6 +1024,48 @@ def dashboard_html(refresh_seconds: int) -> str:
         set("details", `dashboard_refresh_failed: ${{error}}`);
       }}
     }}
+    function rerenderChart() {{
+      if (lastDashboardData) renderStockChart(lastDashboardData.chart || {{}});
+    }}
+    function initChartControls() {{
+      document.querySelectorAll("[data-range]").forEach(button => {{
+        button.addEventListener("click", () => {{
+          chartPrefs.range = button.dataset.range || "1h";
+          chartPrefs.forecastZoom = false;
+          chartPrefs.zoomFactor = 1;
+          document.querySelectorAll("[data-range]").forEach(b => b.classList.toggle("active", b === button));
+          document.getElementById("forecastZoom").classList.remove("active");
+          rerenderChart();
+        }});
+      }});
+      document.getElementById("forecastZoom").addEventListener("click", event => {{
+        chartPrefs.forecastZoom = !chartPrefs.forecastZoom;
+        chartPrefs.zoomFactor = 1;
+        event.currentTarget.classList.toggle("active", chartPrefs.forecastZoom);
+        rerenderChart();
+      }});
+      document.getElementById("zoomIn").addEventListener("click", () => {{
+        chartPrefs.zoomFactor = Math.min(chartPrefs.zoomFactor * 1.5, 12);
+        rerenderChart();
+      }});
+      document.getElementById("zoomOut").addEventListener("click", () => {{
+        chartPrefs.zoomFactor = Math.max(chartPrefs.zoomFactor / 1.5, 0.25);
+        rerenderChart();
+      }});
+      [
+        ["showLine", "showLine"],
+        ["showCandles", "showCandles"],
+        ["showSma9", "showSma9"],
+        ["showSma21", "showSma21"],
+      ].forEach(([id, key]) => {{
+        const input = document.getElementById(id);
+        input.addEventListener("change", () => {{
+          chartPrefs[key] = input.checked;
+          rerenderChart();
+        }});
+      }});
+    }}
+    initChartControls();
     refresh();
     setInterval(refresh, refreshMs);
   </script>

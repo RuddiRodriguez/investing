@@ -12,13 +12,29 @@ from market_forecasting_engine.data_quality import build_data_quality_report
 from market_forecasting_engine.governance import write_audit_bundle
 from market_forecasting_engine.llm_trader.profiles import trader_profiles
 from market_forecasting_engine.llm_trader.responses_api import call_response
+from market_forecasting_engine.llm_trader.source_synthesis import attach_long_term_source_synthesis, run_long_term_source_synthesis
 from market_forecasting_engine.llm_handler import normalize_provider_name
 from market_forecasting_engine.llm_model_catalog import DEFAULT_HUGGINGFACE_TRADER_MODEL, DEFAULT_LOCAL_TRADER_MODEL
+from market_forecasting_engine.long_term_sources import (
+    DEFAULT_LONG_TERM_SOURCE_PROVIDERS,
+    LongTermSourceRequest,
+    append_long_term_source_snapshot,
+    collect_long_term_source_context,
+    load_long_term_source_snapshot_features,
+    parse_long_term_source_providers,
+)
 from market_forecasting_engine.openai_models import DEFAULT_BEDROCK_OPENAI_MODEL, DEFAULT_OPENAI_MODEL
 from market_forecasting_engine.pipeline import ForecastingEngine
 from market_forecasting_engine.plots import write_plot_artifacts
 from market_forecasting_engine.schema import ForecastConfig
 from market_forecasting_engine.security_master import resolve_security_metadata
+from market_forecasting_engine.strategy_knowledge import (
+    DEFAULT_STRATEGY_CORPUS_DIR,
+    DEFAULT_STRATEGY_INDEX_PATH,
+    StrategyKnowledgeRequest,
+    attach_strategy_knowledge_context,
+    build_strategy_knowledge_context,
+)
 
 
 def run_autonomous_trader(args):
@@ -32,6 +48,44 @@ def run_autonomous_trader(args):
         current_price=report.get("current_price"),
         suggested_action=report.get("suggested_action"),
     )
+    emit_progress(args, "SOURCES", "synthesizing long-term source evidence for CEO context")
+    source_synthesis = run_long_term_source_synthesis(
+        report=report,
+        llm_provider=getattr(args, "llm_provider", None),
+        llm_model=args.llm_model,
+        reasoning_effort=args.reasoning_effort,
+        llm_env_file=args.llm_env_file,
+        timeout_seconds=float(args.llm_timeout),
+        dry_run=bool(args.dry_run),
+    )
+    attach_long_term_source_synthesis(report, source_synthesis)
+    emit_progress(args, "SOURCES", "long-term source synthesis ready", status=source_synthesis.get("status"))
+    emit_progress(args, "STRATEGY", "retrieving durable strategy knowledge for CEO context")
+    if not getattr(args, "disable_strategy_knowledge", False):
+        strategy_context = build_strategy_knowledge_context(
+            report,
+            StrategyKnowledgeRequest(
+                ticker=args.ticker.upper(),
+                corpus_dir=getattr(args, "strategy_knowledge_corpus_dir", str(DEFAULT_STRATEGY_CORPUS_DIR)),
+                index_path=getattr(args, "strategy_knowledge_index", str(DEFAULT_STRATEGY_INDEX_PATH)),
+                llm_env_file=args.llm_env_file,
+                max_chunks=int(getattr(args, "strategy_knowledge_max_chunks", 8)),
+                rebuild_index=bool(getattr(args, "strategy_knowledge_rebuild_index", False)),
+                timeout_seconds=int(args.llm_timeout),
+            ),
+        )
+    else:
+        strategy_context = {
+            "status": "disabled",
+            "reason": "disabled by --disable-strategy-knowledge",
+            "decision_policy": {
+                "feeds_ceo_llm": False,
+                "overrides_model_validation": False,
+                "overrides_risk_gates": False,
+            },
+        }
+    attach_strategy_knowledge_context(report, strategy_context)
+    emit_progress(args, "STRATEGY", "strategy knowledge context ready", status=strategy_context.get("status"))
     emit_progress(args, "PACKET", "building technical and portfolio packets")
     technical_packet = build_technical_packet(report)
     portfolio_context = build_portfolio_context(args)
@@ -77,6 +131,7 @@ def run_autonomous_trader(args):
             item=item,
             use_web_search=not args.no_web_search and provider == "openai",
             search_context_size=args.search_context_size,
+            require_web_search=not args.no_web_search and provider == "openai",
             usage_context={"purpose": "autonomous_trader_decision", "ticker": args.ticker.upper(), "profile": args.profile, "provider": provider},
         )
         emit_progress(
@@ -143,6 +198,8 @@ def run_autonomous_trader(args):
         "forecast_report": report,
         "technical_packet": technical_packet,
         "portfolio_context": portfolio_context,
+        "long_term_source_synthesis": source_synthesis,
+        "strategy_knowledge_context": strategy_context,
         "llm_decision": decision,
         "llm_prompt_payload": payload,
         "llm_raw_response": raw_response,
@@ -184,17 +241,27 @@ def openai_client_for_provider(provider: str, *, timeout: float):
 
 def run_forecast(args, output_dir):
     horizons = tuple(int(value.strip()) for value in args.horizons.split(",") if value.strip())
+    enable_long_term_sources = bool(getattr(args, "enable_long_term_sources", True))
+    provider_arg = getattr(args, "long_term_source_providers", None)
+    long_term_source_providers = (
+        parse_long_term_source_providers(provider_arg)
+        if provider_arg
+        else DEFAULT_LONG_TERM_SOURCE_PROVIDERS
+    )
     config = ForecastConfig(
         ticker=args.ticker,
         horizons=horizons,
         target_column=args.target_column.lower(),
         selection_metric=args.selection_metric,
         confidence_level=args.confidence_level,
+        validation_workers=int(getattr(args, "validation_workers", 0)),
         include_lightgbm=not args.no_lightgbm,
         include_statistical_models=not args.no_statistical_models,
         include_lstm=args.include_lstm,
         deep_learning_profile=getattr(args, "deep_learning_profile", "off"),
         llm_env_file=args.llm_env_file,
+        enable_long_term_sources=enable_long_term_sources,
+        long_term_source_providers=long_term_source_providers,
     )
     provider = (args.provider or ("csv" if args.csv else "yahoo")).lower()
     if args.csv:
@@ -228,11 +295,52 @@ def run_forecast(args, output_dir):
         security_metadata=security_metadata,
         calendar_summary=summarize_calendar_alignment(prices, calendar=args.calendar),
     )
+    long_term_context = None
+    if enable_long_term_sources:
+        long_term_output_dir = (
+            Path(getattr(args, "long_term_source_output_dir"))
+            if getattr(args, "long_term_source_output_dir", None)
+            else ((output_dir / "long_term_sources") if output_dir else None)
+        )
+        long_term_snapshot_dir = (
+            Path(getattr(args, "long_term_source_snapshot_dir"))
+            if getattr(args, "long_term_source_snapshot_dir", None)
+            else ((output_dir / "data" / "long_term_source_snapshots") if output_dir else Path("automated_forecasting_engine/runs/long_term_source_snapshots"))
+        )
+        long_term_context = collect_long_term_source_context(
+            LongTermSourceRequest(
+                ticker=args.ticker,
+                providers=long_term_source_providers,
+                env_file=getattr(args, "long_term_source_env_file", None) or args.llm_env_file,
+                output_dir=long_term_output_dir,
+                start_date=args.start,
+                end_date=args.end,
+            )
+        )
+        snapshot_path = append_long_term_source_snapshot(long_term_context, long_term_snapshot_dir, ticker=args.ticker)
+        long_term_features, snapshot_feature_metadata = load_long_term_source_snapshot_features(
+            args.ticker,
+            long_term_snapshot_dir,
+            prices.index,
+        )
+        if not long_term_features.empty:
+            prices = normalize_price_frame(prices.join(long_term_features, how="left"), target_column=config.target_column)
+        long_term_context.setdefault("model_feature_policy", {})["snapshot_feature_metadata"] = snapshot_feature_metadata
+        data_manifest["long_term_sources"] = {
+            "status": long_term_context.get("status"),
+            "providers_requested": long_term_context.get("providers_requested", []),
+            "provider_summaries": long_term_context.get("provider_summaries", {}),
+            "artifacts": long_term_context.get("artifacts", {}),
+            "model_feature_policy": long_term_context.get("model_feature_policy", {}),
+            "snapshot_path": str(snapshot_path),
+            "snapshot_feature_metadata": snapshot_feature_metadata,
+        }
     report = ForecastingEngine(config).run(
         prices,
         data_manifest=data_manifest,
         data_quality_report=data_quality,
         security_metadata=security_metadata,
+        long_term_context=long_term_context,
     )
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +415,8 @@ def build_technical_packet(report):
             "chapter_18_final_action": chapter_18.get("final_action"),
             "chapter_18_rule_gate": chapter_18.get("rule_gate", {}),
             "chapter_18_trade_plan": chapter_18.get("trade_plan", {}),
+            "long_term_context": decision.get("long_term_context", {}),
+            "strategy_knowledge_context": decision.get("strategy_knowledge_context", {}),
             "production_gate": decision.get("production_gate", {}),
             "mean_reversion_dip_buy": decision.get("mean_reversion_dip_buy", {}),
             "chapter_19_status": chapter_19.get("status"),
@@ -424,6 +534,7 @@ def write_trader_outputs(output_dir, result):
                 "trader_profile": result["trader_profile"],
                 "portfolio_context": result["portfolio_context"],
                 "technical_packet": result["technical_packet"],
+                "strategy_knowledge_context": result.get("strategy_knowledge_context"),
                 "llm_prompt_payload": result["llm_prompt_payload"],
                 "summary_prompt_payload": result["summary_prompt_payload"],
             },

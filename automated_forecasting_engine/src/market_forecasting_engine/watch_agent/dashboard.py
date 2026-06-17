@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from market_forecasting_engine.data_providers import DataRequest, load_prices_with_provider
+from market_forecasting_engine.portfolio_overrides import is_sold_ticker, load_portfolio_overrides
 
 
 DEFAULT_LOG_DIR = Path("automated_forecasting_engine/runs/watch_agent_state/logs")
@@ -30,6 +31,7 @@ _CHART_CACHE: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
 def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
     rows = []
     errors = []
+    overrides = load_portfolio_overrides(log_dir.parent / "portfolio_overrides.json")
     for path in sorted(log_dir.glob("*.jsonl")):
         try:
             file_rows = _read_jsonl(path)
@@ -37,6 +39,8 @@ def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
             errors.append({"file": str(path), "error": str(exc)})
             continue
         for row in file_rows:
+            if is_sold_ticker(str(row.get("ticker") or ""), overrides):
+                continue
             row["_log_file"] = str(path)
             rows.append(row)
     rows.sort(key=lambda row: str(row.get("checked_at") or ""))
@@ -48,7 +52,7 @@ def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
         key = f"{ticker}_{profile}"
         latest_by_key[key] = row
         history_by_key.setdefault(key, []).append(row)
-    for placeholder in _portfolio_placeholders(log_dir):
+    for placeholder in _portfolio_placeholders(log_dir, overrides=overrides):
         ticker = str(placeholder.get("ticker") or "UNKNOWN")
         profile = str(placeholder.get("profile") or "default")
         key = f"{ticker}_{profile}"
@@ -61,15 +65,21 @@ def read_watch_logs(log_dir: Path, max_history: int = 50) -> dict[str, Any]:
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
         "log_dir": str(log_dir),
-        "log_files": [str(path) for path in sorted(log_dir.glob("*.jsonl"))],
+        "log_files": [
+            str(path)
+            for path in sorted(log_dir.glob("*.jsonl"))
+            if not is_sold_ticker(_ticker_from_log_filename(path), overrides)
+        ],
         "latest": latest,
         "histories": histories,
         "errors": errors,
+        "portfolio_overrides": overrides,
     }
 
 
-def _portfolio_placeholders(log_dir: Path) -> list[dict[str, Any]]:
+def _portfolio_placeholders(log_dir: Path, *, overrides: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     context_dir = log_dir.parent / "portfolio_contexts"
+    overrides = overrides or {}
     placeholders = []
     for path in sorted(context_dir.glob("*.json")):
         try:
@@ -82,6 +92,8 @@ def _portfolio_placeholders(log_dir: Path) -> list[dict[str, Any]]:
         listing = context.get("listing", {}) if isinstance(context.get("listing"), dict) else {}
         ticker = str(context.get("ticker") or "").upper()
         if not ticker:
+            continue
+        if is_sold_ticker(ticker, overrides):
             continue
         profile = _profile_from_context_path(path)
         placeholders.append(
@@ -117,6 +129,13 @@ def _profile_from_context_path(path: Path) -> str:
         if stem.endswith(suffix):
             return suffix.removeprefix("_")
     return "medium"
+
+
+def _ticker_from_log_filename(path: Path) -> str:
+    parts = path.stem.split("_")
+    if len(parts) >= 3:
+        return "_".join(parts[:-2])
+    return path.stem
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

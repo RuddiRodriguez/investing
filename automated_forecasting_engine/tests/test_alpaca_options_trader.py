@@ -60,6 +60,114 @@ class FakeBroker:
         self.submitted = kwargs
         return {"id": "paper-option-order", **kwargs}
 
+    def submit_multileg_option_order(self, **kwargs):
+        self.submitted = kwargs
+        return {"id": "paper-mleg-option-order", **kwargs}
+
+
+class FakeStraddleBroker:
+    def __init__(self) -> None:
+        self.submitted = None
+
+    def option_contracts(self, **kwargs):
+        option_type = kwargs.get("option_type")
+        if option_type == "call":
+            return [
+                {
+                    "symbol": "SOFI260605C00015000",
+                    "status": "active",
+                    "tradable": True,
+                    "expiration_date": "2026-06-05",
+                    "strike_price": "15",
+                    "type": "call",
+                    "open_interest": "1000",
+                }
+            ]
+        if option_type == "put":
+            return [
+                {
+                    "symbol": "SOFI260605P00015000",
+                    "status": "active",
+                    "tradable": True,
+                    "expiration_date": "2026-06-05",
+                    "strike_price": "15",
+                    "type": "put",
+                    "open_interest": "1000",
+                }
+            ]
+        return []
+
+    def option_snapshots(self, symbols):
+        return {
+            "SOFI260605C00015000": {
+                "latestQuote": {"bp": 0.42, "ap": 0.46},
+                "greeks": {"delta": 0.51, "gamma": 0.05, "theta": -0.01, "vega": 0.02},
+            },
+            "SOFI260605P00015000": {
+                "latestQuote": {"bp": 0.38, "ap": 0.42},
+                "greeks": {"delta": -0.49, "gamma": 0.05, "theta": -0.01, "vega": 0.02},
+            },
+        }
+
+    def submit_multileg_option_order(self, **kwargs):
+        self.submitted = kwargs
+        return {"id": "paper-mleg-option-order", **kwargs}
+
+
+class FakeMultiLegStrategyBroker:
+    def __init__(self) -> None:
+        self.submitted = None
+
+    def option_contracts(self, **kwargs):
+        option_type = kwargs.get("option_type")
+        if option_type == "call":
+            return [
+                {"symbol": "SOFI260619C00015000", "status": "active", "tradable": True, "expiration_date": "2026-06-19", "strike_price": "15", "type": "call", "open_interest": "1000"},
+                {"symbol": "SOFI260619C00016000", "status": "active", "tradable": True, "expiration_date": "2026-06-19", "strike_price": "16", "type": "call", "open_interest": "1000"},
+            ]
+        if option_type == "put":
+            return [
+                {"symbol": "SOFI260619P00014000", "status": "active", "tradable": True, "expiration_date": "2026-06-19", "strike_price": "14", "type": "put", "open_interest": "1000"},
+                {"symbol": "SOFI260619P00015000", "status": "active", "tradable": True, "expiration_date": "2026-06-19", "strike_price": "15", "type": "put", "open_interest": "1000"},
+            ]
+        return []
+
+    def option_snapshots(self, symbols):
+        return {
+            "SOFI260619C00015000": {"latestQuote": {"bp": 0.70, "ap": 0.76}, "greeks": {"delta": 0.50, "gamma": 0.04, "theta": -0.01, "vega": 0.02}},
+            "SOFI260619C00016000": {"latestQuote": {"bp": 0.20, "ap": 0.24}, "greeks": {"delta": 0.25, "gamma": 0.03, "theta": -0.005, "vega": 0.01}},
+            "SOFI260619P00014000": {"latestQuote": {"bp": 0.18, "ap": 0.22}, "greeks": {"delta": -0.25, "gamma": 0.03, "theta": -0.005, "vega": 0.01}},
+            "SOFI260619P00015000": {"latestQuote": {"bp": 0.68, "ap": 0.74}, "greeks": {"delta": -0.50, "gamma": 0.04, "theta": -0.01, "vega": 0.02}},
+        }
+
+    def submit_multileg_option_order(self, **kwargs):
+        self.submitted = kwargs
+        return {"id": "paper-mleg-option-order", **kwargs}
+
+
+class FakeCalendarBroker:
+    def __init__(self) -> None:
+        self.submitted = None
+
+    def option_contracts(self, **kwargs):
+        option_type = kwargs.get("option_type")
+        gte = str(kwargs.get("expiration_date_gte") or "")
+        if option_type != "call":
+            return []
+        if gte < "2026-06-10":
+            return [{"symbol": "SOFI260605C00015000", "status": "active", "tradable": True, "expiration_date": "2026-06-05", "strike_price": "15", "type": "call", "open_interest": "1000"}]
+        return [{"symbol": "SOFI260619C00015000", "status": "active", "tradable": True, "expiration_date": "2026-06-19", "strike_price": "15", "type": "call", "open_interest": "1000"}]
+
+    def option_snapshots(self, symbols):
+        return {
+            "SOFI260605C00015000": {"latestQuote": {"bp": 0.42, "ap": 0.46}, "greeks": {"delta": 0.50, "gamma": 0.05, "theta": -0.02, "vega": 0.02}},
+            "SOFI260619C00015000": {"latestQuote": {"bp": 0.84, "ap": 0.90}, "greeks": {"delta": 0.55, "gamma": 0.03, "theta": -0.01, "vega": 0.04}},
+        }
+
+    def submit_multileg_option_order(self, **kwargs):
+        self.submitted = kwargs
+        return {"id": "paper-mleg-option-order", **kwargs}
+
 
 def test_score_option_contracts_applies_spread_and_premium_gates() -> None:
     broker = FakeBroker()
@@ -80,6 +188,9 @@ def test_score_option_contracts_applies_spread_and_premium_gates() -> None:
     assert scored[0]["accepted"] is True
     assert scored[0]["greeks"]["gamma"] == 0.012
     assert scored[0]["greeks"]["theta_decay_usd_for_horizon"] == 1.5
+    assert scored[0]["trade_quality"]["grade"] in {"fair", "good", "excellent"}
+    assert scored[0]["trade_quality"]["breakeven_price"] == 460.2
+    assert "forecast_clears_breakeven" in scored[0]["trade_quality"]["interpretation"]
     assert scored[1]["accepted"] is False
     assert "spread_too_wide" in scored[1]["reasons"]
 
@@ -221,6 +332,130 @@ def test_submit_option_order_rejects_notional_and_market_orders() -> None:
                 "limit_price": 1.0,
             },
         )
+
+
+def test_build_real_option_trade_plan_can_prepare_paper_long_straddle() -> None:
+    broker = FakeStraddleBroker()
+
+    plan = build_real_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        underlying="SOFI",
+        underlying_price=15.0,
+        forecast={"predicted_price": 15.05, "expected_return": 0.001, "expected_direction": "Upward", "account_equity": 100_000.0, "horizon_hours": 0.25},
+        config=OptionExecutionConfig(
+            underlying="SOFI",
+            min_dte=1,
+            max_dte=7,
+            max_total_debit=100.0,
+            risk_budget_pct=0.001,
+            max_position_equity_pct=0.001,
+            max_spread_pct=0.15,
+            enable_multi_leg=True,
+            option_strategy_mode="long_straddle",
+        ),
+        now=datetime(2026, 6, 4, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "buy_option"
+    assert plan["strategy"] == "long_straddle"
+    assert plan["order"]["order_class"] == "mleg"
+    assert plan["order"]["type"] == "limit"
+    assert plan["order"]["limit_price"] == 0.87
+    assert [leg["symbol"] for leg in plan["order"]["legs"]] == ["SOFI260605C00015000", "SOFI260605P00015000"]
+    assert plan["trade_quality"]["upper_breakeven_price"] == 15.87
+    assert plan["trade_quality"]["lower_breakeven_price"] == 14.13
+    assert plan["trade_quality"]["grade"] in {"poor", "weak", "fair", "good", "excellent"}
+
+
+def test_submit_option_order_routes_multileg_limit_payload() -> None:
+    broker = FakeBroker()
+    order = {
+        "order_class": "mleg",
+        "type": "limit",
+        "qty": 2,
+        "limit_price": 0.84,
+        "time_in_force": "day",
+        "legs": [
+            {"side": "buy", "position_intent": "buy_to_open", "symbol": "SOFI260605C00015000", "ratio_qty": 1},
+            {"side": "buy", "position_intent": "buy_to_open", "symbol": "SOFI260605P00015000", "ratio_qty": 1},
+        ],
+    }
+
+    result = submit_option_order(broker, order, client_order_id="test-mleg")
+
+    assert result["id"] == "paper-mleg-option-order"
+    assert broker.submitted["legs"][0]["symbol"] == "SOFI260605C00015000"
+    assert broker.submitted["limit_price"] == 0.84
+
+
+def test_build_real_option_trade_plan_can_prepare_paper_short_iron_butterfly() -> None:
+    broker = FakeMultiLegStrategyBroker()
+
+    plan = build_real_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        underlying="SOFI",
+        underlying_price=15.0,
+        forecast={"predicted_price": 15.02, "expected_return": 0.001, "expected_direction": "Upward", "account_equity": 100_000.0, "horizon_hours": 0.25},
+        config=OptionExecutionConfig(
+            underlying="SOFI",
+            min_dte=1,
+            max_dte=20,
+            max_total_debit=100.0,
+            max_contracts=1,
+            max_spread_pct=0.25,
+            enable_multi_leg=True,
+            enable_short_option_strategies=True,
+            max_legs=4,
+            option_strategy_mode="short_iron_butterfly",
+        ),
+        now=datetime(2026, 6, 4, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "buy_option"
+    assert plan["strategy"] == "short_iron_butterfly"
+    assert plan["order"]["order_class"] == "mleg"
+    assert plan["order"]["limit_price"] < 0
+    assert [leg["position_intent"] for leg in plan["order"]["legs"]] == ["buy_to_open", "sell_to_open", "sell_to_open", "buy_to_open"]
+    assert plan["risk"]["max_defined_loss"] > 0
+    assert plan["trade_quality"]["strategy"] == "short_iron_butterfly"
+
+
+def test_build_real_option_trade_plan_can_prepare_paper_call_calendar() -> None:
+    broker = FakeCalendarBroker()
+
+    plan = build_real_option_trade_plan(
+        broker=broker,  # type: ignore[arg-type]
+        underlying="SOFI",
+        underlying_price=15.0,
+        forecast={"predicted_price": 15.4, "expected_return": 0.01, "expected_direction": "Upward", "account_equity": 100_000.0, "horizon_hours": 1},
+        config=OptionExecutionConfig(
+            underlying="SOFI",
+            min_dte=1,
+            max_dte=35,
+            max_total_debit=100.0,
+            risk_budget_pct=0.001,
+            max_position_equity_pct=0.001,
+            max_contracts=1,
+            max_spread_pct=0.25,
+            enable_multi_leg=True,
+            enable_short_option_strategies=True,
+            max_legs=2,
+            option_strategy_mode="long_call_calendar",
+            calendar_near_min_dte=1,
+            calendar_near_max_dte=7,
+            calendar_far_min_dte=8,
+            calendar_far_max_dte=35,
+        ),
+        now=datetime(2026, 6, 4, tzinfo=UTC),
+    )
+
+    assert plan["action"] == "buy_option"
+    assert plan["strategy"] == "long_call_calendar"
+    assert plan["order"]["order_class"] == "mleg"
+    assert plan["order"]["limit_price"] > 0
+    assert [leg["position_intent"] for leg in plan["order"]["legs"]] == ["sell_to_open", "buy_to_open"]
+    assert plan["risk"]["estimated_debit"] > 0
+    assert plan["trade_quality"]["strategy"] == "long_call_calendar"
 
 
 def test_exit_policy_can_select_trailing_stop_when_requested() -> None:

@@ -50,7 +50,7 @@ def dashboard_html(refresh_seconds: int) -> str:
     th {{ color:var(--muted); font-weight:700; }}
     .pos {{ color:var(--good); font-weight:700; }}
     .neg {{ color:var(--bad); font-weight:700; }}
-    .chartWrap {{ width:100%; height:420px; }}
+    .chartWrap {{ width:100%; height:420px; position:relative; }}
     svg {{ display:block; width:100%; height:100%; }}
     .axis {{ stroke:#9aa4b2; stroke-width:1; }}
     .chartGrid {{ stroke:#e5e9f0; stroke-width:1; }}
@@ -58,16 +58,27 @@ def dashboard_html(refresh_seconds: int) -> str:
     .forecastLine {{ fill:none; stroke:#dc2626; stroke-width:2; stroke-dasharray:7 5; }}
     .band {{ fill:#dc2626; opacity:.12; }}
     .forecastDot {{ fill:#dc2626; }}
+    .priceSampleDot {{ fill:#233044; opacity:.72; }}
+    .hitTarget {{ cursor:pointer; fill:transparent; pointer-events:all; }}
+    .hitTarget:hover + .forecastDot {{ stroke:#111827; stroke-width:3; }}
+    .hitTarget:hover + .priceSampleDot {{ stroke:#111827; stroke-width:3; }}
     .asofLine {{ stroke:#2563eb; stroke-width:2; stroke-dasharray:3 4; }}
     .priceDot {{ fill:#233044; }}
     .chartLabel {{ fill:#526071; font-size:12px; }}
+    .pointValue {{ fill:#111827; font-size:11px; font-weight:700; paint-order:stroke; stroke:#fff; stroke-width:3px; stroke-linejoin:round; }}
+    .chartReadout {{ position:absolute; top:10px; right:12px; min-width:240px; max-width:min(420px,calc(100% - 24px)); background:rgba(255,255,255,.94); border:1px solid var(--line); border-radius:8px; padding:9px 10px; box-shadow:0 8px 22px rgba(15,23,42,.12); font-size:12px; color:var(--text); pointer-events:none; white-space:pre-line; }}
     .rangeControls {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 12px; }}
     .rangeButton {{ border:1px solid var(--line); background:#fff; color:var(--muted); border-radius:7px; padding:7px 10px; font-weight:700; cursor:pointer; }}
     .rangeButton.active {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
+    .marketSummary {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:10px 0 12px; }}
+    .summaryCell {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:#fff; }}
+    .summaryCell .label {{ margin-bottom:3px; }}
+    .summaryCell .value {{ font-size:15px; }}
     pre {{ margin:0; white-space:pre-wrap; overflow:auto; max-height:560px; font-size:12px; }}
     @media (max-width:1000px) {{ header {{ flex-direction:column; }} .grid {{ grid-template-columns:1fr 1fr; }} }}
     @media (max-width:680px) {{ .grid {{ grid-template-columns:1fr; }} }}
   </style>
+  <script src="/assets/plotly.min.js"></script>
 </head>
 <body>
   <header>
@@ -92,6 +103,7 @@ def dashboard_html(refresh_seconds: int) -> str:
         <button class="rangeButton" data-range="3m">3M</button>
         <button class="rangeButton active" data-range="6m">6M</button>
       </div>
+      <div class="marketSummary" id="marketSummary"></div>
       <div class="chartWrap" id="marketChart"></div>
     </section>
     <section class="panel" style="margin-bottom:14px;">
@@ -171,6 +183,27 @@ def dashboard_html(refresh_seconds: int) -> str:
     function fmt(v) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : num.format(Number(v)); }}
     function money(v) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : usd.format(Number(v)); }}
     function time(v) {{ if (!v) return "-"; const d = new Date(v); return Number.isNaN(d.getTime()) ? v : d.toLocaleString(); }}
+    function escapeHtml(value) {{
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({{ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }}[ch]));
+    }}
+    function wireChartReadout(host, fallback) {{
+      const readout = host.querySelector(".chartReadout");
+      if (!readout) return;
+      readout.textContent = fallback;
+      const update = event => {{
+        const target = event.target && event.target.closest ? event.target.closest("[data-tooltip]") : null;
+        if (target) readout.textContent = target.getAttribute("data-tooltip") || fallback;
+      }};
+      host.addEventListener("mouseover", update);
+      host.addEventListener("mousemove", update);
+      host.addEventListener("click", update);
+      host.addEventListener("focusin", update);
+    }}
+    function pointAttrs(tooltip) {{
+      const safe = escapeHtml(tooltip);
+      const handler = "this.closest('.chartWrap').querySelector('.chartReadout').textContent=this.dataset.tooltip";
+      return `tabindex="0" data-tooltip="${{safe}}" onmousemove="${{handler}}" onclick="${{handler}}" onfocus="${{handler}}"`;
+    }}
     function set(id, value) {{ document.getElementById(id).textContent = value; }}
     function plClass(v) {{ return Number(v) > 0 ? "pos" : Number(v) < 0 ? "neg" : ""; }}
     document.querySelectorAll(".rangeButton").forEach(button => button.addEventListener("click", () => {{
@@ -248,22 +281,45 @@ def dashboard_html(refresh_seconds: int) -> str:
       renderSpotForecastRows(report);
       renderSpotForecastChart(report);
     }}
+    function spotForecastPlan(report) {{
+      const bundle = report.forecast_bundle || {{}};
+      const plan = bundle.forecast_plan || {{}};
+      const agentForecast = report.forecast || {{}};
+      const market = report.market || {{}};
+      return {{
+        forecasts: Array.isArray(plan.forecasts) && plan.forecasts.length ? plan.forecasts : (Array.isArray(agentForecast.forecasts) ? agentForecast.forecasts : []),
+        latest_price: plan.latest_price ?? market.latest_price,
+        as_of: plan.as_of || agentForecast.created_at_utc || report.checked_at_utc || report.checked_at,
+        interval: agentForecast.interval || report.forecast_interval || "1h",
+        price_tail: Array.isArray(bundle.price_tail) ? bundle.price_tail : []
+      }};
+    }}
+    function spotHorizonHours(row, plan) {{
+      if (row.horizon_hours !== null && row.horizon_hours !== undefined && Number.isFinite(Number(row.horizon_hours))) return Number(row.horizon_hours);
+      const bars = row.horizon_bars ?? row.horizon_days;
+      if (bars === null || bars === undefined || !Number.isFinite(Number(bars))) return 0;
+      const interval = String(plan.interval || "1h").toLowerCase();
+      if (interval.endsWith("m")) return Number(bars) * Number(interval.replace("m", "")) / 60;
+      if (interval.endsWith("h")) return Number(bars) * Number(interval.replace("h", ""));
+      if (interval.endsWith("d")) return Number(bars) * Number(interval.replace("d", "")) * 24;
+      return Number(bars);
+    }}
     function renderSpotForecastRows(report) {{
       const body = document.getElementById("spotForecastRows");
       body.innerHTML = "";
-      const bundle = report.forecast_bundle || {{}};
-      const plan = bundle.forecast_plan || {{}};
+      const plan = spotForecastPlan(report);
       const forecasts = plan.forecasts || [];
       forecasts.forEach(row => {{
         const lower = row.lower_price;
         const upper = row.upper_price;
-        const direction = Number(row.predicted_price) > Number(plan.latest_price) ? "Upward" : Number(row.predicted_price) < Number(plan.latest_price) ? "Downward" : "Flat";
+        const horizonHours = spotHorizonHours(row, plan);
+        const direction = row.expected_direction || (Number(row.predicted_price) > Number(plan.latest_price) ? "Upward" : Number(row.predicted_price) < Number(plan.latest_price) ? "Downward" : "Flat");
         const metrics = row.validation_metrics || {{}};
         const validation = metrics.price_mae || metrics.return_mae || metrics.directional_accuracy
           ? `price MAE ${{money(metrics.price_mae)}} | return MAE ${{fmt(metrics.return_mae)}} | dir ${{(Number(metrics.directional_accuracy || 0) * 100).toFixed(1)}}% | n=${{metrics.sample_count || 0}}`
           : (metrics.status || "-");
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${{fmt(row.horizon_hours)}}h</td><td>${{money(row.predicted_price)}}</td><td>${{money(lower)}} - ${{money(upper)}}</td><td>${{direction}}</td><td>${{row.selected_model || row.model || row.method || "-"}}</td><td>${{validation}}</td>`;
+        tr.innerHTML = `<td>${{fmt(horizonHours)}}h</td><td>${{money(row.predicted_price)}}</td><td>${{money(lower)}} - ${{money(upper)}}</td><td>${{direction}}</td><td>${{row.selected_model || row.model || row.method || "-"}}</td><td>${{validation}}</td>`;
         body.appendChild(tr);
       }});
       if (!forecasts.length) body.innerHTML = `<tr><td colspan="6">No forecast horizons in the latest spot-agent report.</td></tr>`;
@@ -271,18 +327,20 @@ def dashboard_html(refresh_seconds: int) -> str:
     function renderSpotForecastChart(report) {{
       const host = document.getElementById("spotForecastChart");
       host.innerHTML = "";
-      const bundle = report.forecast_bundle || {{}};
-      const plan = bundle.forecast_plan || {{}};
-      const tail = (bundle.price_tail || []).map(p => ({{ time:new Date(p.time), price:Number(p.close) }})).filter(p => !Number.isNaN(p.time.getTime()) && Number.isFinite(p.price));
+      const plan = spotForecastPlan(report);
+      const tail = (plan.price_tail || []).map(p => ({{ time:new Date(p.time), price:Number(p.close) }})).filter(p => !Number.isNaN(p.time.getTime()) && Number.isFinite(p.price));
       const forecasts = (plan.forecasts || []).map(row => {{
-        const baseTime = new Date(plan.as_of || report.checked_at);
-        const horizonMs = Number(row.horizon_hours || 0) * 3600 * 1000;
+        const baseTime = new Date(plan.as_of || report.checked_at_utc || report.checked_at);
+        const horizonHours = spotHorizonHours(row, plan);
+        const horizonMs = horizonHours * 3600 * 1000;
         return {{
           time: row.forecast_timestamp ? new Date(row.forecast_timestamp) : new Date(baseTime.getTime() + horizonMs),
           price: Number(row.predicted_price),
           lower: Number(row.lower_price),
           upper: Number(row.upper_price),
-          horizon: Number(row.horizon_hours || 0)
+          horizon: horizonHours,
+          model: row.selected_model || row.model || row.method || "-",
+          direction: row.expected_direction || "-"
         }};
       }}).filter(p => !Number.isNaN(p.time.getTime()) && Number.isFinite(p.price));
       if (!tail.length && !forecasts.length) {{
@@ -323,16 +381,20 @@ def dashboard_html(refresh_seconds: int) -> str:
         svg += `<path class="band" d="${{upper}} ${{lower}} Z"></path>`;
         svg += `<path class="forecastLine" d="${{forecastPath}}"></path>`;
         forecasts.forEach(p => {{
-          svg += `<circle class="forecastDot" cx="${{x(p.time)}}" cy="${{y(p.price)}}" r="4"></circle>`;
+          const tooltip = `${{fmt(p.horizon)}}h forecast\\nTarget: ${{p.time.toLocaleString()}}\\nPrediction: ${{money(p.price)}}\\nBand: ${{money(p.lower)}} - ${{money(p.upper)}}\\nDirection: ${{p.direction}}\\nModel: ${{p.model}}`;
+          svg += `<circle class="hitTarget" ${{pointAttrs(tooltip)}} cx="${{x(p.time)}}" cy="${{y(p.price)}}" r="15"></circle>`;
+          svg += `<circle class="forecastDot" cx="${{x(p.time)}}" cy="${{y(p.price)}}" r="5"></circle>`;
           svg += `<text class="chartLabel" x="${{x(p.time) + 6}}" y="${{y(p.price) - 6}}">${{fmt(p.horizon)}}h</text>`;
+          svg += `<text class="pointValue" x="${{x(p.time) + 6}}" y="${{y(p.price) + 12}}">${{money(p.price)}}</text>`;
         }});
       }}
       const asof = new Date(plan.as_of || report.checked_at);
       if (!Number.isNaN(asof.getTime())) svg += `<line class="asofLine" x1="${{x(asof)}}" y1="${{margin.top}}" x2="${{x(asof)}}" y2="${{height - margin.bottom}}"></line>`;
       svg += `<text class="chartLabel" x="${{margin.left}}" y="${{height - 12}}">${{new Date(minTime).toLocaleString()}}</text>`;
       svg += `<text class="chartLabel" text-anchor="end" x="${{width - margin.right}}" y="${{height - 12}}">${{new Date(maxTime).toLocaleString()}}</text>`;
-      svg += `</svg>`;
+      svg += `</svg><div class="chartReadout">Hover or click a forecast point.</div>`;
       host.innerHTML = svg;
+      wireChartReadout(host, forecasts.length ? "Hover or click a forecast point." : "No forecast points.");
     }}
     function render(report) {{
       const overview = report.overview || {{}};
@@ -413,8 +475,10 @@ def dashboard_html(refresh_seconds: int) -> str:
       set("marketMeta", `${{payload.symbol || currentCurrency}} current ${{money(payload.current_price)}} | ${{(payload.range || marketRange).toUpperCase()}} | ${{payload.interval || "-"}} | ${{payload.point_count || 0}} points | source ${{payload.source || "-"}}`);
       if (!points.length) {{
         host.innerHTML = `<div class="small">No market price history available for this range.</div>`;
+        document.getElementById("marketSummary").innerHTML = "";
         return;
       }}
+      renderMarketSummary(points);
       const width = Math.max(host.clientWidth || 1000, 820);
       const height = 420;
       const margin = {{ left:72, right:34, top:24, bottom:50 }};
@@ -440,12 +504,38 @@ def dashboard_html(refresh_seconds: int) -> str:
       svg += `<line class="axis" x1="${{margin.left}}" y1="${{height - margin.bottom}}" x2="${{width - margin.right}}" y2="${{height - margin.bottom}}"></line>`;
       svg += `<line class="axis" x1="${{margin.left}}" y1="${{margin.top}}" x2="${{margin.left}}" y2="${{height - margin.bottom}}"></line>`;
       svg += `<path class="priceLine" d="${{path}}"></path>`;
+      const sampleEvery = Math.max(1, Math.ceil(points.length / 12));
+      points.forEach((p, i) => {{
+        if (i % sampleEvery !== 0 && i !== points.length - 1) return;
+        const tooltip = `Actual price\\nTime: ${{p.time.toLocaleString()}}\\nPrice: ${{money(p.price)}}`;
+        svg += `<circle class="hitTarget" ${{pointAttrs(tooltip)}} cx="${{x(p.time)}}" cy="${{y(p.price)}}" r="12"></circle>`;
+        svg += `<circle class="priceSampleDot" cx="${{x(p.time)}}" cy="${{y(p.price)}}" r="3"></circle>`;
+      }});
       const latest = points[points.length - 1];
+      const latestTooltip = `Latest actual price\\nTime: ${{latest.time.toLocaleString()}}\\nPrice: ${{money(latest.price)}}`;
+      svg += `<circle class="hitTarget" ${{pointAttrs(latestTooltip)}} cx="${{x(latest.time)}}" cy="${{y(latest.price)}}" r="14"></circle>`;
       svg += `<circle class="priceDot" cx="${{x(latest.time)}}" cy="${{y(latest.price)}}" r="5"></circle>`;
+      svg += `<text class="pointValue" text-anchor="end" x="${{width - margin.right - 8}}" y="${{Math.max(margin.top + 14, y(latest.price) - 8)}}">${{money(latest.price)}}</text>`;
       svg += `<text class="chartLabel" text-anchor="end" x="${{width - margin.right}}" y="${{height - 12}}">${{latest.time.toLocaleString()}}</text>`;
       svg += `<text class="chartLabel" x="${{margin.left}}" y="${{height - 12}}">${{points[0].time.toLocaleString()}}</text>`;
-      svg += `</svg>`;
+      svg += `</svg><div class="chartReadout">Hover or click a price point.</div>`;
       host.innerHTML = svg;
+      wireChartReadout(host, latestTooltip);
+    }}
+    function renderMarketSummary(points) {{
+      const host = document.getElementById("marketSummary");
+      const first = points[0];
+      const latest = points[points.length - 1];
+      const high = points.reduce((best, row) => row.price > best.price ? row : best, first);
+      const low = points.reduce((best, row) => row.price < best.price ? row : best, first);
+      const changePct = first.price ? ((latest.price - first.price) / first.price) * 100 : null;
+      const cells = [
+        ["Start", `${{money(first.price)}}`, first.time.toLocaleDateString()],
+        ["Low", `${{money(low.price)}}`, low.time.toLocaleDateString()],
+        ["High", `${{money(high.price)}}`, high.time.toLocaleDateString()],
+        ["Latest", `${{money(latest.price)}}`, `${{latest.time.toLocaleDateString()}} | ${{changePct === null ? "-" : changePct.toFixed(2) + "%"}}`],
+      ];
+      host.innerHTML = cells.map(([label, value, meta]) => `<div class="summaryCell"><div class="label">${{label}}</div><div class="value">${{value}}</div><div class="small">${{meta}}</div></div>`).join("");
     }}
     function renderAccounts(rows) {{
       const body = document.getElementById("accounts"); body.innerHTML = "";
@@ -510,6 +600,130 @@ def dashboard_html(refresh_seconds: int) -> str:
       }});
       if (!rows.length) body.innerHTML = `<tr><td colspan="8">No rows in latest report.</td></tr>`;
     }}
+    function plotlyBaseLayout(title) {{
+      return {{
+        title: {{ text:title, x:0.02, xanchor:"left", font:{{ size:14 }} }},
+        margin: {{ l:72, r:34, t:42, b:48 }},
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "#fff",
+        hovermode: "x unified",
+        showlegend: true,
+        legend: {{ orientation:"h", yanchor:"bottom", y:1.02, xanchor:"right", x:1 }},
+        xaxis: {{ gridcolor:"#eef2f7", zeroline:false }},
+        yaxis: {{ gridcolor:"#eef2f7", zeroline:false, tickprefix:"$" }},
+      }};
+    }}
+    function plotlyConfig() {{
+      return {{ responsive:true, displaylogo:false, modeBarButtonsToRemove:["lasso2d","select2d"] }};
+    }}
+    function renderMarketChart(payload) {{
+      const host = document.getElementById("marketChart");
+      host.innerHTML = "";
+      const points = (payload.points || []).map(p => ({{ time:new Date(p.time), price:Number(p.close) }})).filter(p => !Number.isNaN(p.time.getTime()) && Number.isFinite(p.price));
+      set("marketMeta", `${{payload.symbol || currentCurrency}} current ${{money(payload.current_price)}} | ${{(payload.range || marketRange).toUpperCase()}} | ${{payload.interval || "-"}} | ${{payload.point_count || 0}} points | source ${{payload.source || "-"}}`);
+      if (!points.length) {{
+        host.innerHTML = `<div class="small">No market price history available for this range.</div>`;
+        document.getElementById("marketSummary").innerHTML = "";
+        return;
+      }}
+      renderMarketSummary(points);
+      if (!window.Plotly) {{
+        host.innerHTML = `<div class="small">Plotly did not load from the local dashboard asset route.</div>`;
+        return;
+      }}
+      const latest = points[points.length - 1];
+      const trace = {{
+        type:"scatter",
+        mode:"lines",
+        name:"Actual ETH/USD",
+        x:points.map(p => p.time),
+        y:points.map(p => p.price),
+        line:{{ color:"#233044", width:2 }},
+        hovertemplate:"%{{x|%Y-%m-%d %H:%M}}<br>Actual: $%{{y:,.2f}}<extra></extra>",
+      }};
+      const latestTrace = {{
+        type:"scatter",
+        mode:"markers+text",
+        name:"Latest",
+        x:[latest.time],
+        y:[latest.price],
+        marker:{{ color:"#2563eb", size:9 }},
+        text:[money(latest.price)],
+        textposition:"top right",
+        hovertemplate:"Latest<br>%{{x|%Y-%m-%d %H:%M}}<br>$%{{y:,.2f}}<extra></extra>",
+      }};
+      const layout = plotlyBaseLayout(`${{payload.symbol || currentCurrency}} real price`);
+      layout.height = 420;
+      Plotly.react(host, [trace, latestTrace], layout, plotlyConfig());
+    }}
+    function renderSpotForecastChart(report) {{
+      const host = document.getElementById("spotForecastChart");
+      host.innerHTML = "";
+      const plan = spotForecastPlan(report);
+      const forecasts = (plan.forecasts || []).map(row => {{
+        const baseTime = new Date(plan.as_of || report.checked_at_utc || report.checked_at);
+        const horizonHours = spotHorizonHours(row, plan);
+        return {{
+          time: row.forecast_timestamp ? new Date(row.forecast_timestamp) : new Date(baseTime.getTime() + horizonHours * 3600 * 1000),
+          price: Number(row.predicted_price),
+          lower: Number(row.lower_price),
+          upper: Number(row.upper_price),
+          horizon: horizonHours,
+          model: row.selected_model || row.model || row.method || "-",
+          direction: row.expected_direction || "-",
+        }};
+      }}).filter(p => !Number.isNaN(p.time.getTime()) && Number.isFinite(p.price));
+      if (!forecasts.length) {{
+        host.innerHTML = `<div class="small">No forecast points in latest spot-agent report.</div>`;
+        return;
+      }}
+      if (!window.Plotly) {{
+        host.innerHTML = `<div class="small">Plotly did not load from the local dashboard asset route.</div>`;
+        return;
+      }}
+      const x = forecasts.map(p => p.time);
+      const lower = forecasts.map(p => p.lower);
+      const upper = forecasts.map(p => p.upper);
+      const predicted = forecasts.map(p => p.price);
+      const custom = forecasts.map(p => [p.horizon, p.direction, p.model, p.lower, p.upper]);
+      const lowerTrace = {{
+        type:"scatter",
+        mode:"lines",
+        name:"Lower band",
+        x,
+        y:lower,
+        line:{{ color:"rgba(220,38,38,0)" }},
+        hoverinfo:"skip",
+        showlegend:false,
+      }};
+      const upperTrace = {{
+        type:"scatter",
+        mode:"lines",
+        name:"Forecast band",
+        x,
+        y:upper,
+        fill:"tonexty",
+        fillcolor:"rgba(220,38,38,0.14)",
+        line:{{ color:"rgba(220,38,38,0)" }},
+        hoverinfo:"skip",
+      }};
+      const forecastTrace = {{
+        type:"scatter",
+        mode:"lines+markers+text",
+        name:"Forecast",
+        x,
+        y:predicted,
+        customdata:custom,
+        line:{{ color:"#dc2626", width:2, dash:"dash" }},
+        marker:{{ color:"#dc2626", size:9 }},
+        text:forecasts.map(p => `${{fmt(p.horizon)}}h<br>${{money(p.price)}}`),
+        textposition:["top left", "bottom center", "top right"],
+        hovertemplate:"%{{customdata[0]}}h forecast<br>Target: %{{x|%Y-%m-%d %H:%M}}<br>Prediction: $%{{y:,.2f}}<br>Band: $%{{customdata[3]:,.2f}} - $%{{customdata[4]:,.2f}}<br>Direction: %{{customdata[1]}}<br>Model: %{{customdata[2]}}<extra></extra>",
+      }};
+      const layout = plotlyBaseLayout("ETH/USDC forecast path");
+      layout.height = 360;
+      Plotly.react(host, [lowerTrace, upperTrace, forecastTrace], layout, plotlyConfig());
+    }}
     refresh(); setInterval(refresh, refreshMs);
   </script>
 </body>
@@ -522,6 +736,9 @@ def build_server(*, report_path: Path, spot_agent_report_path: Path, host: str, 
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 self._send_html(dashboard_html(refresh_seconds))
+                return
+            if parsed.path == "/assets/plotly.min.js":
+                self._send_js(_plotly_js_bytes())
                 return
             if parsed.path == "/api/report":
                 self._send_json(_read_report(report_path))
@@ -557,7 +774,22 @@ def build_server(*, report_path: Path, spot_agent_report_path: Path, host: str, 
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_js(self, body: bytes) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def _plotly_js_bytes() -> bytes:
+    import plotly
+
+    path = Path(plotly.__file__).parent / "package_data" / "plotly.min.js"
+    return path.read_bytes()
 
 
 def _read_report(path: Path) -> dict[str, Any]:

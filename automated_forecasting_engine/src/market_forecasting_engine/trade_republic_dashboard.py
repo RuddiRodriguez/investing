@@ -9,9 +9,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from market_forecasting_engine.portfolio_overrides import (
+    TRADE_REPUBLIC_OVERRIDE_FILE,
+    WATCH_STATE_OVERRIDE_FILE,
+    apply_open_position_overrides,
+    load_portfolio_overrides,
+)
+
 
 DEFAULT_REPORT_PATH = Path("trade_republic_exports/investment_report_latest.json")
 DEFAULT_REFRESH_SECONDS = 60
+DEFAULT_WATCH_LOG_DIR = Path("automated_forecasting_engine/runs/watch_agent_state/logs")
 
 
 def main() -> None:
@@ -30,9 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_dashboard_state(report_path: Path) -> dict[str, Any]:
     report, error = read_report(report_path)
+    overrides = load_portfolio_overrides(Path.cwd() / WATCH_STATE_OVERRIDE_FILE, Path.cwd() / TRADE_REPUBLIC_OVERRIDE_FILE)
+    report = apply_open_position_overrides(report, overrides)
     summary = report.get("summary") or {}
     holdings = report.get("holdings") or []
-    rows = [summarize_holding(row) for row in holdings if isinstance(row, dict)]
+    total_current_value = _round(summary.get("total_current_value"))
+    rows = [summarize_holding(row, total_current_value=total_current_value) for row in holdings if isinstance(row, dict)]
     rows.sort(key=lambda row: float(row.get("current_value") or 0), reverse=True)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -48,9 +59,12 @@ def build_dashboard_state(report_path: Path) -> dict[str, Any]:
             "total_historical_buy_cash": _round(summary.get("total_historical_buy_cash")),
             "total_historical_sell_cash": _round(summary.get("total_historical_sell_cash")),
             "ticker_resolution_count": summary.get("ticker_resolution_count", 0),
+            "manual_position_overrides_applied": summary.get("manual_position_overrides_applied") or [],
+            "manual_position_override_note": summary.get("manual_position_override_note"),
         },
         "holdings": rows,
         "ticker_resolution": report.get("ticker_resolution") or [],
+        "portfolio_overrides": overrides,
     }
 
 
@@ -64,7 +78,8 @@ def read_report(report_path: Path) -> tuple[dict[str, Any], str | None]:
     return parsed if isinstance(parsed, dict) else {}, None
 
 
-def summarize_holding(row: dict[str, Any]) -> dict[str, Any]:
+def summarize_holding(row: dict[str, Any], *, total_current_value: float | None = None) -> dict[str, Any]:
+    current_value = _round(row.get("current_value"))
     return {
         "name": row.get("name"),
         "isin": row.get("isin"),
@@ -73,15 +88,451 @@ def summarize_holding(row: dict[str, Any]) -> dict[str, Any]:
         "source": row.get("ticker_resolution_source"),
         "quantity": _round(row.get("current_quantity"), 6),
         "current_price": _round(row.get("current_price"), 4),
-        "current_value": _round(row.get("current_value")),
+        "current_value": current_value,
         "cost_basis": _round(row.get("open_cost_basis")),
         "unrealized_pl": _round(row.get("unrealized_pl")),
         "unrealized_pl_pct": _round(row.get("unrealized_pl_pct")),
         "paid_price": _round(row.get("weighted_paid_price"), 4),
         "yahoo_buy_close": _round(row.get("weighted_market_price_at_buy"), 4),
+        "yahoo_status": row.get("historical_price_status"),
         "alpaca_buy_time_price": _round(row.get("alpaca_weighted_price_at_buy_time"), 4),
         "alpaca_diff_pct": _round(row.get("alpaca_paid_vs_market_at_buy_time_pct")),
         "alpaca_status": row.get("alpaca_status"),
+        "allocation_pct": _allocation_pct(current_value, total_current_value),
+    }
+
+
+def render_static_dashboard_html(state: dict[str, Any]) -> str:
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"), default=str)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trade Republic End-of-Day Dashboard</title>
+  <style>
+    :root {{
+      --bg: #f3f2ec;
+      --panel: #fffdf7;
+      --panel-2: #f7f4ea;
+      --text: #18212b;
+      --muted: #677381;
+      --line: #d7d2c4;
+      --gain: #0c7a43;
+      --loss: #b83a2f;
+      --warn: #9a6700;
+      --accent: #0057b8;
+      --accent-soft: #d9e8f9;
+      --shadow: 0 18px 40px rgba(24, 33, 43, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+      background:
+        radial-gradient(circle at top left, rgba(0,87,184,0.10), transparent 32%),
+        linear-gradient(180deg, #f8f6ef 0%, #ece8dc 100%);
+    }}
+    .shell {{ max-width: 1440px; margin: 0 auto; padding: 28px 20px 40px; }}
+    .hero {{
+      background: linear-gradient(135deg, rgba(255,253,247,0.96), rgba(247,244,234,0.92));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+      margin-bottom: 18px;
+    }}
+    .hero-top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 34px; line-height: 1.05; }}
+    .lede {{ margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; }}
+    .meta {{ color: var(--muted); font-size: 13px; text-align: right; line-height: 1.5; }}
+    .cards {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }}
+    .card, .panel {{
+      background: rgba(255,253,247,0.88);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 8px 20px rgba(24, 33, 43, 0.05);
+      min-width: 0;
+    }}
+    .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }}
+    .value {{ font-size: 28px; font-weight: 700; line-height: 1.1; overflow-wrap: anywhere; }}
+    .subvalue {{ color: var(--muted); font-size: 13px; margin-top: 8px; }}
+    .gain {{ color: var(--gain); }}
+    .loss {{ color: var(--loss); }}
+    .warn {{ color: var(--warn); }}
+    .grid {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(300px, 0.8fr);
+      gap: 14px;
+      align-items: start;
+    }}
+    .section-title {{ margin: 0 0 12px; font-size: 18px; }}
+    .pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: var(--panel-2);
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .pill.gain {{ background: rgba(12,122,67,0.08); border-color: rgba(12,122,67,0.25); }}
+    .pill.loss {{ background: rgba(184,58,47,0.08); border-color: rgba(184,58,47,0.25); }}
+    .pill.warn {{ background: rgba(154,103,0,0.08); border-color: rgba(154,103,0,0.25); }}
+    .list {{ display: grid; gap: 10px; }}
+    .list-item {{ display: grid; gap: 6px; padding: 12px 0; border-bottom: 1px solid var(--line); }}
+    .list-item:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .row-top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      flex-wrap: wrap;
+    }}
+    .name {{ font-weight: 700; font-size: 16px; }}
+    .detail {{ color: var(--muted); font-size: 12px; }}
+    .allocation {{
+      position: relative;
+      height: 10px;
+      background: var(--accent-soft);
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .allocation > span {{
+      position: absolute;
+      inset: 0 auto 0 0;
+      background: linear-gradient(90deg, #0057b8, #2f88d6);
+      border-radius: 999px;
+    }}
+    .table-wrap {{ overflow: auto; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 1140px; font-size: 13px; }}
+    th, td {{ padding: 11px 10px; border-bottom: 1px solid var(--line); text-align: right; vertical-align: top; }}
+    th:first-child, td:first-child {{ text-align: left; }}
+    th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }}
+    tr:hover td {{ background: rgba(255,255,255,0.45); }}
+    .holding-name {{ font-weight: 700; }}
+    .holding-sub {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
+    .mono {{ font-family: "SFMono-Regular", Menlo, Monaco, monospace; }}
+    .footer-note {{ margin-top: 18px; color: var(--muted); font-size: 13px; }}
+    @media (max-width: 1080px) {{
+      .cards, .grid {{ grid-template-columns: minmax(0, 1fr); }}
+      h1 {{ font-size: 28px; }}
+      .meta {{ text-align: left; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <div class="hero-top">
+        <div>
+          <h1>Trade Republic End-of-Day Dashboard</h1>
+          <p class="lede">Read-only portfolio snapshot generated from the local Trade Republic investment report. No broker orders were submitted.</p>
+        </div>
+        <div class="meta" id="heroMeta"></div>
+      </div>
+      <div class="cards" id="cards"></div>
+    </div>
+    <div class="grid">
+      <div class="panel">
+        <h2 class="section-title">Holdings</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Holding</th>
+                <th>Ticker</th>
+                <th>ISIN</th>
+                <th>Qty</th>
+                <th>Current Price</th>
+                <th>Current Value</th>
+                <th>Allocation</th>
+                <th>Cost Basis</th>
+                <th>Unrealized P/L</th>
+                <th>Unrealized P/L %</th>
+                <th>Paid Price</th>
+                <th>Yahoo</th>
+                <th>Alpaca</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div style="display:grid; gap:14px;">
+        <div class="panel">
+          <h2 class="section-title">Top Holdings By Value</h2>
+          <div class="list" id="topHoldings"></div>
+        </div>
+        <div class="panel">
+          <h2 class="section-title">Largest Winners / Losers</h2>
+          <div class="list" id="plMoves"></div>
+        </div>
+        <div class="panel">
+          <h2 class="section-title">Ticker / Data Quality</h2>
+          <div class="list" id="issues"></div>
+        </div>
+        <div class="panel" id="forecastPanel" hidden>
+          <h2 class="section-title">Latest Forecast / Policy Context</h2>
+          <div class="list" id="forecastContext"></div>
+        </div>
+      </div>
+    </div>
+    <p class="footer-note">Snapshot file is standalone and embeds the dashboard state directly. Report source stays at <span class="mono" id="reportPath"></span>.</p>
+  </div>
+  <script>
+    const state = {payload};
+    const fmtMoney = new Intl.NumberFormat(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+    function money(v) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : fmtMoney.format(Number(v)); }}
+    function num(v, d = 2) {{ return v === null || v === undefined || Number.isNaN(Number(v)) ? "-" : Number(v).toFixed(d); }}
+    function cls(v) {{ return Number(v || 0) > 0 ? "gain" : Number(v || 0) < 0 ? "loss" : ""; }}
+    function text(v) {{ return v === null || v === undefined || v === "" ? "-" : String(v); }}
+    function pill(value) {{
+      const klass = /matched|ok|open|hold/i.test(String(value || "")) ? "gain" : /partial|warn|unsupported|closed|stale/i.test(String(value || "")) ? "warn" : /error|fail|missing/i.test(String(value || "")) ? "loss" : "";
+      return `<span class="pill ${{klass}}">${{text(value)}}</span>`;
+    }}
+    function renderCards() {{
+      const s = state.summary || {{}};
+      const plClass = cls(s.total_unrealized_pl);
+      const cards = [
+        ["Current Value", money(s.total_current_value), `${{text(s.holding_count)}} open holdings`],
+        ["Open Cost Basis", money(s.total_open_cost_basis), "Broker open cost basis"],
+        ["Unrealized P/L", money(s.total_unrealized_pl), `${{num(s.total_unrealized_pl_pct)}}%`],
+        ["Ticker Resolution", String(s.ticker_resolution_count ?? 0), "Resolved tickers in report"],
+        ["Report Status", state.report_error ? "Stale / Error" : "Fresh read", state.report_error || "Report parsed successfully"],
+      ];
+      document.getElementById("cards").innerHTML = cards.map(([label, value, sub], index) => `
+        <div class="card">
+          <div class="label">${{label}}</div>
+          <div class="value ${{index === 2 ? plClass : ""}}">${{value}}</div>
+          <div class="subvalue">${{sub}}</div>
+        </div>`).join("");
+    }}
+    function renderMeta() {{
+      document.getElementById("heroMeta").innerHTML = `
+        <div>Generated: ${{text(state.generated_at)}}</div>
+        <div>Report timestamp: ${{text(state.report_timestamp)}}</div>
+        <div>Report path: <span class="mono">${{text(state.report_path)}}</span></div>`;
+      document.getElementById("reportPath").textContent = text(state.report_path);
+    }}
+    function renderRows() {{
+      const rows = [...(state.holdings || [])];
+      document.getElementById("rows").innerHTML = rows.map((row) => `
+        <tr>
+          <td>
+            <div class="holding-name">${{text(row.name)}}</div>
+            <div class="holding-sub">${{text(row.source)}}</div>
+          </td>
+          <td class="mono">${{text(row.ticker)}}</td>
+          <td class="mono">${{text(row.isin)}}</td>
+          <td>${{num(row.quantity, 6)}}</td>
+          <td>${{money(row.current_price)}}</td>
+          <td>${{money(row.current_value)}}</td>
+          <td>
+            <div>${{num(row.allocation_pct)}}%</div>
+            <div class="allocation"><span style="width:${{Math.max(0, Math.min(100, Number(row.allocation_pct || 0)))}}%"></span></div>
+          </td>
+          <td>${{money(row.cost_basis)}}</td>
+          <td class="${{cls(row.unrealized_pl)}}">${{money(row.unrealized_pl)}}</td>
+          <td class="${{cls(row.unrealized_pl_pct)}}">${{num(row.unrealized_pl_pct)}}%</td>
+          <td>${{money(row.paid_price)}}</td>
+          <td>${{pill(row.yahoo_status)}}</td>
+          <td>${{pill(row.alpaca_status)}}</td>
+        </tr>`).join("");
+    }}
+    function renderTopHoldings() {{
+      const rows = [...(state.holdings || [])].slice(0, 5);
+      document.getElementById("topHoldings").innerHTML = rows.map((row) => `
+        <div class="list-item">
+          <div class="row-top"><div class="name">${{text(row.name)}}</div><div>${{money(row.current_value)}}</div></div>
+          <div class="detail">${{text(row.ticker)}} · Allocation ${{num(row.allocation_pct)}}% · P/L ${{num(row.unrealized_pl_pct)}}%</div>
+          <div class="allocation"><span style="width:${{Math.max(0, Math.min(100, Number(row.allocation_pct || 0)))}}%"></span></div>
+        </div>`).join("");
+    }}
+    function renderPlMoves() {{
+      const rows = [...(state.holdings || [])].filter((row) => row.unrealized_pl_pct !== null && row.unrealized_pl_pct !== undefined);
+      const winners = [...rows].filter((row) => Number(row.unrealized_pl || 0) > 0).sort((a, b) => Number(b.unrealized_pl_pct || 0) - Number(a.unrealized_pl_pct || 0)).slice(0, 3);
+      const losers = [...rows].filter((row) => Number(row.unrealized_pl || 0) < 0).sort((a, b) => Number(a.unrealized_pl_pct || 0) - Number(b.unrealized_pl_pct || 0)).slice(0, 3);
+      const combined = [
+        ...winners.map((row) => ({{ row, label: "winner" }})),
+        ...losers.map((row) => ({{ row, label: "loser" }})),
+      ];
+      document.getElementById("plMoves").innerHTML = combined.length ? combined.map((entry) => `
+        <div class="list-item">
+          <div class="row-top"><div class="name">${{text(entry.row.name)}}</div><div>${{pill(entry.label)}}</div></div>
+          <div class="row-top"><div class="detail">${{text(entry.row.ticker)}} · ${{num(entry.row.unrealized_pl_pct)}}% · Cost ${{money(entry.row.cost_basis)}} · Value ${{money(entry.row.current_value)}}</div><div class="${{cls(entry.row.unrealized_pl)}}">${{money(entry.row.unrealized_pl)}}</div></div>
+        </div>`).join("") : `<div class="detail">No realized winners or losers were available from the current open holdings snapshot.</div>`;
+    }}
+    function renderIssues() {{
+      const reportIssues = (state.report_error ? [{{ label: "report_error", detail: state.report_error }}] : []);
+      const resolutionIssues = (state.ticker_resolution || []).map((row) => ({{ label: row.isin || row.ticker || "resolution", detail: row.error || row.reason || JSON.stringify(row) }}));
+      const holdingIssues = (state.holdings || []).filter((row) => row.alpaca_status && row.alpaca_status !== "matched" || row.yahoo_status && row.yahoo_status !== "matched").map((row) => ({{
+        label: row.ticker || row.name || row.isin || "holding",
+        detail: `Yahoo=${{text(row.yahoo_status)}} | Alpaca=${{text(row.alpaca_status)}}`
+      }}));
+      const issues = [...reportIssues, ...resolutionIssues, ...holdingIssues].slice(0, 12);
+      document.getElementById("issues").innerHTML = issues.length ? issues.map((item) => `
+        <div class="list-item">
+          <div class="row-top"><div class="name">${{text(item.label)}}</div><div>${{pill("attention")}}</div></div>
+          <div class="detail">${{text(item.detail)}}</div>
+        </div>`).join("") : `<div class="detail">No ticker-resolution or data-quality issues were detected in this snapshot.</div>`;
+    }}
+    function renderForecastContext() {{
+      const rows = state.forecast_policy_context || [];
+      if (!rows.length) return;
+      document.getElementById("forecastPanel").hidden = false;
+      document.getElementById("forecastContext").innerHTML = rows.map((row) => `
+        <div class="list-item">
+          <div class="row-top"><div class="name">${{text(row.ticker)}}</div><div>${{pill(row.action || row.llm_decision || "unknown")}}</div></div>
+          <div class="detail">${{text(row.policy || row.llm_decision)}} · Reason: ${{text(row.reason)}} · Checked: ${{text(row.checked_at)}}</div>
+        </div>`).join("");
+    }}
+    renderMeta();
+    renderCards();
+    renderRows();
+    renderTopHoldings();
+    renderPlMoves();
+    renderIssues();
+    renderForecastContext();
+  </script>
+</body>
+</html>"""
+
+
+def build_dashboard_summary_markdown(state: dict[str, Any]) -> str:
+    summary = state.get("summary") or {}
+    holdings = state.get("holdings") or []
+    top_holdings = holdings[:5]
+    winners = sorted(
+        [row for row in holdings if float(row.get("unrealized_pl") or 0) > 0],
+        key=lambda row: float(row.get("unrealized_pl_pct") or float("-inf")),
+        reverse=True,
+    )[:3]
+    losers = sorted(
+        [row for row in holdings if float(row.get("unrealized_pl") or 0) < 0],
+        key=lambda row: float(row.get("unrealized_pl_pct") or float("inf")),
+    )[:3]
+    issues = _collect_issue_rows(state)
+    lines = [
+        "# Trade Republic End-of-Day Dashboard",
+        "",
+        f"- Generated: {state.get('generated_at') or '-'}",
+        f"- Report timestamp: {state.get('report_timestamp') or '-'}",
+        f"- Report path: `{state.get('report_path') or '-'}`",
+        f"- Read-only snapshot: no orders submitted",
+        "",
+        "## Summary",
+        "",
+        f"- Total current value: {_money_text(summary.get('total_current_value'))}",
+        f"- Total open cost basis: {_money_text(summary.get('total_open_cost_basis'))}",
+        f"- Total unrealized P/L: {_signed_money_text(summary.get('total_unrealized_pl'))} ({_pct_text(summary.get('total_unrealized_pl_pct'))})",
+        f"- Holding count: {summary.get('holding_count', 0)}",
+        f"- Ticker resolution count: {summary.get('ticker_resolution_count', 0)}",
+        "",
+        "## Top Holdings By Value",
+        "",
+    ]
+    for row in top_holdings:
+        lines.append(
+            f"- {row.get('name') or row.get('isin')}: {_money_text(row.get('current_value'))} "
+            f"({_pct_text(row.get('allocation_pct'))} allocation, {_pct_text(row.get('unrealized_pl_pct'))} P/L)"
+        )
+    lines.extend(["", "## Biggest Winners", ""])
+    if winners:
+        for row in winners:
+            lines.append(f"- {row.get('name') or row.get('isin')}: {_signed_money_text(row.get('unrealized_pl'))} ({_pct_text(row.get('unrealized_pl_pct'))})")
+    else:
+        lines.append("- None. No open holding is currently above cost basis.")
+    lines.extend(["", "## Biggest Losers", ""])
+    if losers:
+        for row in losers:
+            lines.append(f"- {row.get('name') or row.get('isin')}: {_signed_money_text(row.get('unrealized_pl'))} ({_pct_text(row.get('unrealized_pl_pct'))})")
+    else:
+        lines.append("- None. No open holding is currently below cost basis.")
+    lines.extend(["", "## Ticker / Data-Quality Issues", ""])
+    if issues:
+        for issue in issues:
+            lines.append(f"- {issue['label']}: {issue['detail']}")
+    else:
+        lines.append("- None detected in report or holding status fields.")
+    forecast_rows = state.get("forecast_policy_context") or []
+    if forecast_rows:
+        lines.extend(["", "## Latest Forecast / Policy Context", ""])
+        for row in forecast_rows:
+            lines.append(
+                f"- {row.get('ticker')}: {row.get('action') or row.get('llm_decision') or '-'} | "
+                f"{row.get('policy') or row.get('llm_decision') or '-'} | {row.get('reason') or '-'}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def load_latest_forecast_policy_context(
+    *,
+    log_dir: Path = DEFAULT_WATCH_LOG_DIR,
+    target_day: str | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    resolved_day = target_day or (now or datetime.now().astimezone()).strftime("%Y%m%d")
+    if not resolved_day or not log_dir.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in sorted(log_dir.glob(f"*_{resolved_day}.jsonl")):
+        latest = _read_latest_jsonl_record(path)
+        if not latest:
+            continue
+        rows.append(
+            {
+                "ticker": latest.get("ticker") or _ticker_from_log_path(path),
+                "action": latest.get("action"),
+                "policy": latest.get("llm_decision"),
+                "llm_decision": latest.get("llm_decision"),
+                "reason": latest.get("reason"),
+                "checked_at": latest.get("checked_at"),
+                "market_status": latest.get("market_status"),
+                "log_file": str(path),
+            }
+        )
+    rows.sort(key=lambda row: str(row.get("ticker") or ""))
+    return rows
+
+
+def write_dashboard_snapshot_outputs(
+    *,
+    report_path: Path,
+    output_dir: Path,
+    watch_log_dir: Path = DEFAULT_WATCH_LOG_DIR,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    state = build_dashboard_state(report_path)
+    state["forecast_policy_context"] = load_latest_forecast_policy_context(log_dir=watch_log_dir, now=now)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "dashboard_state.json"
+    html_path = output_dir / "dashboard_snapshot.html"
+    summary_path = output_dir / "dashboard_summary.md"
+    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    html_path.write_text(render_static_dashboard_html(state), encoding="utf-8")
+    summary_path.write_text(build_dashboard_summary_markdown(state), encoding="utf-8")
+    return {
+        "state": state,
+        "dashboard_state_path": str(state_path),
+        "dashboard_snapshot_path": str(html_path),
+        "dashboard_summary_path": str(summary_path),
     }
 
 
@@ -424,6 +875,81 @@ def _round(value: Any, digits: int = 2) -> float | None:
         return round(float(value), digits)
     except (TypeError, ValueError):
         return None
+
+
+def _allocation_pct(current_value: float | None, total_current_value: float | None) -> float | None:
+    if current_value is None or total_current_value in (None, 0):
+        return None
+    return _round((current_value / total_current_value) * 100)
+
+
+def _money_text(value: Any) -> str:
+    rounded = _round(value)
+    return "-" if rounded is None else f"EUR {rounded:,.2f}"
+
+
+def _signed_money_text(value: Any) -> str:
+    rounded = _round(value)
+    if rounded is None:
+        return "-"
+    sign = "+" if rounded > 0 else ""
+    return f"{sign}EUR {rounded:,.2f}"
+
+
+def _pct_text(value: Any) -> str:
+    rounded = _round(value)
+    if rounded is None:
+        return "-"
+    sign = "+" if rounded > 0 else ""
+    return f"{sign}{rounded:.2f}%"
+
+
+def _collect_issue_rows(state: dict[str, Any]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    report_error = state.get("report_error")
+    if report_error:
+        issues.append({"label": "report_error", "detail": str(report_error)})
+    for row in state.get("ticker_resolution") or []:
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("isin") or row.get("ticker") or "ticker_resolution")
+        detail = str(row.get("error") or row.get("reason") or row)
+        issues.append({"label": label, "detail": detail})
+    for row in state.get("holdings") or []:
+        if not isinstance(row, dict):
+            continue
+        yahoo_status = row.get("yahoo_status")
+        alpaca_status = row.get("alpaca_status")
+        if yahoo_status and yahoo_status != "matched":
+            issues.append({"label": str(row.get("ticker") or row.get("name") or row.get("isin") or "holding"), "detail": f"Yahoo status={yahoo_status}"})
+        if alpaca_status and alpaca_status != "matched":
+            issues.append({"label": str(row.get("ticker") or row.get("name") or row.get("isin") or "holding"), "detail": f"Alpaca status={alpaca_status}"})
+    return issues
+
+
+def _read_latest_jsonl_record(path: Path) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    latest = parsed
+    except OSError:
+        return None
+    return latest
+
+
+def _ticker_from_log_path(path: Path) -> str:
+    stem = path.stem
+    parts = stem.rsplit("_", 2)
+    return parts[0] if parts else stem
 
 
 if __name__ == "__main__":

@@ -1171,6 +1171,11 @@ def default_candidates(
         raise ValueError("tuning_mode must be `fixed` or `optuna`.")
     if deep_learning_profile not in {"off", "fast", "research"}:
         raise ValueError("deep_learning_profile must be `off`, `fast`, or `research`.")
+    if search_level not in {"realtime", "fast", "expanded", "medium", "broad"}:
+        raise ValueError("search_level must be `realtime`, `fast`, `expanded`, `medium`, or `broad`.")
+    if search_level in {"medium", "broad"}:
+        search_level = "expanded"
+    realtime = search_level == "realtime"
     expanded = search_level == "expanded"
     candidates: list[ForecastCandidate] = [
         HistoricalMeanReturn(),
@@ -1193,6 +1198,15 @@ def default_candidates(
                 min_samples_leaf=8,
                 random_state=random_state,
             ),
+        ]
+    )
+    if realtime:
+        if include_statistical_models:
+            candidates.extend(_optional_statistical_candidates(search_level=search_level))
+        return candidates
+
+    candidates.extend(
+        [
             _random_forest_candidate(
                 "random_forest_balanced",
                 n_estimators=180,
@@ -1311,11 +1325,16 @@ def default_candidates(
 
 def _optional_statistical_candidates(search_level: str) -> list[ForecastCandidate]:
     candidates: list[ForecastCandidate] = []
+    realtime = search_level == "realtime"
     expanded = search_level == "expanded"
     if importlib.util.find_spec("statsmodels") is not None:
         arima_orders = [(1, 0, 1)]
         sarima_orders = [((1, 0, 1), (1, 0, 1, 5))]
         var_lags = [2]
+        if realtime:
+            arima_orders = []
+            sarima_orders = []
+            var_lags = [1, 2]
         if expanded:
             arima_orders.extend([(1, 0, 0), (0, 0, 1), (2, 0, 1)])
             sarima_orders.extend([((1, 0, 0), (1, 0, 0, 5)), ((0, 0, 1), (0, 0, 1, 5))])
@@ -1333,7 +1352,7 @@ def _optional_statistical_candidates(search_level: str) -> list[ForecastCandidat
             for order, seasonal_order in sarima_orders
         )
         candidates.extend(VARReturnCandidate(maxlags=maxlags, name=f"var_lag_{maxlags}") for maxlags in var_lags)
-    if importlib.util.find_spec("arch") is not None:
+    if not realtime and importlib.util.find_spec("arch") is not None:
         garch_orders = [(1, 1)]
         if expanded:
             garch_orders.extend([(1, 2), (2, 1)])

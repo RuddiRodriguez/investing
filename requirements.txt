@@ -16,7 +16,9 @@ websockets>=15,<16
 streamlit>=1.43,<2.0
 plotly>=6.0,<7.0
 matplotlib>=3.8,<4.0
+tabulate>=0.10,<1.0
 pdfplumber>=0.11,<1.0
+faiss-cpu>=1.8,<2.0
 exchange-calendars>=4.5,<5.0
 
 # ML / optimization / backtesting
@@ -35,6 +37,7 @@ openai>=1.68,<2.0
 aws-bedrock-token-generator>=1.1,<2.0
 python-dotenv>=1.0,<2.0
 pydantic>=2.7,<3.0
+beautifulsoup4>=4.12,<5.0
 
 # Trade Republic integrations
 deprecated>=1.2,<2.0

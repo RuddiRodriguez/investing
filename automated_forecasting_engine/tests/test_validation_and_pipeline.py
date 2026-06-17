@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from market_forecasting_engine import ForecastConfig, ForecastingEngine
+from market_forecasting_engine import pipeline as pipeline_module
 from market_forecasting_engine.backtest import backtest_validation_signals
 from market_forecasting_engine.basing_points import analyze_basing_points
 from market_forecasting_engine.chapter_10_patterns import analyze_chapter_10_patterns
@@ -31,6 +32,7 @@ from market_forecasting_engine.dow_theory import analyze_dow_theory
 from market_forecasting_engine.factor_evaluation import evaluate_factors
 from market_forecasting_engine.features import add_forward_return_targets, build_feature_frame
 from market_forecasting_engine.models import (
+    ForecastCandidate,
     HistoricalMeanReturn,
     KalmanFilterReturnCandidate,
     LSTMReturnCandidate,
@@ -113,6 +115,98 @@ def test_select_candidate_uses_lower_error_metric() -> None:
 
     assert summary.metrics["mae"] >= 0
     assert summary.model_name in {"historical_mean_return", "recent_mean_return"}
+
+
+class _TrackedCandidate(ForecastCandidate):
+    def __init__(self, name: str, family: str, events: list[str]) -> None:
+        self.name = name
+        self.family = family
+        self.events = events
+        self.mean_ = 0.0
+
+    def fit(self, features: pd.DataFrame, target: pd.Series) -> "_TrackedCandidate":
+        self.events.append(f"fit:{self.name}")
+        self.mean_ = float(pd.to_numeric(target, errors="coerce").mean())
+        return self
+
+    def predict(self, features: pd.DataFrame) -> np.ndarray:
+        return np.full(len(features), self.mean_, dtype=float)
+
+    def clone(self) -> "_TrackedCandidate":
+        return _TrackedCandidate(self.name, self.family, self.events)
+
+
+def test_validate_candidates_parallel_preserves_candidate_order() -> None:
+    index = pd.bdate_range("2025-01-01", periods=140)
+    features = pd.DataFrame({"x": np.linspace(0, 1, len(index))}, index=index)
+    target = pd.Series(np.linspace(0.001, 0.01, len(index)), index=index)
+    events: list[str] = []
+    candidates = [
+        _TrackedCandidate("first", "statistical_baseline", events),
+        _TrackedCandidate("second", "statistical_baseline", events),
+        _TrackedCandidate("third", "statistical_baseline", events),
+    ]
+
+    results = validate_candidates(
+        candidates,
+        features,
+        target,
+        horizon_days=1,
+        min_training_rows=60,
+        validation_window=20,
+        step_size=20,
+        max_splits=2,
+        validation_workers=2,
+    )
+
+    assert [summary.model_name for _, summary, _ in results] == ["first", "second", "third"]
+
+
+def test_validate_candidates_keeps_deep_learning_on_serial_lane() -> None:
+    index = pd.bdate_range("2025-01-01", periods=140)
+    features = pd.DataFrame({"x": np.linspace(0, 1, len(index))}, index=index)
+    target = pd.Series(np.linspace(0.001, 0.01, len(index)), index=index)
+    events: list[str] = []
+    candidates = [
+        _TrackedCandidate("cpu_one", "statistical_baseline", events),
+        _TrackedCandidate("gpu_serial", "deep_learning", events),
+        _TrackedCandidate("cpu_two", "tree_model", events),
+    ]
+
+    results = validate_candidates(
+        candidates,
+        features,
+        target,
+        horizon_days=1,
+        min_training_rows=60,
+        validation_window=20,
+        step_size=20,
+        max_splits=2,
+        validation_workers=3,
+    )
+
+    assert [summary.model_name for _, summary, _ in results] == ["cpu_one", "gpu_serial", "cpu_two"]
+    first_gpu_fit = next(index for index, event in enumerate(events) if event == "fit:gpu_serial")
+    assert any(event == "fit:cpu_one" for event in events[:first_gpu_fit])
+    assert any(event == "fit:cpu_two" for event in events[:first_gpu_fit])
+
+
+def test_empirical_forecast_interval_contains_point_forecast_when_residuals_are_one_sided() -> None:
+    predictions = pd.DataFrame(
+        {
+            "actual": np.full(20, 0.10),
+            "predicted": np.full(20, 0.02),
+        }
+    )
+
+    interval = pipeline_module._empirical_forecast_interval(
+        expected_log_return=0.05,
+        validation_predictions=predictions,
+        confidence_level=0.80,
+        residual_std=0.01,
+    )
+
+    assert interval["lower_log_return"] <= 0.05 <= interval["upper_log_return"]
 
 
 def test_chapter_9_adjusted_metric_can_change_candidate_selection() -> None:
@@ -447,6 +541,7 @@ def test_forecasting_engine_returns_governed_multi_horizon_report() -> None:
         max_splits=3,
         include_lightgbm=False,
         include_statistical_models=False,
+        enable_llm_review=False,
     )
 
     report = ForecastingEngine(config).run(_market_prices())
@@ -2020,6 +2115,7 @@ def test_market_only_vs_enriched_comparison_runs_when_context_features_exist() -
         max_splits=2,
         include_lightgbm=False,
         include_statistical_models=False,
+        enable_llm_review=False,
     )
 
     report = ForecastingEngine(config).run(prices)
@@ -2094,6 +2190,7 @@ def test_write_plot_artifacts_creates_forecast_and_validation_plots(tmp_path) ->
         max_splits=2,
         include_lightgbm=False,
         include_statistical_models=False,
+        enable_llm_review=False,
     )
     report = ForecastingEngine(config).run(prices)
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 import math
+import os
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -167,9 +170,36 @@ def validate_candidates(
     purge_window: int = 0,
     embargo_window: int = 0,
     final_holdout_fraction: float = 0.15,
+    validation_workers: int = 0,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> list[tuple[ForecastCandidate, CandidateValidation, pd.DataFrame]]:
-    results = []
-    for candidate in candidates:
+    workers = _resolve_validation_workers(validation_workers, len(candidates))
+    indexed_candidates = list(enumerate(candidates))
+    serial_candidates = [(idx, candidate) for idx, candidate in indexed_candidates if _requires_serial_validation(candidate)]
+    parallel_candidates = [(idx, candidate) for idx, candidate in indexed_candidates if not _requires_serial_validation(candidate)]
+    result_by_index: dict[int, tuple[ForecastCandidate, CandidateValidation, pd.DataFrame]] = {}
+    completed = 0
+    total = len(indexed_candidates)
+
+    def emit(event: str, **payload: object) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                {
+                    "event": event,
+                    "horizon_days": horizon_days,
+                    "completed": completed,
+                    "total": total,
+                    "workers": workers,
+                    **payload,
+                }
+            )
+        except Exception:
+            return
+
+    def run_one(index: int, candidate: ForecastCandidate) -> tuple[int, tuple[ForecastCandidate, CandidateValidation, pd.DataFrame] | None]:
+        emit("candidate_started", candidate=candidate.name, family=candidate.family, index=index)
         try:
             summary, predictions = validate_candidate(
                 candidate=candidate,
@@ -185,10 +215,64 @@ def validate_candidates(
                 final_holdout_fraction=final_holdout_fraction,
             )
         except Exception:
-            continue
-        results.append((candidate, summary, predictions))
+            emit("candidate_failed", candidate=candidate.name, family=candidate.family, index=index)
+            return index, None
+        return index, (candidate, summary, predictions)
+
+    emit(
+        "validation_started",
+        candidate_count=len(candidates),
+        parallel_candidate_count=len(parallel_candidates),
+        serial_candidate_count=len(serial_candidates),
+    )
+    if workers > 1 and len(parallel_candidates) > 1:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mfe_validation") as executor:
+            futures = {
+                executor.submit(run_one, index, candidate): index
+                for index, candidate in parallel_candidates
+            }
+            for future in as_completed(futures):
+                index, result = future.result()
+                if result is not None:
+                    result_by_index[index] = result
+                completed += 1
+                candidate = candidates[index]
+                emit("candidate_completed", candidate=candidate.name, family=candidate.family, index=index, succeeded=result is not None)
+    else:
+        for index, candidate in parallel_candidates:
+            _, result = run_one(index, candidate)
+            if result is not None:
+                result_by_index[index] = result
+            completed += 1
+            emit("candidate_completed", candidate=candidate.name, family=candidate.family, index=index, succeeded=result is not None)
+
+    for index, candidate in serial_candidates:
+        _, result = run_one(index, candidate)
+        if result is not None:
+            result_by_index[index] = result
+        completed += 1
+        emit("candidate_completed", candidate=candidate.name, family=candidate.family, index=index, succeeded=result is not None)
+
+    results = [result_by_index[index] for index, _ in indexed_candidates if index in result_by_index]
     _add_multiple_testing_metrics(results)
+    emit("validation_completed", successful_candidate_count=len(results))
     return results
+
+
+def _requires_serial_validation(candidate: ForecastCandidate) -> bool:
+    return str(getattr(candidate, "family", "")).lower() in DEEP_LEARNING_FAMILIES
+
+
+def _resolve_validation_workers(validation_workers: int, candidate_count: int) -> int:
+    if candidate_count <= 1:
+        return 1
+    requested = int(validation_workers or 0)
+    if requested < 0:
+        return 1
+    if requested > 0:
+        return max(1, min(requested, candidate_count))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(candidate_count, max(1, cpu_count - 1), 4))
 
 
 def select_candidate(
