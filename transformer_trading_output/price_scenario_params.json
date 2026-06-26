@@ -1,9 +1,0 @@
-{
-  "benchmark_base_log_return": 0.016840428113937378,
-  "median_excess_if_outperform": 0.07957151532173157,
-  "median_excess_if_underperform": -0.0594727098941803,
-  "q20_excess_if_outperform": 0.031047636270523073,
-  "q80_excess_if_outperform": 0.1365323215723038,
-  "q20_excess_if_underperform": -0.13835607767105101,
-  "q80_excess_if_underperform": -0.021964586898684486
-}

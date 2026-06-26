@@ -214,3 +214,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated trading data, reports, and run outputs
+*.csv
+*.json
+*.jsonl
+*.faiss
+
+# Keep source-controlled config JSON files.
+!automated_forecasting_engine/configs/
+!automated_forecasting_engine/configs/*.json
+
+models/
+notebooks/**/models/
+output/
+simulation_runs/
+trade_republic_exports/
+transformer_trading_output/
+
+automated_forecasting_engine/snaptrade_exports/
+automated_forecasting_engine/strategy_knowledge/indexes/
+automated_forecasting_engine/trade_republic_exports/
+automated_forecasting_engine/unified_*.json
+automated_forecasting_engine/unified_*.jsonl

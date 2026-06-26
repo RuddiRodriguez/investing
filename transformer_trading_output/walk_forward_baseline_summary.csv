@@ -1,4 +1,0 @@
-,accuracy,accuracy,accuracy,auc,auc,auc,brier,brier,brier
-,mean,std,count,mean,std,count,mean,std,count
-model,,,,,,,,,
-logistic_regression,0.5014035087719299,0.12755652824459715,5,0.42266866979560475,0.14481462256179609,5,0.28638702817990147,0.048620305169389186,5
