@@ -1,2 +1,0 @@
-label,n_signals,n_trades_nonzero,fixed_position,total_return_pct,annualized_sharpe,max_drawdown_pct,hit_rate_nonzero,avg_net_return_per_signal_pct,turnover_avg,transaction_cost_bps
-test_simple_always_neutral,19,0,0,0.0,,0.0,,0.0,0.0,5.0

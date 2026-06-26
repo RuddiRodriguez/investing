@@ -1,4 +1,0 @@
-label,n_signals,n_trades_nonzero,fixed_position,total_return_pct,annualized_sharpe,max_drawdown_pct,hit_rate_nonzero,avg_net_return_per_signal_pct,turnover_avg,transaction_cost_bps
-test_simple_always_long_stock_short_benchmark,19,19,1,22.883033600737114,0.5639029116184453,-16.796269760029002,0.5263157894736842,1.0904433616693687,0.05263157894736842,5.0
-test_simple_always_neutral,19,0,0,0.0,,0.0,,0.0,0.0,5.0
-test_simple_always_short_stock_long_benchmark,19,19,-1,-18.784394442118778,-0.5688788563638162,-30.904643845889524,0.47368421052631576,-1.0890931791868286,0.05263157894736842,5.0
