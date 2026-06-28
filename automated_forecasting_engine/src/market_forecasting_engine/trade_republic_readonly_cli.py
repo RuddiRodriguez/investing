@@ -163,6 +163,11 @@ def _subprocess_env() -> dict[str, str]:
     env = dict(os.environ)
     scripts_dir = str(Path(sys.executable).resolve().parent)
     env["PATH"] = scripts_dir + os.pathsep + env.get("PATH", "")
+    src_dir = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+    chrome_path = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if chrome_path.exists() and not env.get("PYTR_PLAYWRIGHT_EXECUTABLE_PATH"):
+        env["PYTR_PLAYWRIGHT_EXECUTABLE_PATH"] = str(chrome_path)
     return env
 
 

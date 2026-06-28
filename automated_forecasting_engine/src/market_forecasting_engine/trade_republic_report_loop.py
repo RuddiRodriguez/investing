@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -48,16 +50,25 @@ def run_loop(args: argparse.Namespace) -> None:
         started = datetime.now(UTC)
         status: dict[str, Any] = {"iteration": iteration, "started_at": started.isoformat(), "events": []}
         try:
+            reconstruct_positions = False
             if args.refresh_portfolio:
-                refresh_portfolio(args, status)
+                try:
+                    refresh_portfolio(args, status)
+                except Exception as exc:  # noqa: BLE001
+                    status["events"].append({"event": "portfolio_export_failed", "error": str(exc)})
+                    reconstruct_positions = True
             if args.refresh_movements_every > 0 and (iteration == 1 or iteration % args.refresh_movements_every == 0):
-                refresh_movements(args, status)
+                try:
+                    refresh_movements(args, status)
+                except Exception as exc:  # noqa: BLE001
+                    status["events"].append({"event": "movements_export_failed", "error": str(exc)})
             report = build_report(
                 portfolio_path=args.portfolio,
                 transactions_path=args.transactions,
                 isin_map_path=args.isin_map,
                 fetch_yahoo=args.fetch_yahoo,
                 fetch_alpaca=args.fetch_alpaca,
+                reconstruct_positions_from_transactions=reconstruct_positions,
             )
             atomic_write_report(report, args.output)
             summary = report.get("summary", {})
@@ -125,7 +136,26 @@ def run_readonly_export(args: list[str], *, timeout_seconds: int) -> None:
         "--store-credentials",
         *args,
     ]
-    result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=timeout_seconds)
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.communicate(timeout=5)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        raise TimeoutError(f"read_only_export_timeout after {timeout_seconds}s: {' '.join(command)}") from exc
+    result = subprocess.CompletedProcess(command, process.returncode, stdout=stdout, stderr=stderr)
     if result.returncode != 0:
         message = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"read_only_export_failed rc={result.returncode}: {message[:500]}")

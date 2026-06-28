@@ -41,6 +41,7 @@ NUMERIC_FIELD_PATHS: dict[str, tuple[str, str]] = {
     "profit_margin": ("profitability", "profit_margin"),
     "return_on_assets": ("profitability", "return_on_assets"),
     "return_on_equity": ("profitability", "return_on_equity"),
+    "roic": ("profitability", "roic"),
     "target_consensus": ("analyst", "target_consensus"),
     "target_high": ("analyst", "target_high"),
     "target_low": ("analyst", "target_low"),

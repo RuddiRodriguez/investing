@@ -18,6 +18,7 @@ def test_long_term_source_consolidation_uses_current_values_and_marks_stale() ->
                 "identity": {"name": "Example Corp", "sector": "Technology", "currency": "USD"},
                 "quote": {"price": 100.0},
                 "valuation": {"market_cap": 1_000_000_000, "pe": 20.0},
+                "profitability": {"roic": 0.24},
                 "income_statement": {"date": "2025-12-31", "revenue": 500_000_000},
                 "recent_news": [{"title": "Example raises guidance", "published_at": "2026-06-12", "url": "https://x/news"}],
             }
@@ -48,6 +49,7 @@ def test_long_term_source_consolidation_uses_current_values_and_marks_stale() ->
     assert consolidated["identity"]["name"]["value"] == "Example Corp"
     assert consolidated["numeric_consensus"]["market_cap"]["value"] == 1_025_000_000
     assert consolidated["numeric_consensus"]["pe"]["conflict"] is True
+    assert consolidated["numeric_consensus"]["roic"]["value"] == 0.24
     assert consolidated["numeric_consensus"]["revenue"]["value"] == 500_000_000
     assert consolidated["numeric_consensus"]["revenue"]["used_observations"][0]["provider"] == "fmp"
     assert consolidated["stale_fields"][0]["provider"] == "tiingo"
@@ -93,6 +95,12 @@ def test_long_term_snapshots_join_asof_without_future_leakage(tmp_path) -> None:
                     "value": 20.0,
                     "relative_dispersion": 0.0,
                     "provider_count": 1,
+                },
+                "roic": {
+                    "status": "ok",
+                    "value": 0.21,
+                    "relative_dispersion": 0.0,
+                    "provider_count": 1,
                 }
             },
             "conflicts": [],
@@ -134,6 +142,7 @@ def test_long_term_snapshots_join_asof_without_future_leakage(tmp_path) -> None:
     assert metadata["status"] == "ok"
     assert pd.isna(features.loc[index[0], "lts_pe"])
     assert features.loc[index[1], "lts_pe"] == 20.0
+    assert features.loc[index[1], "lts_roic"] == 0.21
     assert features.loc[index[2], "lts_pe"] == 20.0
     assert features.loc[index[3], "lts_pe"] == 30.0
 

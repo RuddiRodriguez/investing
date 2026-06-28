@@ -47,6 +47,7 @@ from market_forecasting_engine.dip_buy import annotate_mean_reversion_dip_buy
 from market_forecasting_engine.dow_theory import analyze_dow_theory
 from market_forecasting_engine.factor_evaluation import evaluate_factors
 from market_forecasting_engine.feature_registry import build_feature_registry
+from market_forecasting_engine.forecast_calibration import ForecastCalibrationSettings, apply_forecast_calibration
 from market_forecasting_engine.features import add_forward_return_targets, build_feature_frame
 from market_forecasting_engine.governance import build_model_card
 from market_forecasting_engine.models import default_candidates
@@ -242,6 +243,29 @@ class ForecastingEngine:
                 expected_direction=forecast.expected_direction,
                 directional_confidence=forecast.directional_confidence,
             )
+
+        calibration_report = {
+            "ticker": self.config.ticker.upper(),
+            "as_of_date": as_of_date,
+            "as_of_timestamp": as_of_timestamp.isoformat(),
+            "forecast_interval": self.config.forecast_interval,
+            "forecast_interval_minutes": self.config.forecast_interval_minutes,
+            "generated_at_utc": datetime.now(UTC).isoformat(),
+            "current_price": latest_price,
+            "horizons": list(self.config.horizons),
+            "forecasts": forecasts,
+        }
+        apply_forecast_calibration(
+            calibration_report,
+            settings=ForecastCalibrationSettings(
+                enabled=bool(self.config.enable_forecast_calibration),
+                ledger_path=self.config.forecast_calibration_ledger_path,
+                min_active_samples=int(self.config.forecast_calibration_min_samples),
+                full_active_samples=int(self.config.forecast_calibration_full_samples),
+            ),
+        )
+        forecasts = calibration_report["forecasts"]
+        forecast_calibration = calibration_report.get("diagnostics", {}).get("forecast_calibration", {})
 
         risk = _portfolio_risk_level(forecasts)
         raw_action = suggested_action(forecasts, risk=risk)
@@ -555,6 +579,7 @@ class ForecastingEngine:
                 "llm_review": chapter_18_tactical_problem.get("llm_review", {}),
                 "llm_safety_gate": chapter_18_tactical_problem.get("llm_safety_gate", {}),
                 "long_term_context": long_term_context or {},
+                "forecast_calibration": forecast_calibration,
                 "final_decision_reasoning": final_decision_reasoning,
             },
             "portfolio_view": {
@@ -564,7 +589,7 @@ class ForecastingEngine:
                     "reason": "Single-ticker forecast runs do not include shares, cost basis, account liquidity, or tax constraints.",
                 },
             },
-            "operations_view": {},
+            "operations_view": {"forecast_calibration": forecast_calibration},
             "selection_view": {},
             "trade_risk_view": {},
             "discipline_view": {},
@@ -715,6 +740,7 @@ class ForecastingEngine:
                 "chapter_17_deep_learning": chapter_17_deep_learning,
                 "chapter_18_cnn": chapter_18_cnn,
                 "selected_validation_predictions": selected_validation_predictions,
+                "forecast_calibration": forecast_calibration,
                 "factor_evaluation": factor_evaluation,
                 "technical_structure": structure_snapshot,
                 "dow_theory": dow_theory,

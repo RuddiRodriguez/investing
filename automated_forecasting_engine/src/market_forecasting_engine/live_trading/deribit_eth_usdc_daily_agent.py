@@ -49,14 +49,33 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     broker = DeribitLiveSpotBroker()
+    log_progress(
+        "starting ETH/USDC daily agent "
+        f"instrument={args.instrument.upper()} live_execution={bool(args.execute_live_orders)} "
+        f"check_interval_seconds={int(args.check_interval_seconds)}"
+    )
     while True:
+        log_progress("cycle started")
         record = run_cycle(args=args, broker=broker)
         report_path = write_agent_report(record, output_dir)
         append_agent_log(record, output_dir)
         print(json.dumps(_cycle_summary(record, report_path), indent=2, default=str), flush=True)
+        log_progress(
+            "cycle complete "
+            f"latest_price={(record.get('market') or {}).get('latest_price')} "
+            f"action={(record.get('decision') or {}).get('action')} "
+            f"reason={(record.get('decision') or {}).get('reason')} "
+            f"orders={len(record.get('order_results') or [])}"
+        )
         if args.once:
             break
-        time.sleep(max(60, int(args.check_interval_seconds)))
+        sleep_seconds = max(60, int(args.check_interval_seconds))
+        log_progress(f"sleeping {sleep_seconds}s until next live-price check")
+        time.sleep(sleep_seconds)
+
+
+def log_progress(message: str) -> None:
+    print(f"[eth-agent] {datetime.now().strftime('%H:%M:%S')} {message}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forecast-validation-workers", type=int, default=0)
     parser.add_argument("--forecast-llm-timeout", type=int, default=240)
     parser.add_argument("--forecast-timeout-seconds", type=int, default=3600)
+    parser.add_argument("--forecast-retry-after-seconds", type=int, default=14400)
     parser.add_argument("--force-forecast-refresh", action="store_true")
     parser.add_argument("--max-notional-usdc", type=float, default=100.0)
     parser.add_argument("--max-base-position", type=float, default=0.25)
@@ -106,20 +126,40 @@ def build_parser() -> argparse.ArgumentParser:
 def run_cycle(*, args: argparse.Namespace, broker: DeribitLiveSpotBroker) -> dict[str, Any]:
     now = datetime.now(UTC)
     output_dir = Path(args.output_dir)
+    log_progress("loading state and daily forecast/CEO decision")
     state = read_state(output_dir, args.instrument)
     forecast_record = ensure_daily_forecast(args=args, state=state, now=now)
     state.update(
         {
             "last_forecast_report_path": str(forecast_record.report_path),
-            "last_forecast_date": _local_date(now, args.active_timezone),
             "last_forecast_created_at_utc": forecast_record.created_at_utc,
         }
     )
+    if "last_forecast_refresh_error" not in state:
+        state["last_forecast_date"] = _local_date(now, args.active_timezone)
+    log_progress("reading live Deribit market, balances, and open orders")
     market_packet = read_live_market(args=args, broker=broker)
+    log_progress("reconciling open sell-order exposure")
+    sell_order_reconciliation = reconcile_open_sell_orders(
+        args=args,
+        broker=broker,
+        state=state,
+        market_packet=market_packet,
+    )
+    if sell_order_reconciliation.get("cancelled_count"):
+        log_progress(
+            "sell-order reconciliation cancelled "
+            f"{sell_order_reconciliation.get('cancelled_count')} excess agent-managed sell order(s); refreshing market"
+        )
+        market_packet = read_live_market(args=args, broker=broker)
+    elif sell_order_reconciliation.get("status") == "manual_review_required":
+        log_progress("sell-order reconciliation found unmanaged over-exposure; no manual orders were cancelled")
+    log_progress("building live action from cached CEO decision")
     plan = decide_from_cached_ceo(args=args, state=state, forecast_record=forecast_record, market_packet=market_packet)
     order_results: list[dict[str, Any]] = []
     if args.execute_live_orders and plan.get("execution_allowed"):
         label_base = f"codex-eth-usdc-daily-{now.strftime('%Y%m%d%H%M%S')}"
+        log_progress(f"submitting live plan action={plan.get('action')} reason={plan.get('reason')}")
         order_results = execute_live_plan(broker=broker, args=args, plan=plan, label_base=label_base)
         update_state_from_order_results(state=state, instrument=args.instrument.upper(), results=order_results)
     else:
@@ -152,6 +192,7 @@ def run_cycle(*, args: argparse.Namespace, broker: DeribitLiveSpotBroker) -> dic
             "forecasts": forecast_record.report.get("forecasts", []),
         },
         "market": market_packet,
+        "sell_order_reconciliation": sell_order_reconciliation,
         "decision": plan,
         "order_results": order_results,
         "agent_state": state,
@@ -163,7 +204,29 @@ def ensure_daily_forecast(*, args: argparse.Namespace, state: dict[str, Any], no
     forecast_due = is_forecast_due(args=args, state=state, now=now)
     report_path = Path(str(state.get("last_forecast_report_path") or ""))
     if forecast_due or not report_path.exists() or bool(args.force_forecast_refresh):
-        report_path = run_morning_forecast(args=args, now=now)
+        log_progress("daily forecast refresh is due; launching full forecast pipeline")
+        try:
+            report_path = run_morning_forecast(args=args, now=now)
+            state.pop("last_forecast_refresh_error", None)
+            state.pop("last_forecast_refresh_failed_at_utc", None)
+            log_progress(f"daily forecast refresh completed report={report_path}")
+        except Exception as exc:
+            fallback_path = report_path if report_path.exists() else _latest_valid_forecast_report(output_dir)
+            state["last_forecast_refresh_failed_at_utc"] = datetime.now(UTC).isoformat()
+            state["last_forecast_refresh_error"] = {
+                "error": str(exc),
+                "fallback_report_path": str(fallback_path) if fallback_path else None,
+                "policy": (
+                    "Forecast refresh failed, but the agent stays alive and continues hourly live-price "
+                    "monitoring with the last valid CEO decision when one exists."
+                ),
+            }
+            if fallback_path is None:
+                raise RuntimeError("Forecast refresh failed and no previous valid forecast report is available.") from exc
+            report_path = fallback_path
+            log_progress(f"daily forecast refresh failed; using fallback report={report_path}")
+    else:
+        log_progress(f"using cached forecast report={report_path}")
     return load_forecast_decision(report_path)
 
 
@@ -172,6 +235,9 @@ def is_forecast_due(*, args: argparse.Namespace, state: dict[str, Any], now: dat
     last_date = str(state.get("last_forecast_date") or "")
     today = local_now.date().isoformat()
     if last_date != today:
+        failed_at = _parse_utc_datetime(state.get("last_forecast_refresh_failed_at_utc"))
+        if failed_at is not None and (now - failed_at).total_seconds() < max(0, int(args.forecast_retry_after_seconds)):
+            return False
         return local_now.time() >= _parse_local_time(args.daily_forecast_local_time)
     return False
 
@@ -432,6 +498,142 @@ def read_live_market(*, args: argparse.Namespace, broker: DeribitLiveSpotBroker)
     }
 
 
+def reconcile_open_sell_orders(
+    *,
+    args: argparse.Namespace,
+    broker: DeribitLiveSpotBroker,
+    state: dict[str, Any],
+    market_packet: dict[str, Any],
+) -> dict[str, Any]:
+    instrument = args.instrument.upper()
+    base = args.base_currency.upper()
+    base_account = ((market_packet.get("account") or {}).get(base) or {})
+    base_balance = _float(base_account.get("balance"))
+    managed_base_balance = managed_balance(args=args, state=state, base_balance=base_balance)
+    open_orders = market_packet.get("open_orders") or []
+    sell_orders = [_summarize_sell_order(order) for order in open_orders if _is_active_sell_order(order, instrument)]
+    sell_orders = [order for order in sell_orders if order["remaining_amount"] > 0]
+    total_open_sell_amount = sum(float(order["remaining_amount"]) for order in sell_orders)
+    exposure_limit = max(0.0, managed_base_balance)
+    tolerance = max(1e-9, float(args.min_order_base_amount) * 0.1)
+    base_payload: dict[str, Any] = {
+        "status": "ok",
+        "policy": (
+            "Deribit spot does not provide a native OCO guarantee in this agent path. "
+            "The agent caps active sell exposure to the managed ETH balance. It may cancel only "
+            "agent-labelled excess sell orders; unmanaged/manual sell orders require visible review."
+        ),
+        "instrument": instrument,
+        "base_balance": base_balance,
+        "managed_base_balance": managed_base_balance,
+        "total_open_sell_amount": total_open_sell_amount,
+        "excess_sell_amount": max(0.0, total_open_sell_amount - exposure_limit),
+        "sell_order_count": len(sell_orders),
+        "cancelled_count": 0,
+        "cancelled_orders": [],
+        "would_cancel_orders": [],
+        "kept_orders": [],
+        "unmanaged_sell_orders": [],
+    }
+    if total_open_sell_amount <= exposure_limit + tolerance:
+        base_payload["kept_orders"] = sell_orders
+        return base_payload
+    managed_orders = [order for order in sell_orders if _is_agent_managed_label(order.get("label"))]
+    unmanaged_orders = [order for order in sell_orders if not _is_agent_managed_label(order.get("label"))]
+    unmanaged_amount = sum(float(order["remaining_amount"]) for order in unmanaged_orders)
+    remaining_capacity = max(0.0, exposure_limit - unmanaged_amount)
+    keep: list[dict[str, Any]] = []
+    cancel: list[dict[str, Any]] = []
+    for order in sorted(managed_orders, key=_sell_order_keep_priority):
+        remaining_amount = float(order["remaining_amount"])
+        if remaining_amount <= remaining_capacity + tolerance:
+            keep.append(order)
+            remaining_capacity = max(0.0, remaining_capacity - remaining_amount)
+        else:
+            cancel.append(order)
+    base_payload["kept_orders"] = [*unmanaged_orders, *keep]
+    base_payload["unmanaged_sell_orders"] = unmanaged_orders
+    if unmanaged_orders:
+        base_payload["status"] = "manual_review_required" if unmanaged_amount > exposure_limit + tolerance else "reconciled_agent_orders_only"
+        base_payload["manual_review_reason"] = (
+            "Unmanaged/manual active sell orders contribute to sell exposure. "
+            "The agent will not cancel them automatically."
+        )
+    else:
+        base_payload["status"] = "reconciled_needed"
+    if not cancel:
+        return base_payload
+    if not bool(args.execute_live_orders):
+        base_payload["status"] = "dry_run_would_cancel_excess_agent_sell_orders"
+        base_payload["would_cancel_orders"] = cancel
+        return base_payload
+    cancelled: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for order in cancel:
+        order_id = str(order.get("order_id") or "")
+        if not order_id:
+            failed.append({"order": order, "error": "missing_order_id"})
+            continue
+        try:
+            result = broker.cancel_order(order_id)
+        except Exception as exc:
+            failed.append({"order": order, "error": str(exc)})
+            continue
+        cancelled.append({"order": order, "result": result})
+    base_payload["cancelled_orders"] = cancelled
+    base_payload["cancelled_count"] = len(cancelled)
+    if failed:
+        base_payload["status"] = "cancel_failed_manual_review_required"
+        base_payload["cancel_failures"] = failed
+    elif unmanaged_orders and unmanaged_amount > exposure_limit + tolerance:
+        base_payload["status"] = "manual_review_required"
+    else:
+        base_payload["status"] = "reconciled"
+    return base_payload
+
+
+def _is_active_sell_order(order: dict[str, Any], instrument: str) -> bool:
+    if str(order.get("instrument_name") or "").upper() != instrument.upper():
+        return False
+    if str(order.get("direction") or "").lower() != "sell":
+        return False
+    state = str(order.get("order_state") or "").lower()
+    return state in {"open", "untriggered"}
+
+
+def _summarize_sell_order(order: dict[str, Any]) -> dict[str, Any]:
+    amount = max(0.0, _float(order.get("amount")) - _float(order.get("filled_amount")))
+    order_type = str(order.get("order_type") or order.get("type") or "").lower()
+    trigger_price = _float(order.get("trigger_price"))
+    return {
+        "order_id": order.get("order_id"),
+        "label": order.get("label"),
+        "instrument_name": order.get("instrument_name"),
+        "direction": order.get("direction"),
+        "order_state": order.get("order_state"),
+        "order_type": order_type,
+        "remaining_amount": amount,
+        "price": _float(order.get("price")) or None,
+        "trigger_price": trigger_price or None,
+        "is_stop": _is_stop_order_summary(order_type=order_type, trigger_price=trigger_price),
+    }
+
+
+def _is_stop_order_summary(*, order_type: str, trigger_price: float) -> bool:
+    return "stop" in order_type or trigger_price > 0
+
+
+def _is_agent_managed_label(label: Any) -> bool:
+    return str(label or "").startswith("codex-eth-usdc-daily-")
+
+
+def _sell_order_keep_priority(order: dict[str, Any]) -> tuple[int, float, float, str]:
+    is_stop = bool(order.get("is_stop"))
+    remaining_amount = float(order.get("remaining_amount") or 0.0)
+    price = float(order.get("trigger_price") or order.get("price") or 0.0)
+    return (0 if is_stop else 1, remaining_amount, price, str(order.get("order_id") or ""))
+
+
 def decide_from_cached_ceo(
     *,
     args: argparse.Namespace,
@@ -490,7 +692,15 @@ def decide_from_cached_ceo(
     )
     if buy_plan is not None:
         return {**base, **buy_plan, "created_at_utc": now}
-    sell_plan = maybe_sell_plan(args=args, latest_price=latest_price, managed_base_balance=managed_base_balance, quote=quote, advice=advice, action=action)
+    sell_plan = maybe_sell_plan(
+        args=args,
+        latest_price=latest_price,
+        managed_base_balance=managed_base_balance,
+        quote=quote,
+        open_orders=open_orders,
+        advice=advice,
+        action=action,
+    )
     if sell_plan is not None:
         return {**base, **sell_plan, "created_at_utc": now}
     return {**base, "action": "hold", "reason": "cached_ceo_decision_no_live_trigger", "execution_allowed": False, "created_at_utc": now}
@@ -510,6 +720,14 @@ def maybe_buy_plan(
 ) -> dict[str, Any] | None:
     if managed_base_balance >= float(args.max_base_position):
         return None
+    invalidation = _float_or_none(advice.get("invalidation_price")) or _float_or_none(advice.get("stop_loss_price"))
+    if invalidation and latest_price <= invalidation:
+        return {
+            "action": "hold",
+            "reason": "buy_blocked_below_ceo_invalidation",
+            "execution_allowed": False,
+            "invalidation_price": invalidation,
+        }
     triggers: list[tuple[str, float | None]] = [
         ("buy_now", _float_or_none(advice.get("buy_now_price"))),
         ("buy_lower", _float_or_none(advice.get("buy_lower_price")) or _float_or_none(advice.get("buy_lower_zone_high"))),
@@ -557,6 +775,7 @@ def maybe_sell_plan(
     latest_price: float,
     managed_base_balance: float,
     quote: dict[str, Any],
+    open_orders: list[dict[str, Any]],
     advice: dict[str, Any],
     action: str,
 ) -> dict[str, Any] | None:
@@ -576,6 +795,24 @@ def maybe_sell_plan(
         trigger = "take_profit_price_reached"
     if trigger is None:
         return None
+    existing_protection = analyze_existing_protection(
+        open_orders=open_orders,
+        instrument=args.instrument.upper(),
+        base_balance=managed_base_balance,
+        latest_price=latest_price,
+    )
+    if existing_protection.get("sell_coverage_ratio", 0.0) >= float(args.stop_protection_coverage_ratio):
+        return {
+            "action": "hold",
+            "reason": "existing_sell_orders_already_cover_position",
+            "execution_allowed": False,
+            "trigger_seen": trigger,
+            "existing_protection": existing_protection,
+            "policy": (
+                "Deribit spot orders are not treated as native OCO here. If active sell orders already "
+                "reserve the managed ETH balance, the agent does not submit another sell."
+            ),
+        }
     bid = _float(quote.get("bid")) or latest_price
     amount = agent_round_amount(args, min(managed_base_balance, float(args.max_base_position)))
     if amount < float(args.min_order_base_amount):
@@ -643,29 +880,26 @@ def execute_live_plan(*, broker: DeribitLiveSpotBroker, args: argparse.Namespace
     results: list[dict[str, Any]] = []
     instrument = args.instrument.upper()
     entry = plan.get("entry_order")
+    entry_result: dict[str, Any] | None = None
     if entry:
         signal_key = plan.get("signal_key")
-        results.append(
-            {
-                "action": "submit_entry_order",
-                "payload": entry,
-                "signal_key": signal_key,
-                "result": broker.submit_spot_order(
-                    side=entry["side"],
-                    instrument_name=instrument,
-                    amount=float(entry["amount"]),
-                    order_type=entry["type"],
-                    price=entry.get("price"),
-                    label=f"{label_base}-entry",
-                ),
-            }
+        entry_result = _submit_spot_order_safely(
+            broker=broker,
+            side=entry["side"],
+            instrument_name=instrument,
+            amount=float(entry["amount"]),
+            order_type=entry["type"],
+            price=entry.get("price"),
+            label=f"{label_base}-entry",
         )
+        results.append({"action": "submit_entry_order", "payload": entry, "signal_key": signal_key, "result": entry_result})
     for name, order in (plan.get("protection") or {}).items():
         results.append(
             {
                 "action": f"submit_{name}_order",
                 "payload": order,
-                "result": broker.submit_spot_order(
+                "result": _submit_spot_order_safely(
+                    broker=broker,
                     side=order["side"],
                     instrument_name=instrument,
                     amount=float(order["amount"]),
@@ -678,14 +912,86 @@ def execute_live_plan(*, broker: DeribitLiveSpotBroker, args: argparse.Namespace
             }
         )
     if entry and entry.get("side") == "buy" and plan.get("post_fill_protection_plan"):
-        results.append(
-            {
-                "action": "post_fill_protection_pending",
-                "reason": "protection_not_submitted_until_buy_fill_is_confirmed",
-                "protection_plan": plan.get("post_fill_protection_plan"),
-            }
-        )
+        filled_amount = _filled_amount(entry_result)
+        if filled_amount >= float(args.min_order_base_amount):
+            for name, order in (plan.get("post_fill_protection_plan") or {}).items():
+                adjusted = {**order, "amount": agent_round_amount(args, min(float(order["amount"]), filled_amount))}
+                if adjusted["amount"] < float(args.min_order_base_amount):
+                    continue
+                results.append(
+                    {
+                        "action": f"submit_post_fill_{name}_order",
+                        "payload": adjusted,
+                        "result": _submit_spot_order_safely(
+                            broker=broker,
+                            side=adjusted["side"],
+                            instrument_name=instrument,
+                            amount=float(adjusted["amount"]),
+                            order_type=adjusted["type"],
+                            price=adjusted.get("price"),
+                            trigger_price=adjusted.get("trigger_price"),
+                            trigger=adjusted.get("trigger"),
+                            label=f"{label_base}-post-fill-{name}",
+                        ),
+                    }
+                )
+        else:
+            results.append(
+                {
+                    "action": "post_fill_protection_pending",
+                    "reason": "entry_not_filled_yet",
+                    "protection_plan": plan.get("post_fill_protection_plan"),
+                }
+            )
     return results
+
+
+def _submit_spot_order_safely(
+    *,
+    broker: DeribitLiveSpotBroker,
+    side: str,
+    instrument_name: str,
+    amount: float,
+    order_type: str,
+    price: float | None = None,
+    trigger_price: float | None = None,
+    trigger: str | None = None,
+    label: str | None = None,
+) -> dict[str, Any]:
+    try:
+        result = broker.submit_spot_order(
+            side=side,
+            instrument_name=instrument_name,
+            amount=amount,
+            order_type=order_type,
+            price=price,
+            trigger_price=trigger_price,
+            trigger=trigger,
+            label=label,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "blocked_or_rejected": True,
+            "policy": "Broker-side order rejection is recorded and does not crash the live monitoring loop.",
+        }
+    if isinstance(result, dict):
+        return {"ok": True, **result}
+    return {"ok": True, "result": result}
+
+
+def _filled_amount(order_result: dict[str, Any] | None) -> float:
+    if not isinstance(order_result, dict):
+        return 0.0
+    if order_result.get("ok") is False:
+        return 0.0
+    order = order_result.get("order") if isinstance(order_result.get("order"), dict) else {}
+    filled = _float(order.get("filled_amount"))
+    if filled > 0:
+        return filled
+    trades = order_result.get("trades") if isinstance(order_result.get("trades"), list) else []
+    return sum(_float(trade.get("amount")) for trade in trades if isinstance(trade, dict))
 
 
 def _base_decision_payload(
@@ -810,6 +1116,35 @@ def _cycle_summary(record: dict[str, Any], report_path: Path) -> dict[str, Any]:
 def _parse_local_time(value: str) -> local_time:
     hour, minute = [int(part) for part in value.split(":", 1)]
     return local_time(hour=hour, minute=minute)
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _latest_valid_forecast_report(output_dir: Path) -> Path | None:
+    candidates = []
+    forecast_root = output_dir / "forecasts"
+    if forecast_root.exists():
+        candidates.extend(sorted(forecast_root.glob("*/forecast_report.json"), key=lambda path: path.stat().st_mtime, reverse=True))
+    candidates.append(output_dir / "forecast_report.json")
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            load_forecast_decision(path)
+        except Exception:
+            continue
+        return path
+    return None
 
 
 def _local_date(now: datetime, timezone: str) -> str:

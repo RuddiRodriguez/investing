@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trading Router"
+  short_description: "Route trading requests to the right local agent"
+  default_prompt: "Use $trading-router to answer a trading request with the correct local agent and safe options."

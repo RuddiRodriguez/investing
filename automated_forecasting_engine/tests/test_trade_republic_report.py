@@ -197,3 +197,65 @@ def test_build_report_can_persist_llm_resolved_tickers(tmp_path: Path) -> None:
 
     saved = isin_map.read_text(encoding="utf-8")
     assert "US5324571083,LLY,LLY,Eli Lilly & Co,llm_name_resolution,0.98" in saved
+
+
+def test_build_report_can_reconstruct_current_positions_from_transactions(tmp_path: Path) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text(
+        "Name;ISIN;quantity;price;avgCost;netValue\n"
+        "Tesla;US88160R1014;99;260;200;25740\n",
+        encoding="utf-8",
+    )
+    transactions = tmp_path / "account_transactions.csv"
+    transactions.write_text(
+        "Date;Type;Value;Note;ISIN;Shares\n"
+        "2026-01-02T10:00:00;Buy;-200;Tesla;US88160R1014;1\n"
+        "2026-01-03T10:00:00;Buy;-420;Tesla;US88160R1014;2\n"
+        "2026-01-04T10:00:00;Sell;260;Tesla;US88160R1014;1\n",
+        encoding="utf-8",
+    )
+
+    report = build_report(
+        portfolio_path=portfolio,
+        transactions_path=transactions,
+        reconstruct_positions_from_transactions=True,
+    )
+
+    row = report["holdings"][0]
+    assert row["current_quantity"] == 2.0
+    assert row["broker_avg_cost"] == 210.0
+    assert row["current_price"] == 260.0
+    assert row["current_value"] == 520.0
+
+
+def test_build_report_extracts_dividends_from_transactions(tmp_path: Path) -> None:
+    portfolio = tmp_path / "portfolio.csv"
+    portfolio.write_text("Name;ISIN;quantity;price;avgCost;netValue\nTesla;US88160R1014;1;260;200;260\n", encoding="utf-8")
+    transactions = tmp_path / "account_transactions.csv"
+    transactions.write_text(
+        "Date;Type;Value;Note;ISIN;Shares;Fees;Taxes\n"
+        "2026-06-10T08:29:55;Dividend;0.02;Exxon Mobil;US30231G1022;0.040173;;0.01\n"
+        "2026-06-10T08:29:55;Dividend;;Exxon Mobil;US30231G1022;;;;\n",
+        encoding="utf-8",
+    )
+
+    report = build_report(portfolio_path=portfolio, transactions_path=transactions)
+
+    assert report["summary"]["total_dividends_after_tax"] == 0.02
+    assert report["summary"]["total_dividend_tax"] == 0.01
+    assert report["dividends"] == [
+        {
+            "date": "2026-06-10",
+            "timestamp": "2026-06-10T08:29:55",
+            "type": "dividend",
+            "isin": "US30231G1022",
+            "ticker": "",
+            "name": "Exxon Mobil",
+            "shares": 0.040173,
+            "after_tax_amount": 0.02,
+            "tax_amount": 0.01,
+            "gross_amount": 0.03,
+            "currency": "EUR",
+            "source": "trade_republic_movements",
+        }
+    ]

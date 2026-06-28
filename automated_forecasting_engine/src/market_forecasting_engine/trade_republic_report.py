@@ -108,10 +108,11 @@ def build_report(
     llm_model: str | None = None,
     ticker_resolver: Any | None = None,
     update_isin_map: bool = False,
+    reconstruct_positions_from_transactions: bool = False,
 ) -> dict[str, Any]:
     isin_map = load_isin_map(isin_map_path)
     prices = load_price_history(price_history_path)
-    portfolio_rows = load_portfolio(portfolio_path)
+    portfolio_rows = load_portfolio(portfolio_path) if portfolio_path.exists() else []
     transactions = list(load_transactions(transactions_path))
     ticker_resolution: list[dict[str, Any]] = []
     if resolve_tickers_llm:
@@ -128,9 +129,17 @@ def build_report(
             write_isin_map(isin_map_path, isin_map)
     if fetch_yahoo:
         prices.update(fetch_yahoo_prices(transactions, isin_map, existing_prices=prices))
+    if reconstruct_positions_from_transactions:
+        portfolio_rows = reconstruct_portfolio_from_transactions(
+            transactions,
+            portfolio_rows=portfolio_rows,
+            isin_map=isin_map,
+            fetch_yahoo=fetch_yahoo,
+        )
     transaction_stats = summarize_transactions(transactions, isin_map, prices)
     if fetch_alpaca:
         merge_alpaca_execution_stats(transaction_stats, transactions, isin_map, fetch_alpaca_execution_prices(transactions, isin_map))
+    dividends = summarize_dividends(transactions, isin_map)
     holdings: list[HoldingReport] = []
 
     for row in portfolio_rows:
@@ -206,10 +215,212 @@ def build_report(
             "total_historical_buy_cash": float(sum(Decimal(str(item.historical_buy_cash)) for item in holdings)),
             "total_historical_sell_cash": float(sum(Decimal(str(item.historical_sell_cash)) for item in holdings)),
             "ticker_resolution_count": len(ticker_resolution),
+            "total_dividends_after_tax": float(sum(Decimal(str(item["after_tax_amount"])) for item in dividends)),
+            "total_dividend_tax": float(sum(Decimal(str(item["tax_amount"])) for item in dividends)),
         },
         "ticker_resolution": ticker_resolution,
         "holdings": [asdict(item) for item in sorted(holdings, key=lambda item: item.current_value, reverse=True)],
+        "dividends": dividends,
     }
+
+
+def summarize_dividends(transactions: Iterable[dict[str, Any]], isin_map: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in transactions:
+        row_type = normalize_text(value_for(row, "type")).lower()
+        if "dividend" not in row_type and "dividende" not in row_type:
+            continue
+        after_tax = parse_decimal(value_for(row, "value"), default=None)
+        tax = abs(parse_decimal(row.get("Taxes") or row.get("taxes"), default=Decimal("0")) or Decimal("0"))
+        shares = parse_decimal(value_for(row, "shares"), default=None)
+        if after_tax is None and tax == 0:
+            continue
+        isin = normalize_text(value_for(row, "isin")).upper()
+        mapped = isin_map.get(isin, {})
+        rows.append(
+            {
+                "date": normalize_text(value_for(row, "date"))[:10],
+                "timestamp": normalize_text(value_for(row, "date")),
+                "type": "dividend",
+                "isin": isin,
+                "ticker": mapped.get("ticker") or mapped.get("alpaca_ticker") or "",
+                "name": normalize_text(row.get("Note") or row.get("note")) or mapped.get("name") or isin,
+                "shares": float(shares) if shares is not None else None,
+                "after_tax_amount": float(after_tax or Decimal("0")),
+                "tax_amount": float(tax),
+                "gross_amount": float((after_tax or Decimal("0")) + tax),
+                "currency": "EUR",
+                "source": "trade_republic_movements",
+            }
+        )
+    return sorted(rows, key=lambda item: (str(item.get("date") or ""), str(item.get("name") or "")))
+
+
+def reconstruct_portfolio_from_transactions(
+    transactions: Iterable[dict[str, Any]],
+    *,
+    portfolio_rows: Iterable[dict[str, Any]] = (),
+    isin_map: dict[str, dict[str, str]] | None = None,
+    fetch_yahoo: bool = False,
+) -> list[dict[str, str]]:
+    isin_map = isin_map or {}
+    existing_by_isin = {
+        normalize_text(row.get("ISIN") or row.get("isin")).upper(): row
+        for row in portfolio_rows
+        if normalize_text(row.get("ISIN") or row.get("isin"))
+    }
+    lots: dict[str, list[dict[str, Decimal | str]]] = defaultdict(list)
+    names: dict[str, str] = {}
+    for row in sorted(transactions, key=lambda item: normalize_text(value_for(item, "date"))):
+        isin = normalize_text(value_for(row, "isin")).upper()
+        if not isin:
+            continue
+        name = normalize_text(row.get("Note") or row.get("note"))
+        if name:
+            names[isin] = name
+        value = parse_decimal(value_for(row, "value"), default=Decimal("0"))
+        shares = abs(parse_decimal(value_for(row, "shares"), default=Decimal("0")))
+        row_type = normalize_text(value_for(row, "type")).lower()
+        is_buy = row_type in {"buy", "kauf"} or (value < 0 and shares > 0)
+        is_sell = row_type in {"sell", "verkauf"} or (value > 0 and shares > 0)
+        if is_buy and shares > 0:
+            lots[isin].append({"shares": shares, "cost": abs(value), "name": name})
+        elif is_sell and shares > 0:
+            remaining = shares
+            while remaining > 0 and lots[isin]:
+                lot = lots[isin][0]
+                lot_shares = Decimal(str(lot["shares"]))
+                consumed = min(lot_shares, remaining)
+                lot_cost = Decimal(str(lot["cost"]))
+                if consumed >= lot_shares:
+                    remaining -= lot_shares
+                    lots[isin].pop(0)
+                else:
+                    fraction = consumed / lot_shares
+                    lot["shares"] = lot_shares - consumed
+                    lot["cost"] = lot_cost * (Decimal("1") - fraction)
+                    remaining = Decimal("0")
+
+    latest_prices = fetch_latest_yahoo_prices(lots.keys(), isin_map) if fetch_yahoo else {}
+    reconstructed: list[dict[str, str]] = []
+    for isin, isin_lots in lots.items():
+        quantity = sum(Decimal(str(lot["shares"])) for lot in isin_lots)
+        if quantity <= Decimal("0.00000001"):
+            continue
+        open_cost = sum(Decimal(str(lot["cost"])) for lot in isin_lots)
+        avg_cost = open_cost / quantity if quantity else Decimal("0")
+        existing = existing_by_isin.get(isin, {})
+        price = latest_prices.get(isin) or parse_decimal(existing.get("price"), default=None) or avg_cost
+        net_value = quantity * price
+        name = (
+            names.get(isin)
+            or normalize_text(existing.get("Name") or existing.get("name"))
+            or isin_map.get(isin, {}).get("name")
+            or isin
+        )
+        reconstructed.append(
+            {
+                "Name": name,
+                "ISIN": isin,
+                "quantity": str(quantity.normalize()),
+                "price": str(price.normalize()),
+                "avgCost": str(avg_cost.normalize()),
+                "netValue": str(net_value.normalize()),
+                "source": "transactions_reconstructed",
+            }
+        )
+    return reconstructed
+
+
+def fetch_latest_yahoo_prices(isins: Iterable[str], isin_map: dict[str, dict[str, str]]) -> dict[str, Decimal]:
+    requests = {isin: isin_map.get(isin, {}).get("ticker") for isin in isins}
+    requests = {isin: ticker for isin, ticker in requests.items() if ticker}
+    if not requests:
+        return {}
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+    output: dict[str, Decimal] = {}
+    currency_cache: dict[str, str] = {}
+    fx_cache: dict[str, Decimal] = {}
+    for isin, ticker in requests.items():
+        try:
+            data = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=False, threads=False)
+        except Exception:
+            continue
+        if data.empty or "Close" not in data:
+            continue
+        close_series = data["Close"]
+        if hasattr(close_series, "columns"):
+            close_series = close_series.iloc[:, 0]
+        close_series = close_series.dropna()
+        if close_series.empty:
+            continue
+        price = Decimal(str(close_series.iloc[-1]))
+        output[isin] = convert_yahoo_price_to_eur(price, ticker, yf, currency_cache, fx_cache)
+    return output
+
+
+def convert_yahoo_price_to_eur(
+    price: Decimal,
+    ticker: str,
+    yf: Any,
+    currency_cache: dict[str, str],
+    fx_cache: dict[str, Decimal],
+) -> Decimal:
+    currency = yahoo_ticker_currency(ticker, yf, currency_cache)
+    if currency == "EUR":
+        return price
+    rate = yahoo_fx_to_eur(currency, yf, fx_cache)
+    return price * rate
+
+
+def yahoo_ticker_currency(ticker: str, yf: Any, cache: dict[str, str]) -> str:
+    if ticker in cache:
+        return cache[ticker]
+    currency = ""
+    try:
+        fast_info = getattr(yf.Ticker(ticker), "fast_info", None)
+        if fast_info:
+            currency = str(fast_info.get("currency") or "").upper()
+    except Exception:
+        currency = ""
+    if not currency:
+        suffix_defaults = {
+            ".TO": "CAD",
+            ".V": "CAD",
+            ".L": "GBP",
+            ".AS": "EUR",
+            ".DE": "EUR",
+            ".PA": "EUR",
+            ".MI": "EUR",
+            ".MC": "EUR",
+        }
+        currency = next((value for suffix, value in suffix_defaults.items() if ticker.upper().endswith(suffix)), "USD")
+    cache[ticker] = currency
+    return currency
+
+
+def yahoo_fx_to_eur(currency: str, yf: Any, cache: dict[str, Decimal]) -> Decimal:
+    currency = currency.upper()
+    if currency in {"", "EUR"}:
+        return Decimal("1")
+    if currency in cache:
+        return cache[currency]
+    pair = f"{currency}EUR=X"
+    try:
+        data = yf.download(pair, period="5d", interval="1d", progress=False, auto_adjust=False, threads=False)
+        close_series = data["Close"]
+        if hasattr(close_series, "columns"):
+            close_series = close_series.iloc[:, 0]
+        close_series = close_series.dropna()
+        if not close_series.empty:
+            cache[currency] = Decimal(str(close_series.iloc[-1]))
+            return cache[currency]
+    except Exception:
+        pass
+    raise RuntimeError(f"Missing Yahoo FX rate for {currency}->EUR.")
 
 
 def summarize_transactions(
@@ -523,6 +734,8 @@ def fetch_yahoo_prices(
         raise RuntimeError("Yahoo price fetching requires yfinance. Install project dependencies first.") from exc
 
     fetched: dict[tuple[str, str], Decimal] = {}
+    currency_cache: dict[str, str] = {}
+    fx_cache: dict[str, Decimal] = {}
     for ticker, dates in requests_by_ticker.items():
         start_date = min(datetime.fromisoformat(date).date() for date in dates)
         end_date = max(datetime.fromisoformat(date).date() for date in dates) + timedelta(days=7)
@@ -539,7 +752,10 @@ def fetch_yahoo_prices(
         close_series = data["Close"]
         if hasattr(close_series, "columns"):
             close_series = close_series.iloc[:, 0]
-        available = {index.date().isoformat(): Decimal(str(value)) for index, value in close_series.dropna().items()}
+        available = {
+            index.date().isoformat(): convert_yahoo_price_to_eur(Decimal(str(value)), ticker, yf, currency_cache, fx_cache)
+            for index, value in close_series.dropna().items()
+        }
         sorted_dates = sorted(available)
         for date in dates:
             selected_date = date if date in available else next((candidate for candidate in sorted_dates if candidate >= date), None)

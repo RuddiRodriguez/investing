@@ -49,6 +49,10 @@ class ForecastConfig:
     bayesian_mcmc_tune: int = 300
     forecast_interval: str = "1d"
     forecast_interval_minutes: float | None = None
+    enable_forecast_calibration: bool = True
+    forecast_calibration_ledger_path: str | None = None
+    forecast_calibration_min_samples: int = 5
+    forecast_calibration_full_samples: int = 15
     model_version: str = "0.1.0"
 
     def to_dict(self) -> dict[str, Any]:

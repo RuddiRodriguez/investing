@@ -36,9 +36,13 @@ def main() -> None:
     parser.add_argument("--provider", default="yahoo")
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--horizons", default="5,10,20")
+    parser.add_argument("--forecast-backend", choices=("full", "pure_llm"), default="full")
     parser.add_argument("--risk-profile", choices=("conservative", "medium", "aggressive"), default="medium")
     parser.add_argument("--trader-profile", choices=("conservative", "medium", "aggressive"), default="medium")
+    parser.add_argument("--llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="llm_studio")
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--ceo-llm-provider", choices=("openai", "huggingface", "bedrock", "llm_studio"), default="openai")
+    parser.add_argument("--ceo-llm-model", default=None)
     parser.add_argument("--llm-reasoning-effort", default="none")
     parser.add_argument("--llm-timeout-seconds", type=int, default=120)
     parser.add_argument("--llm-search-context-size", choices=("low", "medium", "high"), default="medium")
@@ -75,9 +79,13 @@ def main() -> None:
         provider=args.provider,
         interval=args.interval,
         horizons=args.horizons,
+        forecast_backend=args.forecast_backend,
         risk_profile=args.risk_profile,
         trader_profile=args.trader_profile,
+        llm_provider=args.llm_provider,
         llm_model=args.llm_model,
+        ceo_llm_provider=args.ceo_llm_provider,
+        ceo_llm_model=args.ceo_llm_model,
         llm_reasoning_effort=args.llm_reasoning_effort,
         llm_timeout_seconds=args.llm_timeout_seconds,
         llm_search_context_size=args.llm_search_context_size,

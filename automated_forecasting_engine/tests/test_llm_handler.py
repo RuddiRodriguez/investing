@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import market_forecasting_engine.llm_handler as llm_handler
 from market_forecasting_engine.llm_handler import (
     BedrockOpenAIResponsesProvider,
     HuggingFaceChatProvider,
@@ -208,3 +209,73 @@ def test_llm_studio_provider_reads_structured_json_from_reasoning_content(tmp_pa
 
     assert result.parsed == {"decision": "Hold"}
     assert client.chat.completions.payload["response_format"]["type"] == "json_schema"
+
+
+def test_llm_studio_provider_executes_local_web_search_tool_loop(tmp_path, monkeypatch) -> None:
+    class ToolLoopCompletions:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **payload):
+            self.calls.append(payload)
+            if len(self.calls) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": json.dumps({"query": "J stock news today", "max_results": 3}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+                }
+            return {
+                "choices": [{"message": {"content": '{"decision":"Hold","freshness":"used_tool"}'}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            }
+
+    class Chat:
+        def __init__(self):
+            self.completions = ToolLoopCompletions()
+
+    class Client:
+        api_key = "local-key"
+
+        def __init__(self):
+            self.chat = Chat()
+
+    monkeypatch.setattr(
+        llm_handler,
+        "local_web_search",
+        lambda *, query, max_results=6: {"status": "ok", "query": query, "results": [{"title": "Jacobs news"}]},
+    )
+    log_file = tmp_path / "usage.jsonl"
+    monkeypatch.setenv("OPENAI_USAGE_LOG_FILE", str(log_file))
+    client = Client()
+    provider = OpenAICompatibleChatProvider(client=client, api_key="local-key", base_url="http://127.0.0.1:1234/v1")
+    payload = {
+        **_payload(),
+        "tools": [{"type": "web_search", "search_context_size": "low"}],
+    }
+    handler = LLMHandler({"llm_studio": provider})
+
+    result = handler.predict(LLMRequest(provider="llm_studio", model="qwen3-vl-8b-instruct-mlx", payload=payload, usage_context={"purpose": "local_tool_unit"}))
+
+    assert result.parsed == {"decision": "Hold", "freshness": "used_tool"}
+    assert len(client.chat.completions.calls) == 2
+    assert client.chat.completions.calls[0]["tools"][0]["function"]["name"] == "web_search"
+    assert client.chat.completions.calls[1]["messages"][-1]["role"] == "tool"
+    assert json.loads(client.chat.completions.calls[1]["messages"][-1]["content"])["results"][0]["title"] == "Jacobs news"
+    row = json.loads(log_file.read_text().splitlines()[0])
+    assert row["provider"] == "llm_studio"
+    assert row["context"]["purpose"] == "local_tool_unit"

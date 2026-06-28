@@ -46,9 +46,13 @@ class VirtualTraderAgentConfig:
     provider: str = "yahoo"
     interval: str = "1d"
     horizons: str = "5,10,20"
+    forecast_backend: str = "full"
     risk_profile: str = "medium"
     trader_profile: str = "medium"
+    llm_provider: str = "llm_studio"
     llm_model: str | None = None
+    ceo_llm_provider: str = "openai"
+    ceo_llm_model: str | None = None
     llm_reasoning_effort: str = "none"
     llm_timeout_seconds: int = 120
     llm_search_context_size: str = "medium"
@@ -95,13 +99,24 @@ def run_agent_cycle(config: VirtualTraderAgentConfig, *, cycle: int) -> dict[str
     cycle_dir.mkdir(parents=True, exist_ok=True)
     memory = VirtualTraderMemory.load(config.memory_path)
     broker_state = _broker_state()
+    order_lifecycle_events: list[dict[str, Any]] = []
     if broker_state.get("status") == "ok":
-        memory.broker_snapshot(
+        order_lifecycle_events = memory.broker_snapshot(
             account=broker_state.get("account"),
             positions=broker_state.get("positions", []),
             orders=broker_state.get("open_orders", []),
+            recent_orders=broker_state.get("recent_orders", []),
         )
         memory.save()
+        if order_lifecycle_events:
+            expired = [event for event in order_lifecycle_events if event.get("status") == "expired"]
+            filled = [event for event in order_lifecycle_events if event.get("status") == "filled"]
+            canceled = [event for event in order_lifecycle_events if event.get("status") == "canceled"]
+            _progress(
+                config,
+                "order lifecycle reconciled "
+                f"events={len(order_lifecycle_events)} expired={len(expired)} filled={len(filled)} canceled={len(canceled)}",
+            )
     portfolio_state = build_portfolio_state(memory=memory, broker_state=broker_state, config=config)
     intelligence_decision = market_intelligence_refresh_decision(memory=memory, portfolio_state=portfolio_state, config=config)
     if intelligence_decision["refresh"]:
@@ -181,7 +196,14 @@ def run_agent_cycle(config: VirtualTraderAgentConfig, *, cycle: int) -> dict[str
     _write_json(managed_path, managed_candidates)
     _progress(config, f"managed candidate set={','.join(row.get('ticker', '') for row in managed_candidates)}")
 
-    if managed_candidates and _plan_should_forecast(plan):
+    skip_forecast_reason = _skip_forecast_reason_for_open_orders(
+        plan=plan,
+        broker_state=broker_state,
+        portfolio_state=portfolio_state,
+    )
+    if skip_forecast_reason:
+        _progress(config, f"skipping forecasts reason={skip_forecast_reason}")
+    if managed_candidates and _plan_should_forecast(plan) and not skip_forecast_reason:
         _progress(config, "planner requested active paper trader pipeline")
         board = run_virtual_trader_pipeline(
             VirtualTraderPipelineConfig(
@@ -193,10 +215,14 @@ def run_agent_cycle(config: VirtualTraderAgentConfig, *, cycle: int) -> dict[str
                 start=config.forecast_start,
                 interval=config.interval,
                 horizons=config.horizons,
+                forecast_backend=config.forecast_backend,
                 risk_profile=config.risk_profile,
                 trader_profile=config.trader_profile,
                 llm_env_file=config.env_file,
+                llm_provider=config.llm_provider,
                 llm_model=config.llm_model,
+                ceo_llm_provider=config.ceo_llm_provider,
+                ceo_llm_model=config.ceo_llm_model,
                 llm_reasoning_effort=config.llm_reasoning_effort,
                 llm_timeout_seconds=config.llm_timeout_seconds,
                 llm_search_context_size=config.llm_search_context_size,
@@ -215,7 +241,10 @@ def run_agent_cycle(config: VirtualTraderAgentConfig, *, cycle: int) -> dict[str
             "artifact_paths": {},
             "order_plans": [],
             "portfolio_selection": {},
-            "policy": {"planner_skipped_forecasts": True},
+            "policy": {
+                "planner_skipped_forecasts": True,
+                "skip_forecast_reason": skip_forecast_reason,
+            },
         }
     memory = VirtualTraderMemory.load(config.memory_path)
     cycle_record = {
@@ -228,6 +257,7 @@ def run_agent_cycle(config: VirtualTraderAgentConfig, *, cycle: int) -> dict[str
             "forecast_ceo_usage_logs": "Forecast subprocesses use the same OpenAI usage logger with their own process/purpose context.",
         },
         "portfolio_state": portfolio_state,
+        "order_lifecycle_events": order_lifecycle_events,
         "market_intelligence": {
             "status": intelligence.get("status"),
             "fetched_at_utc": intelligence.get("fetched_at_utc"),
@@ -381,6 +411,8 @@ def build_portfolio_state(
     account = broker_state.get("account") if isinstance(broker_state.get("account"), dict) else portfolio.get("account", {})
     positions = broker_state.get("positions") if isinstance(broker_state.get("positions"), list) else portfolio.get("positions", [])
     open_orders = broker_state.get("open_orders") if isinstance(broker_state.get("open_orders"), list) else portfolio.get("open_orders", [])
+    recent_orders = broker_state.get("recent_orders") if isinstance(broker_state.get("recent_orders"), list) else portfolio.get("broker_recent_orders", [])
+    lifecycle_events = portfolio.get("recent_order_lifecycle_events", []) if isinstance(portfolio.get("recent_order_lifecycle_events"), list) else []
     clock = broker_state.get("clock") if isinstance(broker_state.get("clock"), dict) else {}
     equity = _to_float(account.get("equity") or account.get("portfolio_value")) or 0.0
     cash = _to_float(account.get("cash")) or 0.0
@@ -421,6 +453,11 @@ def build_portfolio_state(
         },
         "positions": position_rows,
         "open_orders_count": len(open_orders or []),
+        "recent_orders_count": len(recent_orders or []),
+        "order_lifecycle_events": lifecycle_events,
+        "expired_order_events_count": len([event for event in lifecycle_events if event.get("status") == "expired"]),
+        "filled_order_events_count": len([event for event in lifecycle_events if event.get("status") == "filled"]),
+        "canceled_order_events_count": len([event for event in lifecycle_events if event.get("status") == "canceled"]),
         "active_watch_plan_count": len(watch_plans),
         "total_market_value": round(total_market_value, 2),
         "gross_exposure_pct_equity": round(total_market_value / equity, 4) if equity else None,
@@ -569,11 +606,21 @@ def install_launch_agent(config: VirtualTraderAgentConfig, *, python_executable:
         str(config.analyst_pages),
         "--horizons",
         config.horizons,
+        "--forecast-backend",
+        config.forecast_backend,
         "--risk-profile",
         config.risk_profile,
         "--trader-profile",
         config.trader_profile,
+        "--llm-provider",
+        config.llm_provider,
+        "--ceo-llm-provider",
+        config.ceo_llm_provider,
     ]
+    if config.llm_model:
+        program_arguments.extend(["--llm-model", config.llm_model])
+    if config.ceo_llm_model:
+        program_arguments.extend(["--ceo-llm-model", config.ceo_llm_model])
     if config.env_file:
         program_arguments.extend(["--env-file", str(config.env_file)])
     if not config.execute_paper_orders:
@@ -689,9 +736,10 @@ def _broker_state() -> dict[str, Any]:
             "clock": broker.clock(),
             "positions": broker.positions(),
             "open_orders": broker.orders(status="open", limit=100),
+            "recent_orders": broker.orders(status="all", limit=100, direction="desc"),
         }
     except Exception as exc:
-        return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "positions": [], "open_orders": []}
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "positions": [], "open_orders": [], "recent_orders": []}
 
 
 def _write_cycle_error(config: VirtualTraderAgentConfig, cycle: int, started_at: datetime, exc: Exception) -> None:
@@ -733,8 +781,12 @@ def _planner_config(config: VirtualTraderAgentConfig) -> dict[str, Any]:
         "scout_final_candidates": config.scout_final_candidates,
         "max_managed_candidates": config.max_managed_candidates,
         "horizons": config.horizons,
+        "forecast_backend": config.forecast_backend,
         "risk_profile": config.risk_profile,
         "trader_profile": config.trader_profile,
+        "llm_provider": config.llm_provider,
+        "ceo_llm_provider": config.ceo_llm_provider,
+        "ceo_llm_model": config.ceo_llm_model,
         "max_notional_per_trade": config.max_notional_per_trade,
         "max_position_pct_equity": config.max_position_pct_equity,
         "execute_paper_orders": config.execute_paper_orders,
@@ -755,6 +807,24 @@ def _plan_should_forecast(plan: dict[str, Any]) -> bool:
         return True
     tasks = plan.get("tasks", []) if isinstance(plan.get("tasks"), list) else []
     return any(isinstance(task, dict) and task.get("task_type") == "refresh_forecast" for task in tasks)
+
+
+def _skip_forecast_reason_for_open_orders(
+    *,
+    plan: dict[str, Any],
+    broker_state: dict[str, Any],
+    portfolio_state: dict[str, Any],
+) -> str | None:
+    open_orders = broker_state.get("open_orders", []) if isinstance(broker_state.get("open_orders"), list) else []
+    if not open_orders:
+        return None
+    if bool(plan.get("should_scan_new_candidates")) or _plan_has_task(plan, "scan_new_candidates"):
+        return None
+    if portfolio_state.get("state") == "manage_pending_portfolio" or str(plan.get("cycle_mode") or "").lower() == "order_maintenance":
+        return "open_orders_pending_order_maintenance_only"
+    if _plan_has_task(plan, "review_open_order") and not _plan_has_task(plan, "scan_new_candidates"):
+        return "open_orders_review_before_forecast"
+    return None
 
 
 def _parse_time(value: Any) -> datetime | None:

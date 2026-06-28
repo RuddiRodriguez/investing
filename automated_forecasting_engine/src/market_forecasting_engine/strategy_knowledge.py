@@ -20,6 +20,7 @@ DEFAULT_STRATEGY_INDEX_PATH = Path("automated_forecasting_engine/strategy_knowle
 STRATEGY_KNOWLEDGE_VERSION = "strategy_knowledge_faiss_v1"
 MAX_CHARS_PER_CHUNK = 1800
 CHUNK_OVERLAP_CHARS = 250
+PINNED_STOCK_GUIDANCE_FILENAME = "stock_long_term_execution_guidance.md"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class StrategyKnowledgeRequest:
     max_chunks: int = 8
     rebuild_index: bool = False
     timeout_seconds: int = 45
+    include_pdfs: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -46,12 +48,14 @@ def build_strategy_knowledge_context(report: dict[str, Any], request: StrategyKn
     corpus_dir = Path(request.corpus_dir).expanduser()
     if not corpus_dir.exists():
         return _context_status(request, "skipped", reason=f"strategy corpus directory does not exist: {corpus_dir}")
-    documents = load_strategy_documents(corpus_dir)
+    documents = load_strategy_documents(corpus_dir, include_pdfs=bool(request.include_pdfs))
     if not documents:
         return _context_status(request, "skipped", reason=f"no supported strategy documents found in {corpus_dir}")
     index_status = ensure_strategy_index(documents, request)
     query = build_strategy_query_from_report(report)
     retrieved = retrieve_strategy_chunks(query, request)
+    pinned = _pinned_stock_guidance_chunks(documents, request)
+    retrieved = _merge_pinned_chunks(retrieved, pinned)
     synthesis = synthesize_strategy_context(query=query, retrieved_chunks=retrieved)
     return {
         "status": "executed" if retrieved else "empty",
@@ -76,8 +80,9 @@ def attach_strategy_knowledge_context(report: dict[str, Any], context: dict[str,
     report.setdefault("final_decision_reasoning", {})["strategy_knowledge_status"] = context.get("status")
 
 
-def load_strategy_documents(corpus_dir: Path) -> list[dict[str, Any]]:
-    paths = sorted(path for path in corpus_dir.rglob("*") if path.is_file() and path.suffix.lower() in {".md", ".txt", ".pdf"})
+def load_strategy_documents(corpus_dir: Path, *, include_pdfs: bool = True) -> list[dict[str, Any]]:
+    suffixes = {".md", ".txt", ".pdf"} if include_pdfs else {".md", ".txt"}
+    paths = sorted(path for path in corpus_dir.rglob("*") if path.is_file() and path.suffix.lower() in suffixes)
     documents: list[dict[str, Any]] = []
     for path in paths:
         text, extraction = _extract_document_text(path)
@@ -191,6 +196,58 @@ def retrieve_strategy_chunks(query: str, request: StrategyKnowledgeRequest) -> l
     return [_chunk_result(score, semantic, lexical_score, idx, chunk) for score, semantic, lexical_score, idx, chunk in top]
 
 
+def _pinned_stock_guidance_chunks(documents: list[dict[str, Any]], request: StrategyKnowledgeRequest) -> list[dict[str, Any]]:
+    if not _is_stock_or_etf_ticker(request.ticker):
+        return []
+    for document in documents:
+        if Path(str(document.get("source_path") or "")).name != PINNED_STOCK_GUIDANCE_FILENAME:
+            continue
+        text = _clean_text(str(document.get("text") or ""))
+        if not text:
+            return []
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return [
+            {
+                "rank_index": -1,
+                "chunk_id": f"{document['source_id']}:pinned:{text_hash[:12]}",
+                "source_id": document.get("source_id"),
+                "source_title": document.get("source_title"),
+                "source_path": document.get("source_path"),
+                "source_type": document.get("source_type"),
+                "chunk_index": "pinned",
+                "score": 1.0,
+                "semantic_score": None,
+                "lexical_score": 1.0,
+                "text_excerpt": text[:1400],
+                "text_sha256": text_hash,
+                "pin_reason": "stock_long_term_execution_guidance",
+                "decision_policy": {
+                    "guidance_only": True,
+                    "applies_to": "stock_and_etf_ceo_decisions",
+                    "excludes": ["options", "crypto"],
+                },
+            }
+        ]
+    return []
+
+
+def _merge_pinned_chunks(retrieved: list[dict[str, Any]], pinned: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not pinned:
+        return retrieved
+    pinned_paths = {chunk.get("source_path") for chunk in pinned}
+    output = list(pinned)
+    output.extend(chunk for chunk in retrieved if chunk.get("source_path") not in pinned_paths)
+    return output
+
+
+def _is_stock_or_etf_ticker(ticker: str) -> bool:
+    symbol = str(ticker or "").upper().strip()
+    if not symbol or "-" in symbol or "/" in symbol:
+        return False
+    crypto_tokens = {"BTC", "ETH", "SOL", "USDC", "USDT", "USD", "EUR"}
+    return symbol not in crypto_tokens
+
+
 def synthesize_strategy_context(*, query: str, retrieved_chunks: list[dict[str, Any]]) -> dict[str, Any]:
     principles: list[str] = []
     entry_rules: list[str] = []
@@ -205,16 +262,34 @@ def synthesize_strategy_context(*, query: str, retrieved_chunks: list[dict[str, 
             principles.append("Prioritize strong current/annual earnings growth and estimate revisions when judging quality.")
         if any(token in lower for token in ("new product", "new service", "new leadership", "catalyst")):
             principles.append("Look for a new product, service, leadership, market, or catalyst that changes company character.")
+        if "roic" in lower or "return on invested capital" in lower:
+            principles.append("For stock quality, check ROIC or return on invested capital when available; high and durable ROIC supports stronger business quality.")
         if any(token in lower for token in ("breakout", "base", "pivot", "trendline")):
             entry_rules.append("Prefer disciplined breakouts or early trendline entries from proper bases, not blind chasing.")
         if any(token in lower for token in ("pullback", "10-day", "21-day", "50-day", "support")):
             entry_rules.append("For leaders, pullbacks into institutional support can be safer than extended entries.")
+        if "limit order" in lower:
+            entry_rules.append("For stock and ETF buys, prefer limit orders and do not use market orders.")
+        if "huge daily jump" in lower or "extended price jump" in lower:
+            entry_rules.append("Do not chase stock buys after a huge daily jump; wait for a cleaner entry.")
+        if "averaging down" in lower or "cheaper" in lower:
+            entry_rules.append("Do not buy more just because a stock is cheaper; require a fresh business and setup reason.")
+        if "one growth buy per week" in lower:
+            entry_rules.append("For the growth side, avoid repeated buys; use at most one growth buy per week as guidance.")
+        if "one etf buy per month" in lower:
+            entry_rules.append("For ETF accumulation, use at most one scheduled ETF buy per month as guidance.")
         if any(token in lower for token in ("7%", "8%", "stop", "risk", "position")):
             risk_rules.append("Only enter when price is close enough to a logical stop to keep loss within the defined risk budget.")
+        if "7% to 8%" in lower and "review" in lower:
+            risk_rules.append("For growth stocks, a 7% to 8% drawdown should trigger review, not automatic averaging down.")
+        if "partial profit" in lower:
+            risk_rules.append("After a strong rise, consider partial profit if momentum weakens.")
         if any(token in lower for token in ("market direction", "follow-through", "confirmed uptrend")):
             warnings.append("Do not get aggressive unless the broad market confirms an uptrend.")
         if any(token in lower for token in ("choppy", "failed", "cash is a position", "chop")):
             warnings.append("Failed breakouts or choppy markets argue for cash, pilot size, or waiting.")
+        if "bad news" in lower:
+            warnings.append("Avoid buying stocks falling hard on bad business news; worsening business news can justify reducing or selling.")
     return {
         "status": "deterministic_synthesis",
         "query_hash": hashlib.sha256(query.encode("utf-8")).hexdigest(),

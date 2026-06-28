@@ -4,9 +4,17 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from market_forecasting_engine.llm_usage import log_llm_usage, log_openai_usage, monotonic_ms, new_llm_call_id
-from market_forecasting_engine.llm_model_catalog import DEFAULT_LLM_STUDIO_BASE_URL
+from market_forecasting_engine.llm_model_catalog import (
+    DEFAULT_LLM_STUDIO_BASE_URL,
+    LLMModelProfile,
+    normalize_llm_provider,
+    resolve_llm_model_profile,
+)
 from market_forecasting_engine.openai_models import BEDROCK_OPENAI_BASE_URL
 
 
@@ -181,7 +189,7 @@ class OpenAICompatibleChatProvider:
         client = self.client or self._client()
         payload = payload_with_model(request.payload, request.model)
         if payload.get("tools"):
-            raise LLMProviderNotConfigured(f"{self.name} provider does not support Responses API tools in this framework yet.")
+            return self._generate_with_tools(client=client, request=request, payload=payload)
         messages = responses_payload_to_chat_messages(payload)
         if not self._should_use_response_format():
             messages = _messages_with_json_instruction(messages, payload.get("text"))
@@ -207,6 +215,76 @@ class OpenAICompatibleChatProvider:
             output_text=output_text,
             api_key=getattr(client, "api_key", None) or self.api_key or os.getenv("LLM_STUDIO_API_KEY") or "local",
         )
+
+    def _generate_with_tools(self, *, client: Any, request: LLMRequest, payload: dict[str, Any]) -> LLMResult:
+        chat_tools = _local_chat_tools_from_responses_tools(payload.get("tools") or [])
+        if not chat_tools:
+            raise LLMProviderNotConfigured(f"{self.name} provider received unsupported tools.")
+        messages = responses_payload_to_chat_messages(payload)
+        if not self._should_use_response_format():
+            messages = _messages_with_json_instruction(messages, payload.get("text"))
+        create_payload = self._chat_create_payload(model=request.model, messages=messages, payload=payload, tools=chat_tools)
+        first_response = client.chat.completions.create(**create_payload)
+        first_data = response_json(first_response)
+        tool_calls = _chat_tool_calls(first_data)
+        if not tool_calls:
+            output_text = _chat_output_text(first_response, first_data)
+            return LLMResult(
+                provider=self.name,
+                model=request.model,
+                payload=create_payload,
+                response_data=first_data,
+                parsed=parse_json_object(output_text),
+                output_text=output_text,
+                api_key=getattr(client, "api_key", None) or self.api_key or os.getenv("LLM_STUDIO_API_KEY") or "local",
+            )
+        messages = [*messages, _assistant_tool_call_message(first_data)]
+        tool_results = []
+        for tool_call in tool_calls:
+            tool_result = _execute_local_tool_call(tool_call)
+            tool_results.append(tool_result)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id") or tool_call.get("index") or "tool_call",
+                    "content": json.dumps(tool_result, separators=(",", ":"), default=str),
+                }
+            )
+        final_payload = self._chat_create_payload(model=request.model, messages=messages, payload=payload, tools=chat_tools)
+        final_response = client.chat.completions.create(**final_payload)
+        final_data = response_json(final_response)
+        output_text = _chat_output_text(final_response, final_data)
+        response_data = {
+            "tool_loop": {
+                "first_response": first_data,
+                "tool_results": tool_results,
+                "final_response": final_data,
+            }
+        }
+        return LLMResult(
+            provider=self.name,
+            model=request.model,
+            payload={**final_payload, "local_tool_loop": {"enabled": True, "tools": [tool.get("function", {}).get("name") for tool in chat_tools]}},
+            response_data=response_data,
+            parsed=parse_json_object(output_text),
+            output_text=output_text,
+            api_key=getattr(client, "api_key", None) or self.api_key or os.getenv("LLM_STUDIO_API_KEY") or "local",
+        )
+
+    def _chat_create_payload(self, *, model: str, messages: list[dict[str, Any]], payload: dict[str, Any], tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        create_payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": payload.get("temperature"),
+        }
+        if tools:
+            create_payload["tools"] = tools
+            create_payload["tool_choice"] = "auto"
+        if self._should_use_response_format():
+            response_format = _chat_response_format(payload.get("text"))
+            if response_format is not None:
+                create_payload["response_format"] = response_format
+        return {key: value for key, value in create_payload.items() if value is not None}
 
     def _client(self) -> Any:
         try:
@@ -331,21 +409,11 @@ def default_llm_handler(
 
 
 def normalize_provider_name(value: str | None) -> str:
-    normalized = str(value or "").strip().lower().replace("-", "_")
-    aliases = {
-        "open_ai": "openai",
-        "aws_bedrock": "bedrock",
-        "amazon_bedrock": "bedrock",
-        "bedrock_openai": "bedrock",
-        "aws_bedrock_openai": "bedrock",
-        "hf": "huggingface",
-        "hugging_face": "huggingface",
-        "hugging_face_hub": "huggingface",
-        "lm_studio": "llm_studio",
-        "llmstudio": "llm_studio",
-        "local_llm_studio": "llm_studio",
-    }
-    return aliases.get(normalized, normalized)
+    return normalize_llm_provider(value)
+
+
+def resolve_llm_client_profile(provider: str | None = None, model: str | None = None) -> LLMModelProfile:
+    return resolve_llm_model_profile(provider=provider, model=model)
 
 
 def response_json(response: Any) -> dict[str, Any]:
@@ -467,6 +535,115 @@ def _chat_output_text(response: Any, response_data: dict[str, Any]) -> str:
         return str(response.choices[0].message.content)
     except Exception:
         return ""
+
+
+def _local_chat_tools_from_responses_tools(tools: list[Any]) -> list[dict[str, Any]]:
+    chat_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "web_search":
+            chat_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search current web/news results for market, stock, company, macro, earnings, analyst, and regulatory context.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search query."},
+                                "max_results": {"type": "integer", "description": "Maximum number of results to return.", "default": 6},
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+    return chat_tools
+
+
+def _chat_tool_calls(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    choices = response_data.get("choices") if isinstance(response_data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return []
+    message = (choices[0] or {}).get("message") if isinstance(choices[0], dict) else {}
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+    return [call for call in tool_calls if isinstance(call, dict)] if isinstance(tool_calls, list) else []
+
+
+def _assistant_tool_call_message(response_data: dict[str, Any]) -> dict[str, Any]:
+    choices = response_data.get("choices") if isinstance(response_data, dict) else None
+    message = (choices[0] or {}).get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+    return {
+        "role": "assistant",
+        "content": message.get("content") or "",
+        "tool_calls": message.get("tool_calls") or [],
+    }
+
+
+def _execute_local_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = str(function.get("name") or tool_call.get("name") or "")
+    raw_arguments = function.get("arguments") or tool_call.get("arguments") or "{}"
+    try:
+        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+    except Exception:
+        arguments = {}
+    if name != "web_search":
+        return {"status": "unsupported_tool", "tool": name}
+    query = str(arguments.get("query") or "").strip()
+    max_results = _bounded_int(arguments.get("max_results"), default=6, low=1, high=10)
+    return local_web_search(query=query, max_results=max_results)
+
+
+def local_web_search(*, query: str, max_results: int = 6) -> dict[str, Any]:
+    if not query:
+        return {"status": "error", "provider": "yahoo_news_rss", "query": query, "error": "empty_query", "results": []}
+    url = "https://news.search.yahoo.com/rss?" + urlencode({"p": query})
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0 market-forecasting-engine-local-tool/1.0"})
+    try:
+        with urlopen(request, timeout=12) as response:
+            raw = response.read(400_000)
+    except Exception as exc:
+        return {"status": "error", "provider": "yahoo_news_rss", "query": query, "error": f"{type(exc).__name__}: {exc}", "results": []}
+    try:
+        root = ElementTree.fromstring(raw)
+    except Exception as exc:
+        return {"status": "parse_error", "provider": "yahoo_news_rss", "query": query, "error": f"{type(exc).__name__}: {exc}", "results": []}
+    results = []
+    for item_node in root.findall(".//item")[: max(1, int(max_results))]:
+        results.append(
+            {
+                "title": _clean_text(item_node.findtext("title")),
+                "link": _clean_text(item_node.findtext("link")),
+                "published": _clean_text(item_node.findtext("pubDate")),
+                "summary": _clean_text(item_node.findtext("description")),
+            }
+        )
+    return {
+        "status": "ok" if results else "empty",
+        "provider": "yahoo_news_rss",
+        "query": query,
+        "results": results,
+        "limitations": ["Bounded Yahoo News RSS search executed locally by Python for an LM Studio tool call."],
+    }
+
+
+def _bounded_int(value: Any, *, default: int, low: int, high: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(low, min(high, parsed))
+
+
+def _clean_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def log_provider_usage(

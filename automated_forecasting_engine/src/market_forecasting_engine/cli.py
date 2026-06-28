@@ -169,6 +169,10 @@ def main() -> None:
         help="Optional CSV path where one compact forecast row per horizon is appended after each run.",
     )
     parser.add_argument("--no-forecast-log", action="store_true", help="Disable the default output-dir forecast log.")
+    parser.add_argument("--disable-forecast-calibration", action="store_true", help="Disable matured forecast feedback calibration.")
+    parser.add_argument("--forecast-calibration-ledger", default=None, help="Optional shared forecast_ledger.csv path for matured-error calibration.")
+    parser.add_argument("--forecast-calibration-min-samples", type=int, default=5, help="Minimum matured rows per ticker+horizon before calibration changes forecasts.")
+    parser.add_argument("--forecast-calibration-full-samples", type=int, default=15, help="Matured rows per ticker+horizon where calibration reaches full strength.")
     parser.add_argument("--calendar", default="XNYS", help="Exchange calendar used for data-quality session checks.")
     parser.add_argument("--security-master-csv", default=None, help="Optional security master CSV with ticker metadata.")
     parser.add_argument("--no-lightgbm", action="store_true", help="Disable optional LightGBM candidate.")

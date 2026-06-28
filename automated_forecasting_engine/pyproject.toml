@@ -16,6 +16,7 @@ dependencies = [
   "PyWavelets>=1.8,<2.0",
   "yfinance>=0.2",
   "xgboost>=3.2,<4.0",
+  "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +36,12 @@ traderepublic-legacy = [
   "requests>=2.32",
   "websockets>=15",
 ]
+snaptrade = [
+  "snaptrade-python-sdk==11.0.207",
+]
+ibkr = [
+  "ib-insync>=0.9.86,<1.0",
+]
 
 [project.scripts]
 market-forecast = "market_forecasting_engine.cli:main"
@@ -45,6 +52,9 @@ market-traderepublic-report = "market_forecasting_engine.trade_republic_report:m
 market-traderepublic-report-loop = "market_forecasting_engine.trade_republic_report_loop:main"
 market-traderepublic-dashboard = "market_forecasting_engine.trade_republic_dashboard:main"
 market-portfolio-brain = "market_forecasting_engine.portfolio_brain:main"
+market-snaptrade-readonly = "market_forecasting_engine.snaptrade_readonly_cli:main"
+market-unified-portfolio-dashboard = "market_forecasting_engine.unified_portfolio_dashboard:main"
+market-trading-router = "market_forecasting_engine.trading_router_agent:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

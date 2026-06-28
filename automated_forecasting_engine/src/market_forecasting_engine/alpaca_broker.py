@@ -68,8 +68,29 @@ class AlpacaPaperBroker:
         payload = self._request("GET", "/v2/positions")
         return payload if isinstance(payload, list) else []
 
-    def orders(self, *, status: str = "open", limit: int = 50) -> list[dict[str, Any]]:
-        payload = self._request("GET", f"/v2/orders?status={quote(status)}&limit={int(limit)}")
+    def orders(
+        self,
+        *,
+        status: str = "open",
+        limit: int = 50,
+        direction: str | None = None,
+        symbols: list[str] | None = None,
+        after: str | None = None,
+        until: str | None = None,
+        nested: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"status": status, "limit": int(limit)}
+        if direction:
+            params["direction"] = direction
+        if symbols:
+            params["symbols"] = ",".join(sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()}))
+        if after:
+            params["after"] = after
+        if until:
+            params["until"] = until
+        if nested is not None:
+            params["nested"] = str(bool(nested)).lower()
+        payload = self._request("GET", "/v2/orders?" + urlencode(params))
         return payload if isinstance(payload, list) else []
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:

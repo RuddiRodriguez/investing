@@ -10,7 +10,8 @@ from typing import Any
 
 from market_forecasting_engine.alpaca_broker import AlpacaPaperBroker, load_env_file
 from market_forecasting_engine.llm_trader.responses_api import call_response
-from market_forecasting_engine.llm_trader.run import load_env, openai_client_for_provider, resolve_llm_model, resolve_llm_provider
+from market_forecasting_engine.llm_trader.run import load_env, openai_client_for_provider, resolve_llm_provider
+from market_forecasting_engine.llm_model_catalog import DEFAULT_FULL_LLM_OPTIONS_PROVIDER, LLMModelProfile, resolve_llm_step_profile
 from market_forecasting_engine.llm_options_trader.alpaca_common import (
     AlpacaLLMOptionsRuntimeConfig,
     alpaca_asset_class,
@@ -46,6 +47,7 @@ from market_forecasting_engine.llm_options_trader.memory import (
     update_strategy_memory_from_record,
 )
 from market_forecasting_engine.llm_options_trader.profiles import strategy_mode_profile, trader_profile
+from market_forecasting_engine.llm_options_trader.prompts import ENTRY_LLM_PROFILE, EXIT_LLM_PROFILE, PROFIT_POLICY_LLM_PROFILE
 
 
 def main() -> None:
@@ -55,9 +57,8 @@ def main() -> None:
     broker = _alpaca_broker_for_mode(args.account_mode)
     config = runtime_config(args)
     provider = resolve_llm_provider(args.llm_provider)
-    client = openai_client_for_provider(provider, timeout=float(args.llm_timeout_seconds))
     while True:
-        record = run_once(args=args, broker=broker, config=config, provider=provider, client=client)
+        record = run_once(args=args, broker=broker, config=config, provider=provider)
         report_path = output_dir / f"{config.ticker.upper()}_alpaca_llm_shadow_report.json"
         write_json(report_path, record)
         append_jsonl(output_dir / "logs" / f"{config.ticker.upper()}_alpaca_llm_shadow_agent.jsonl", record)
@@ -82,7 +83,7 @@ def main() -> None:
         time.sleep(max(1, int(args.check_interval_seconds)))
 
 
-def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: AlpacaLLMOptionsRuntimeConfig, provider: str, client) -> dict[str, Any]:
+def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: AlpacaLLMOptionsRuntimeConfig, provider: str) -> dict[str, Any]:
     now = datetime.now(UTC)
     profile = trader_profile(args.trader_profile)
     full_packet = build_alpaca_market_packet(broker=broker, config=config, process="alpaca_shadow_agent", now=now)
@@ -124,11 +125,14 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
     )
     profit_policy_raw_response = None
     profit_policy_decision = None
+    profit_policy_profile = _branch_profile(args, "profit_policy", PROFIT_POLICY_LLM_PROFILE)
+    entry_profile = _branch_profile(args, "entry", ENTRY_LLM_PROFILE)
+    exit_profile = _branch_profile(args, "exit", EXIT_LLM_PROFILE)
     if args.enable_profit_policy_llm:
         _, profit_policy_raw_response, profit_policy_decision = call_response(
-            client=client,
-            provider=provider,
-            model=resolve_llm_model(args.profit_policy_llm_model or args.llm_model, provider=provider),
+            client=_client_for_profile(args, profit_policy_profile),
+            provider=profit_policy_profile.provider,
+            model=profit_policy_profile.model,
             system_message=PROFIT_POLICY_SYSTEM_MESSAGE,
             user_message=PROFIT_POLICY_USER_MESSAGE,
             json_schema=PROFIT_POLICY_JSON_SCHEMA,
@@ -136,7 +140,7 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
             use_web_search=False,
             search_context_size=args.search_context_size,
             reasoning_effort=args.reasoning_effort,
-            usage_context=_usage_context(args=args, config=config, provider=provider, process="alpaca_llm_options_profit_policy"),
+            usage_context=_usage_context(args=args, config=config, provider=profit_policy_profile.provider, process="alpaca_llm_options_profit_policy"),
         )
         full_packet["adaptive_profit_policy"] = profit_policy_decision
         packet["adaptive_profit_policy"] = profit_policy_decision
@@ -145,17 +149,17 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
     if has_shadow_exposure:
         exit_packet = _packet_with_shadow_exposure(packet)
         _, raw_response, decision = call_response(
-            client=client,
-            provider=provider,
-            model=resolve_llm_model(args.llm_model, provider=provider),
+            client=_client_for_profile(args, exit_profile),
+            provider=exit_profile.provider,
+            model=exit_profile.model,
             system_message=ALPACA_EXIT_SYSTEM_MESSAGE,
             user_message=ALPACA_EXIT_USER_MESSAGE,
             json_schema=ALPACA_EXIT_JSON_SCHEMA,
             item={"market_packet_json": json.dumps(exit_packet, indent=2, default=str)},
-            use_web_search=bool(args.use_web_search) and provider == "openai",
+            use_web_search=bool(args.use_web_search) and exit_profile.provider == "openai",
             search_context_size=args.search_context_size,
             reasoning_effort=args.reasoning_effort,
-            usage_context=_usage_context(args=args, config=config, provider=provider, process="alpaca_llm_options_exit_agent"),
+            usage_context=_usage_context(args=args, config=config, provider=exit_profile.provider, process="alpaca_llm_options_exit_agent"),
         )
         order_result = _apply_decision(args=args, broker=broker, config=config, decision=decision, now=now, require_exit=True, market_policy=packet.get("market_policy") or {})
         entry_decision = {"action": "hold", "intent": "hold", "confidence": 1.0, "reason": "entry_skipped_while_shadow_exposure_exists", "risks": [], "order_id": None, "order_ids": [], "order": None}
@@ -167,17 +171,17 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
         llm_decision = exit_decision
     else:
         _, raw_response, decision = call_response(
-            client=client,
-            provider=provider,
-            model=resolve_llm_model(args.llm_model, provider=provider),
+            client=_client_for_profile(args, entry_profile),
+            provider=entry_profile.provider,
+            model=entry_profile.model,
             system_message=ALPACA_COMBINED_SYSTEM_MESSAGE,
             user_message=ALPACA_COMBINED_USER_MESSAGE,
             json_schema=ALPACA_COMBINED_JSON_SCHEMA,
             item={"market_packet_json": json.dumps(packet, indent=2, default=str)},
-            use_web_search=bool(args.use_web_search) and provider == "openai",
+            use_web_search=bool(args.use_web_search) and entry_profile.provider == "openai",
             search_context_size=args.search_context_size,
             reasoning_effort=args.reasoning_effort,
-            usage_context=_usage_context(args=args, config=config, provider=provider, process="alpaca_llm_options_entry_agent"),
+            usage_context=_usage_context(args=args, config=config, provider=entry_profile.provider, process="alpaca_llm_options_entry_agent"),
         )
         order_result = _apply_decision(args=args, broker=broker, config=config, decision=decision, now=now, require_exit=False, market_policy=packet.get("market_policy") or {})
         entry_decision = decision
@@ -194,7 +198,12 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
         "execution_mode": "live_shadow_simulation",
         "agent": "alpaca_llm_options_shadow_agent",
         "llm_provider": provider,
-        "llm_model": resolve_llm_model(args.llm_model, provider=provider),
+        "llm_model": args.llm_model or entry_profile.model,
+        "llm_branch_profiles": {
+            "entry": entry_profile.__dict__,
+            "exit": exit_profile.__dict__,
+            "profit_policy": profit_policy_profile.__dict__,
+        },
         "trader_profile": profile,
         "python_role": "api_interface_only",
         "market_packet": packet,
@@ -219,7 +228,8 @@ def run_once(*, args: argparse.Namespace, broker: AlpacaPaperBroker, config: Alp
             "chronos_model": args.chronos_model,
             "chronos_refresh_seconds": int(args.chronos_refresh_seconds),
             "enable_profit_policy_llm": bool(args.enable_profit_policy_llm),
-            "profit_policy_llm_model": resolve_llm_model(args.profit_policy_llm_model or args.llm_model, provider=provider),
+            "profit_policy_llm_provider": profit_policy_profile.provider,
+            "profit_policy_llm_model": profit_policy_profile.model,
             "entry_bias": args.entry_bias,
             "strategy_mode": args.strategy_mode,
         },
@@ -375,6 +385,26 @@ def _usage_context(*, args: argparse.Namespace, config: AlpacaLLMOptionsRuntimeC
     }
 
 
+def _branch_profile(args: argparse.Namespace, branch: str, default_profile: LLMModelProfile) -> LLMModelProfile:
+    provider = getattr(args, f"{branch}_llm_provider", None)
+    model = getattr(args, f"{branch}_llm_model", None)
+    fallback_provider = args.llm_provider or default_profile.provider
+    fallback_model = args.llm_model
+    if fallback_model is None and fallback_provider == default_profile.provider:
+        fallback_model = default_profile.model
+    return resolve_llm_step_profile(
+        branch,
+        provider=provider,
+        model=model,
+        fallback_provider=fallback_provider,
+        fallback_model=fallback_model,
+    )
+
+
+def _client_for_profile(args: argparse.Namespace, profile: LLMModelProfile):
+    return openai_client_for_provider(profile.provider, timeout=float(args.llm_timeout_seconds))
+
+
 def runtime_config(args: argparse.Namespace) -> AlpacaLLMOptionsRuntimeConfig:
     if str(args.data_provider or "").lower() != "alpaca":
         raise ValueError("Alpaca shadow agent requires --data-provider alpaca so data and execution venue match.")
@@ -437,9 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-order-price", type=float, default=25.0)
     parser.add_argument("--max-order-debit", type=float, default=1500.0)
     parser.add_argument("--max-crypto-notional", type=float, default=100.0)
-    parser.add_argument("--llm-provider", default="openai")
+    parser.add_argument("--llm-provider", default=DEFAULT_FULL_LLM_OPTIONS_PROVIDER)
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--entry-llm-provider", default=None)
+    parser.add_argument("--entry-llm-model", default=None)
+    parser.add_argument("--exit-llm-provider", default=None)
+    parser.add_argument("--exit-llm-model", default=None)
     parser.add_argument("--enable-profit-policy-llm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--profit-policy-llm-provider", default=None)
     parser.add_argument("--profit-policy-llm-model", default=None)
     parser.add_argument("--entry-bias", choices=("unrestricted", "put_only", "call_only"), default="unrestricted")
     parser.add_argument("--strategy-mode", default="options_directional")

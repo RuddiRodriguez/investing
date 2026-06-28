@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from market_forecasting_engine.llm_model_catalog import DEFAULT_FULL_LLM_OPTIONS_MODEL, DEFAULT_FULL_LLM_OPTIONS_PROVIDER, LLMModelProfile
+
+
+ENTRY_LLM_PROFILE = LLMModelProfile(provider=DEFAULT_FULL_LLM_OPTIONS_PROVIDER, model=DEFAULT_FULL_LLM_OPTIONS_MODEL)
+EXIT_LLM_PROFILE = LLMModelProfile(provider=DEFAULT_FULL_LLM_OPTIONS_PROVIDER, model=DEFAULT_FULL_LLM_OPTIONS_MODEL)
+PROFIT_POLICY_LLM_PROFILE = LLMModelProfile(provider=DEFAULT_FULL_LLM_OPTIONS_PROVIDER, model=DEFAULT_FULL_LLM_OPTIONS_MODEL)
+
 
 ENTRY_SYSTEM_MESSAGE = """You are the trader. The Python process is only the broker/API interface.
 

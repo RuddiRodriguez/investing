@@ -31,10 +31,14 @@ class VirtualTraderPipelineConfig:
     start: str = "2020-01-01"
     interval: str = "1d"
     horizons: str = "5,10,20"
+    forecast_backend: str = "full"
     risk_profile: str = "medium"
     trader_profile: str = "medium"
     llm_env_file: str | Path | None = None
+    llm_provider: str = "llm_studio"
     llm_model: str | None = None
+    ceo_llm_provider: str = "openai"
+    ceo_llm_model: str | None = None
     llm_reasoning_effort: str = "none"
     llm_timeout_seconds: int = 120
     llm_search_context_size: str = "medium"
@@ -68,12 +72,15 @@ def run_virtual_trader_pipeline(config: VirtualTraderPipelineConfig) -> dict[str
     _progress(config, f"virtual trader pipeline started output={output_dir}")
 
     broker_state = _load_broker_state(config)
+    order_lifecycle_events: list[dict[str, Any]] = []
     if broker_state.get("status") == "ok":
-        memory.broker_snapshot(
+        order_lifecycle_events = memory.broker_snapshot(
             account=broker_state.get("account"),
             positions=broker_state.get("positions", []),
             orders=broker_state.get("open_orders", []),
+            recent_orders=broker_state.get("recent_orders", []),
         )
+        memory.save()
 
     enrichment_board = _ensure_enrichment(config, output_dir)
     candidates = _candidate_rows_from_enrichment(enrichment_board, max_candidates=config.max_candidates)
@@ -118,6 +125,7 @@ def run_virtual_trader_pipeline(config: VirtualTraderPipelineConfig) -> dict[str
             "independent_paths": "Discovery, ranking, enrichment, forecast CLI, and watch agents can run without virtual trader memory.",
         },
         "broker_state": _broker_state_for_board(broker_state),
+        "order_lifecycle_events": order_lifecycle_events,
         "memory": {
             "path": str(Path(config.memory_path).expanduser()),
             "portfolio_context": memory.portfolio_context(),
@@ -151,8 +159,11 @@ def build_alpaca_paper_order_plan(
     final_advice = report.get("final_advice") if isinstance(report.get("final_advice"), dict) else {}
     if not final_advice and isinstance(decision.get("final_advice"), dict):
         final_advice = decision["final_advice"]
+    final_advice = dict(final_advice)
     action = str(decision.get("decision") or report.get("suggested_action") or "Hold").lower()
     current_price = _to_float(report.get("current_price"))
+    watch_conditions = _watch_conditions(final_advice, current_price)
+    final_advice["watch_condition_status"] = watch_conditions
     account = broker_state.get("account") if isinstance(broker_state.get("account"), dict) else {}
     equity = _to_float(account.get("equity") or account.get("portfolio_value")) or 0.0
     buying_power = _to_float(account.get("buying_power")) or 0.0
@@ -168,6 +179,13 @@ def build_alpaca_paper_order_plan(
         blocks.append("alpaca_market_closed")
     if open_orders and not config.allow_repeated_symbol_orders:
         blocks.append("existing_open_order_for_symbol")
+    if action == "hold":
+        breakout_status = watch_conditions.get("breakout_buy", {}).get("status")
+        buy_lower_status = watch_conditions.get("buy_lower", {}).get("status")
+        if breakout_status == "trigger_crossed":
+            warnings.append("breakout_price_already_crossed_ceo_requires_confirmation_or_retest")
+        if buy_lower_status in {"trigger_crossed", "inside_zone"}:
+            warnings.append("buy_lower_zone_already_reached_ceo_still_hold")
 
     order_payload: dict[str, Any] | None = None
     intent = "no_trade"
@@ -226,13 +244,13 @@ def build_alpaca_paper_order_plan(
                     "order_type": "limit",
                     "notional": round(notional, 2),
                     "limit_price": round(buy_lower, 2),
-                    "time_in_force": "gtc",
+                    "time_in_force": "day",
                     "client_order_id": _client_order_id("vt_dip", ticker),
                 }
-                reason = "hold_with_buy_lower_limit_enabled"
+                reason = _buy_lower_order_reason(watch_conditions)
 
     if order_payload is None and action == "hold":
-        reason = "ceo_hold_watch_plan_only"
+        reason = _hold_watch_reason(watch_conditions)
     memory_context = memory.context_for_ticker(ticker)
     return {
         "ticker": ticker,
@@ -244,6 +262,7 @@ def build_alpaca_paper_order_plan(
         "candidate_rank": candidate.get("rank"),
         "candidate_ranking_score": candidate.get("ranking_score"),
         "final_advice": final_advice,
+        "watch_conditions": watch_conditions,
         "execution_allowed": bool(order_payload and not blocks),
         "execution_blocks": blocks,
         "warnings": warnings,
@@ -344,6 +363,17 @@ def _run_forecast_for_candidate(
             memory_summary_for_prompt(memory, ticker)[:5000],
         ]
     )
+    if config.forecast_backend == "pure_llm":
+        return _run_pure_llm_forecast_for_candidate(
+            ticker=ticker,
+            ticker_dir=ticker_dir,
+            candidate=candidate,
+            config=config,
+            memory=memory,
+            portfolio_notes=portfolio_notes,
+        )
+    if config.forecast_backend != "full":
+        raise ValueError(f"Unsupported forecast_backend={config.forecast_backend!r}. Use 'full' or 'pure_llm'.")
     command = [
         sys.executable,
         "-m",
@@ -408,6 +438,134 @@ def _run_forecast_for_candidate(
     }
 
 
+def _run_pure_llm_forecast_for_candidate(
+    *,
+    ticker: str,
+    ticker_dir: Path,
+    candidate: dict[str, Any],
+    config: VirtualTraderPipelineConfig,
+    memory: VirtualTraderMemory,
+    portfolio_notes: str,
+) -> dict[str, Any]:
+    ticker_memory = memory.context_for_ticker(ticker)
+    position = ticker_memory.get("position") if isinstance(ticker_memory.get("position"), dict) else None
+    holding_status = "owned" if position else "not_owned"
+    command = [
+        sys.executable,
+        "-m",
+        "market_forecasting_engine.pure_llm_stock_forecaster",
+        "--ticker",
+        ticker,
+        "--company",
+        str(candidate.get("company") or candidate.get("name") or ticker),
+        "--provider",
+        config.provider,
+        "--start",
+        config.start,
+        "--interval",
+        config.interval,
+        "--output-dir",
+        str(ticker_dir),
+        "--llm-provider",
+        config.llm_provider,
+        "--trader-profile",
+        config.trader_profile,
+        "--holding-status",
+        holding_status,
+        "--portfolio-notes",
+        portfolio_notes,
+        "--llm-timeout",
+        str(config.llm_timeout_seconds),
+        "--reasoning-effort",
+        config.llm_reasoning_effort,
+        "--search-context-size",
+        config.llm_search_context_size,
+        "--ceo-llm-provider",
+        config.ceo_llm_provider,
+    ]
+    if config.llm_model:
+        command.extend(["--llm-model", config.llm_model])
+    if config.ceo_llm_model:
+        command.extend(["--ceo-llm-model", config.ceo_llm_model])
+    if config.llm_env_file:
+        command.extend(["--llm-env-file", str(config.llm_env_file)])
+    if position:
+        _append_position_args(command, position)
+    started = datetime.now(UTC)
+    result = subprocess.run(command, cwd=Path.cwd(), text=True, capture_output=True, check=False)
+    (ticker_dir / "forecast_command.json").write_text(json.dumps({"command": command}, indent=2) + "\n", encoding="utf-8")
+    (ticker_dir / "forecast_stdout.txt").write_text(result.stdout or "", encoding="utf-8")
+    (ticker_dir / "forecast_stderr.txt").write_text(result.stderr or "", encoding="utf-8")
+    pure_report_path = ticker_dir / f"{_pure_llm_safe_name(ticker)}_pure_llm_stock_forecast.json"
+    pure_report = _read_json(pure_report_path) if pure_report_path.exists() else {}
+    report = _pure_llm_report_for_order_planner(pure_report, ticker=ticker)
+    report_path = ticker_dir / "forecast_report.json"
+    if report:
+        _write_json(report_path, report)
+    return {
+        "ticker": ticker,
+        "started_at_utc": started.isoformat(),
+        "finished_at_utc": datetime.now(UTC).isoformat(),
+        "returncode": result.returncode,
+        "forecast_output_dir": str(ticker_dir),
+        "forecast_report_path": str(report_path) if report_path.exists() else None,
+        "pure_llm_report_path": str(pure_report_path) if pure_report_path.exists() else None,
+        "command_path": str(ticker_dir / "forecast_command.json"),
+        "stdout_path": str(ticker_dir / "forecast_stdout.txt"),
+        "stderr_path": str(ticker_dir / "forecast_stderr.txt"),
+        "report": report,
+        "error": None if result.returncode == 0 else (result.stderr or result.stdout)[-3000:],
+    }
+
+
+def _append_position_args(command: list[str], position: dict[str, Any]) -> None:
+    values = {
+        "--entry-price": position.get("avg_entry_price"),
+        "--quantity": position.get("qty"),
+        "--position-value": position.get("market_value"),
+    }
+    for flag, value in values.items():
+        parsed = _to_float(value)
+        if parsed is not None:
+            command.extend([flag, str(parsed)])
+
+
+def _pure_llm_report_for_order_planner(pure_report: dict[str, Any], *, ticker: str) -> dict[str, Any]:
+    if not pure_report:
+        return {}
+    advice = pure_report.get("advice") if isinstance(pure_report.get("advice"), dict) else {}
+    forecast = pure_report.get("forecast") if isinstance(pure_report.get("forecast"), dict) else {}
+    final_advice = advice.get("final_advice") if isinstance(advice.get("final_advice"), dict) else {}
+    return {
+        "ticker": str(advice.get("ticker") or forecast.get("ticker") or ticker).upper(),
+        "current_price": forecast.get("current_price"),
+        "suggested_action": advice.get("decision") or "Hold",
+        "llm_final_decision": advice,
+        "final_advice": final_advice,
+        "autonomous_llm_trader": {
+            "status": "executed",
+            "provider": pure_report.get("ceo_provider"),
+            "model": pure_report.get("ceo_model"),
+            "source_path": "pure_llm_stock_forecaster",
+        },
+        "decision_view": {
+            "autonomous_execution_gate": {
+                "execution_blocks": [],
+                "warnings": [
+                    "pure_llm_forecast_not_walk_forward_validated",
+                    "standalone_pure_llm_script_is_advice_only_pipeline_provides_execution_gate",
+                ],
+            }
+        },
+        "pure_llm_stock_forecast": forecast,
+        "pure_llm_artifact": pure_report,
+    }
+
+
+def _pure_llm_safe_name(value: str) -> str:
+    return str(value).upper().replace("/", "_").replace(" ", "_")
+
+
 def _load_broker_state(config: VirtualTraderPipelineConfig) -> dict[str, Any]:
     if config.disable_alpaca:
         return {"status": "disabled", "reason": "Alpaca broker disabled by config."}
@@ -419,9 +577,10 @@ def _load_broker_state(config: VirtualTraderPipelineConfig) -> dict[str, Any]:
             "clock": broker.clock(),
             "positions": broker.positions(),
             "open_orders": broker.orders(status="open", limit=100),
+            "recent_orders": broker.orders(status="all", limit=100, direction="desc"),
         }
     except Exception as exc:
-        return {"status": "error", "error": _safe_error(exc), "positions": [], "open_orders": []}
+        return {"status": "error", "error": _safe_error(exc), "positions": [], "open_orders": [], "recent_orders": []}
 
 
 def _portfolio_selection(forecast_rows: list[dict[str, Any]], order_rows: list[dict[str, Any]], memory: VirtualTraderMemory) -> dict[str, Any]:
@@ -524,6 +683,7 @@ def _broker_state_for_board(broker_state: dict[str, Any]) -> dict[str, Any]:
         "account": broker_state.get("account"),
         "positions_count": len(broker_state.get("positions", []) or []),
         "open_orders_count": len(broker_state.get("open_orders", []) or []),
+        "recent_orders_count": len(broker_state.get("recent_orders", []) or []),
     }
 
 
@@ -548,6 +708,15 @@ def _write_markdown_board(path: Path, board: dict[str, Any]) -> None:
             f"- {row.get('ticker')}: intent={row.get('intent')} allowed={row.get('execution_allowed')} "
             f"submitted={row.get('order_result', {}).get('submitted')} reason={row.get('reason')} "
             f"blocks={'; '.join(row.get('execution_blocks', []) or [])}"
+        )
+    lines.extend(["", "## Order Lifecycle", ""])
+    lifecycle_events = board.get("order_lifecycle_events", []) if isinstance(board.get("order_lifecycle_events"), list) else []
+    if not lifecycle_events:
+        lines.append("- No broker order lifecycle changes detected in this run.")
+    for event in lifecycle_events:
+        lines.append(
+            f"- {event.get('symbol')}: {event.get('previous_status')} -> {event.get('status')} "
+            f"state={event.get('lifecycle_state')} reason={event.get('reason')} client_id={event.get('client_order_id')}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -587,6 +756,105 @@ def _sell_limit_price(final_advice: dict[str, Any], current_price: float | None,
     if reference is None:
         return None
     return reference * (1.0 - float(offset_bps) / 10_000.0)
+
+
+def _watch_conditions(final_advice: dict[str, Any], current_price: float | None) -> dict[str, Any]:
+    buy_lower_low = _to_float(final_advice.get("buy_lower_zone_low"))
+    buy_lower_high = _to_float(final_advice.get("buy_lower_zone_high"))
+    buy_lower_price = _to_float(final_advice.get("buy_lower_price"))
+    breakout_price = _to_float(final_advice.get("buy_above_breakout_price"))
+    stop_loss_price = _to_float(final_advice.get("stop_loss_price"))
+    invalidation_price = _to_float(final_advice.get("invalidation_price"))
+    take_profit_price = _to_float(final_advice.get("take_profit_price"))
+    return {
+        "current_price": current_price,
+        "buy_lower": {
+            "zone_low": buy_lower_low,
+            "zone_high": buy_lower_high,
+            "preferred_price": buy_lower_price,
+            "status": _buy_lower_status(current_price, buy_lower_low, buy_lower_high, buy_lower_price),
+        },
+        "breakout_buy": {
+            "trigger_price": breakout_price,
+            "status": _price_trigger_status(
+                current_price=current_price,
+                trigger_price=breakout_price,
+                direction="above",
+            ),
+        },
+        "stop_loss": {
+            "trigger_price": stop_loss_price,
+            "status": _price_trigger_status(
+                current_price=current_price,
+                trigger_price=stop_loss_price,
+                direction="below",
+            ),
+        },
+        "invalidation": {
+            "trigger_price": invalidation_price,
+            "status": _price_trigger_status(
+                current_price=current_price,
+                trigger_price=invalidation_price,
+                direction="below",
+            ),
+        },
+        "take_profit": {
+            "trigger_price": take_profit_price,
+            "status": _price_trigger_status(
+                current_price=current_price,
+                trigger_price=take_profit_price,
+                direction="above",
+            ),
+        },
+    }
+
+
+def _buy_lower_status(
+    current_price: float | None,
+    zone_low: float | None,
+    zone_high: float | None,
+    preferred_price: float | None,
+) -> str:
+    if current_price is None:
+        return "unknown_current_price"
+    high = zone_high or preferred_price
+    low = zone_low or preferred_price or high
+    if high is None:
+        return "not_defined"
+    if current_price <= high and (low is None or current_price >= low):
+        return "inside_zone"
+    if current_price < (low or high):
+        return "trigger_crossed"
+    return "waiting_for_pullback"
+
+
+def _price_trigger_status(*, current_price: float | None, trigger_price: float | None, direction: str) -> str:
+    if trigger_price is None:
+        return "not_defined"
+    if current_price is None:
+        return "unknown_current_price"
+    if direction == "above":
+        return "trigger_crossed" if current_price >= trigger_price else "waiting_for_breakout"
+    if direction == "below":
+        return "trigger_crossed" if current_price <= trigger_price else "not_triggered"
+    return "unknown_direction"
+
+
+def _hold_watch_reason(watch_conditions: dict[str, Any]) -> str:
+    breakout_status = watch_conditions.get("breakout_buy", {}).get("status")
+    buy_lower_status = watch_conditions.get("buy_lower", {}).get("status")
+    if breakout_status == "trigger_crossed":
+        return "ceo_hold_after_breakout_crossed_needs_confirmation_or_retest"
+    if buy_lower_status in {"trigger_crossed", "inside_zone"}:
+        return "ceo_hold_after_buy_lower_zone_reached_needs_confirmation"
+    return "ceo_hold_watch_plan_only"
+
+
+def _buy_lower_order_reason(watch_conditions: dict[str, Any]) -> str:
+    breakout_status = watch_conditions.get("breakout_buy", {}).get("status")
+    if breakout_status == "trigger_crossed":
+        return "hold_after_breakout_crossed_buy_lower_retest_limit_enabled"
+    return "hold_with_buy_lower_limit_enabled"
 
 
 def _position_for_symbol(positions: Any, ticker: str) -> dict[str, Any] | None:

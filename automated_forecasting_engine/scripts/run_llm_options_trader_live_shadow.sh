@@ -17,15 +17,17 @@ MAX_ORDER_PRICE="${MAX_ORDER_PRICE:-5000}"
 SHADOW_ACCOUNT_EQUITY="${SHADOW_ACCOUNT_EQUITY:-500}"
 SHADOW_MAX_ENTRY_DEBIT="${SHADOW_MAX_ENTRY_DEBIT:-75}"
 SHADOW_MAX_SESSION_DEBIT="${SHADOW_MAX_SESSION_DEBIT:-250}"
-LLM_PROVIDER="${LLM_PROVIDER:-openai}"
+LLM_PROVIDER="${LLM_PROVIDER:-llm_studio}"
 ENTRY_BIAS="${ENTRY_BIAS:-unrestricted}"
 STRATEGY_MODE="${STRATEGY_MODE:-exploratory_trend_probe}"
 DEFAULT_LLM_MODEL="$(
   LLM_PROVIDER="$LLM_PROVIDER" PYTHONPATH=automated_forecasting_engine/src "$PYTHON" - <<'PY'
 import os
-from market_forecasting_engine.llm_trader.run import resolve_llm_model
+from market_forecasting_engine.llm_model_catalog import DEFAULT_FULL_LLM_OPTIONS_MODEL
+from market_forecasting_engine.llm_trader.run import resolve_llm_provider, resolve_llm_model
 
-print(resolve_llm_model(None, provider=os.environ.get("LLM_PROVIDER")))
+provider = resolve_llm_provider(os.environ.get("LLM_PROVIDER"))
+print(DEFAULT_FULL_LLM_OPTIONS_MODEL if provider == "llm_studio" else resolve_llm_model(None, provider=provider))
 PY
 )"
 LLM_MODEL="${LLM_MODEL:-$DEFAULT_LLM_MODEL}"

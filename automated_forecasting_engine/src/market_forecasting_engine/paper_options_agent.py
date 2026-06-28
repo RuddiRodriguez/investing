@@ -32,25 +32,27 @@ from market_forecasting_engine.risk_profiles import risk_profile_for_name
 
 OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
     "aggressive": {
-        "stop_loss_pct": 0.10,
-        "take_profit_pct": 0.25,
-        "profit_lock_trigger_pct": 0.08,
+        "stop_loss_pct": 0.07,
+        "take_profit_pct": 0.18,
+        "profit_lock_trigger_pct": 0.05,
         "profit_lock_ratio": 0.75,
-        "take_profit_position_pl": 35.0,
-        "profit_retrace_from_peak_pct": 0.20,
+        "take_profit_position_pl": 25.0,
+        "profit_retrace_from_peak_pct": 0.18,
         "profit_close_limit_offset_pct": 0.01,
-        "max_spread_pct": 0.15,
-        "max_theta_edge_ratio": 0.75,
-        "max_theta_premium_pct_per_day": 0.35,
+        "max_spread_pct": 0.10,
+        "max_theta_edge_ratio": 0.50,
+        "max_theta_premium_pct_per_day": 0.25,
+        "min_option_directional_confidence": 0.60,
+        "min_option_forecast_move_pct": 0.0020,
         "entry_cooldown_minutes": 1,
         "loss_cooldown_minutes": 2,
-        "max_trades_per_day": 50,
-        "max_consecutive_losses": 10,
+        "max_trades_per_day": 12,
+        "max_consecutive_losses": 4,
         "max_open_option_positions": 1,
-        "max_open_option_contracts": 2,
-        "max_open_option_exposure": 2500.0,
+        "max_open_option_contracts": 1,
+        "max_open_option_exposure": 1200.0,
         "max_realized_loss_per_day": 300.0,
-        "max_position_unrealized_loss": 150.0,
+        "max_position_unrealized_loss": 100.0,
         "one_trade_per_forecast": False,
     },
     "medium": {
@@ -64,6 +66,8 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_spread_pct": 0.10,
         "max_theta_edge_ratio": 0.75,
         "max_theta_premium_pct_per_day": 0.35,
+        "min_option_directional_confidence": 0.62,
+        "min_option_forecast_move_pct": 0.0030,
         "entry_cooldown_minutes": 30,
         "loss_cooldown_minutes": 60,
         "max_trades_per_day": 3,
@@ -86,6 +90,8 @@ OPTION_AGENT_PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_spread_pct": 0.08,
         "max_theta_edge_ratio": 0.60,
         "max_theta_premium_pct_per_day": 0.25,
+        "min_option_directional_confidence": 0.65,
+        "min_option_forecast_move_pct": 0.0040,
         "entry_cooldown_minutes": 60,
         "loss_cooldown_minutes": 120,
         "max_trades_per_day": 2,
@@ -171,6 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-greeks", action=argparse.BooleanOptionalAction, default=True, help="Require live option delta/gamma/theta/vega before entry.")
     parser.add_argument("--max-theta-edge-ratio", type=float, default=None, help="Profile default: reject contracts when expected theta decay over the forecast horizon is too large versus delta-adjusted forecast edge.")
     parser.add_argument("--max-theta-premium-pct-per-day", type=float, default=None, help="Profile default: reject contracts when daily theta decay is too large versus option premium.")
+    parser.add_argument("--require-forecast-gate-for-options", action=argparse.BooleanOptionalAction, default=True, help="Block option entries unless the selected forecast passed the production forecast gate.")
+    parser.add_argument("--min-option-directional-confidence", type=float, default=None, help="Profile default: minimum forecast direction confidence before buying stock options.")
+    parser.add_argument("--min-option-forecast-move-pct", type=float, default=None, help="Profile default: minimum underlying forecast move before buying stock options.")
+    parser.add_argument("--require-positive-option-edge-after-costs", action=argparse.BooleanOptionalAction, default=True, help="Block option entries unless forecast edge remains positive after spread and theta.")
+    parser.add_argument("--require-forecast-clears-option-breakeven", action=argparse.BooleanOptionalAction, default=True, help="Block option entries unless the forecast clears the selected option breakeven.")
     parser.add_argument("--min-open-interest", type=int, default=0)
     parser.add_argument("--enable-market-regime-filter", action=argparse.BooleanOptionalAction, default=True, help="Block option entries in oscillating/range-middle regimes and late exhausted trends.")
     parser.add_argument("--allow-range-edge-reversal-entry", action="store_true", help="Allow countertrend entries only at range edges when the short-term reversal confirms the forecast.")
@@ -234,6 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--liquidation-retry-limit-offset-pct", type=float, default=0.15, help="If emergency liquidation is not flat after the first attempt, retry with a wider sell limit below current mark.")
     parser.add_argument("--liquidation-wait-seconds", type=float, default=30.0, help="After emergency liquidation, wait this many seconds while checking whether ticker option positions are flat.")
     parser.add_argument("--liquidation-poll-seconds", type=float, default=2.0, help="Polling interval while verifying emergency liquidation.")
+    parser.add_argument("--stop-new-entries-before-close-minutes", type=float, default=30.0, help="Block new stock-option entries this many minutes before market close.")
+    parser.add_argument("--force-flat-before-close-minutes", type=float, default=15.0, help="Close stock-option positions this many minutes before market close.")
     parser.add_argument("--abandon-entry-after-seconds", type=int, default=300)
     parser.add_argument("--require-market-open", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-duplicate-contract-order", action="store_true")
@@ -408,6 +421,7 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     execution_blocks = execution_block_reasons(
         args=args,
         clock=clock,
+        forecast=forecast,
         trade_plan=trade_plan,
         open_orders=open_orders,
         option_positions=option_positions,
@@ -718,6 +732,16 @@ def build_options_forecast_plan(
         no_statistical_models=bool(getattr(args, "no_statistical_models", False)),
         search_level=_normalize_advanced_search_level(getattr(args, "search_level", "realtime")),
         risk_profile=getattr(args, "risk_profile", "aggressive"),
+        output_dir=str(Path(args.output_dir) / "forecasts" / args.ticker.upper()),
+        output=None,
+        disable_long_term_sources=True,
+        long_term_source_output_dir=None,
+        long_term_source_snapshot_dir=None,
+        long_term_source_providers="",
+        long_term_source_env_file=None,
+        llm_env_file=None,
+        start=None,
+        end=None,
     )
     advanced = _run_advanced_hourly_forecast(
         prices=prices,
@@ -937,6 +961,7 @@ def execution_block_reasons(
     *,
     args: argparse.Namespace,
     clock: dict[str, Any],
+    forecast: dict[str, Any] | None = None,
     trade_plan: dict[str, Any],
     open_orders: list[dict[str, Any]],
     option_positions: list[dict[str, Any]],
@@ -946,6 +971,10 @@ def execution_block_reasons(
         reasons.append(str(trade_plan.get("reason") or "no_buy_option_plan"))
     if args.require_market_open and not bool(clock.get("is_open")):
         reasons.append("market_closed")
+    minutes_to_close = _minutes_to_market_close(clock)
+    if minutes_to_close is not None and minutes_to_close <= float(getattr(args, "stop_new_entries_before_close_minutes", 0.0)):
+        reasons.append("too_close_to_market_close_for_new_entry")
+    reasons.extend(_professional_option_entry_block_reasons(args=args, forecast=forecast or {}, trade_plan=trade_plan))
     if len(open_orders) >= int(args.max_open_option_orders):
         reasons.append("max_open_option_orders_reached")
     open_positions = [position for position in option_positions if _int_float(position.get("qty")) > 0]
@@ -985,6 +1014,72 @@ def execution_block_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def _professional_option_entry_block_reasons(
+    *,
+    args: argparse.Namespace,
+    forecast: dict[str, Any],
+    trade_plan: dict[str, Any],
+) -> list[str]:
+    if trade_plan.get("action") != "buy_option":
+        return []
+    reasons: list[str] = []
+    production_gate = forecast.get("production_gate") or {}
+    if bool(getattr(args, "require_forecast_gate_for_options", True)):
+        if forecast.get("trade_allowed") is False or production_gate.get("trade_allowed") is False:
+            reasons.append("forecast_gate_failed_for_options")
+    confidence = _float_or_none(forecast.get("directional_confidence"))
+    min_confidence = _float_or_none(getattr(args, "min_option_directional_confidence", None))
+    if confidence is not None and min_confidence is not None and confidence < min_confidence:
+        reasons.append("option_directional_confidence_too_low")
+    spot = _float_or_none(forecast.get("spot"))
+    predicted = _float_or_none(forecast.get("predicted_price"))
+    min_move_pct = _float_or_none(getattr(args, "min_option_forecast_move_pct", None))
+    if spot is not None and predicted is not None and min_move_pct is not None and min_move_pct > 0:
+        move_pct = abs(predicted / max(abs(spot), 1e-9) - 1.0)
+        if move_pct < min_move_pct:
+            reasons.append("option_forecast_move_too_small")
+    quality = trade_plan.get("trade_quality") or (trade_plan.get("selected_contract") or {}).get("trade_quality") or {}
+    interpretations = set(quality.get("interpretation") or [])
+    edge_after_costs = _float_or_none(quality.get("forecast_edge_after_theta_and_half_spread_usd"))
+    if bool(getattr(args, "require_positive_option_edge_after_costs", True)):
+        if edge_after_costs is None or edge_after_costs <= 0 or "costs_overwhelm_forecast_edge" in interpretations:
+            reasons.append("option_edge_after_costs_not_positive")
+    if bool(getattr(args, "require_forecast_clears_option_breakeven", True)):
+        if "forecast_does_not_clear_breakeven" in interpretations:
+            reasons.append("option_forecast_does_not_clear_breakeven")
+    return reasons
+
+
+def _minutes_to_market_close(clock: dict[str, Any], *, now: datetime | None = None) -> float | None:
+    if not bool(clock.get("is_open")):
+        return None
+    close_at = _parse_broker_timestamp(clock.get("next_close"))
+    if close_at is None:
+        return None
+    current = now or _parse_broker_timestamp(clock.get("timestamp")) or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return (close_at.astimezone(UTC) - current.astimezone(UTC)).total_seconds() / 60.0
+
+
+def _parse_broker_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    match = re.match(r"^(.*\\.\\d{6})\\d+([+-]\\d\\d:\\d\\d)$", text)
+    if match:
+        text = match.group(1) + match.group(2)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "risk_profile": args.risk_profile,
@@ -1012,6 +1107,13 @@ def option_agent_controls(args: argparse.Namespace) -> dict[str, Any]:
         "max_spread_pct": args.max_spread_pct,
         "entry_cooldown_minutes": float(args.entry_cooldown_minutes),
         "loss_cooldown_minutes": float(args.loss_cooldown_minutes),
+        "require_forecast_gate_for_options": bool(getattr(args, "require_forecast_gate_for_options", True)),
+        "min_option_directional_confidence": float(getattr(args, "min_option_directional_confidence", 0.0)),
+        "min_option_forecast_move_pct": float(getattr(args, "min_option_forecast_move_pct", 0.0)),
+        "require_positive_option_edge_after_costs": bool(getattr(args, "require_positive_option_edge_after_costs", True)),
+        "require_forecast_clears_option_breakeven": bool(getattr(args, "require_forecast_clears_option_breakeven", True)),
+        "stop_new_entries_before_close_minutes": float(getattr(args, "stop_new_entries_before_close_minutes", 0.0)),
+        "force_flat_before_close_minutes": float(getattr(args, "force_flat_before_close_minutes", 0.0)),
         "max_trades_per_day": int(args.max_trades_per_day),
         "max_consecutive_losses": int(args.max_consecutive_losses),
         "one_trade_per_forecast": bool(args.one_trade_per_forecast),

@@ -22,7 +22,7 @@
   "max_order_amount": 10,
   "max_order_price": 5000,
   "llm_provider": "llm_studio",
-  "llm_model": "qwen3.5-9b",
+  "llm_model": "gemma-4-e4b-it",
   "enable_profit_policy_llm": false,
   "profit_policy_llm_model": null,
   "entry_bias": "unrestricted",

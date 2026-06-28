@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from market_forecasting_engine.llm_model_catalog import DEFAULT_FULL_LLM_OPTIONS_MODEL, DEFAULT_FULL_LLM_OPTIONS_PROVIDER
+from market_forecasting_engine.llm_options_trader.alpaca_agent import _branch_profile, _entry_blocked_by_market, build_parser
 from market_forecasting_engine.llm_options_trader.alpaca_common import AlpacaLLMOptionsRuntimeConfig, compact_alpaca_market_packet, validate_alpaca_order_payload
-from market_forecasting_engine.llm_options_trader.alpaca_agent import _entry_blocked_by_market
 from market_forecasting_engine.llm_options_trader.alpaca_shadow_ledger import (
     load_and_update_alpaca_shadow_state,
     record_simulated_alpaca_order,
 )
+from market_forecasting_engine.llm_options_trader.prompts import ENTRY_LLM_PROFILE
 
 
 class FakeAlpacaBroker:
@@ -132,3 +134,15 @@ def test_compact_alpaca_packet_keeps_strategy_mode() -> None:
     )
 
     assert packet["strategy_mode"]["name"] == "crypto_spot_probe"
+
+
+def test_alpaca_full_llm_branch_profile_defaults_to_local_model(monkeypatch) -> None:
+    monkeypatch.delenv("ENTRY_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("ENTRY_LLM_MODEL", raising=False)
+    args = build_parser().parse_args([])
+
+    entry = _branch_profile(args, "entry", ENTRY_LLM_PROFILE)
+
+    assert args.llm_provider == DEFAULT_FULL_LLM_OPTIONS_PROVIDER
+    assert entry.provider == DEFAULT_FULL_LLM_OPTIONS_PROVIDER
+    assert entry.model == DEFAULT_FULL_LLM_OPTIONS_MODEL
